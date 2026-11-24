@@ -464,7 +464,11 @@ impl Layout {
             let mut sizes = vec![];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
-                if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
+                if w <= fixed[0]
+                    && h <= fixed[1]
+                    && (!thick || mip_depth(i) <= fixed[2])
+                    && d.mips - i <= max_in_tail
+                {
                     first_tail_mip = i;
                     slice_size += block_bytes / u64::from(block[2]);
                     break;
