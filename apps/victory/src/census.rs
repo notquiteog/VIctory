@@ -76,6 +76,11 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
             if !seen.insert(identity) {
                 continue;
             }
+            // Use the resolved path for deduplication and keep the original for output.
+            let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if !seen.insert(identity) {
+                continue;
+            }
             let info = match std::fs::read(path)
                 .map_err(anyhow::Error::from)
                 .and_then(|d| ImageInfo::parse(&d).map_err(anyhow::Error::from))
