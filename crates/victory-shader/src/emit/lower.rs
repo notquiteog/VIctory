@@ -5462,16 +5462,23 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
+        // shortcut: LDS addresses are taken as aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let byte_addr = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
+            l.s.m.bin(c, Bin::Add, a, o)
+        };
+        let dword_at = |l: &mut Self, at: V| -> V {
+            let c = l.cur;
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
+        };
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let at = byte_addr(l, bytes);
+            dword_at(l, at)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5565,45 +5572,118 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_read") {
-            let elements = if rest.starts_with('2') {
-                pair(name)
-            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                vec![(offset, width(name))]
-            } else {
-                return Err("an LDS read of bytes or halves");
-            };
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let mut n = 0;
-            for (off, w) in elements {
-                for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
-                    self.write(inst, Reg::V(reg + n), x, guard);
-                    n += 1;
+            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else {
+                    vec![(offset, width(name))]
+                };
+                let mut n = 0;
+                for (off, w) in elements {
+                    for k in 0..w {
+                        let p = dword(self, off + 4 * k);
+                        let x = self.s.m.load(self.cur, p);
+                        self.write(inst, Reg::V(reg + n), x, guard);
+                        n += 1;
+                    }
                 }
+                return Ok(());
             }
+            let (bytes, signed, d16) = match rest {
+                "_u8" => (1u32, false, None),
+                "_i8" => (1, true, None),
+                "_u16" => (2, false, None),
+                "_i16" => (2, true, None),
+                "_u8_d16" => (1, false, Some(false)),
+                "_u8_d16_hi" => (1, false, Some(true)),
+                "_i8_d16" => (1, true, Some(false)),
+                "_i8_d16_hi" => (1, true, Some(true)),
+                "_u16_d16" => (2, false, Some(false)),
+                "_u16_d16_hi" => (2, false, Some(true)),
+                _ => return Err("an LDS read of bytes or halves"),
+            };
+            let at = byte_addr(self, offset);
+            let p = dword_at(self, at);
+            let word = self.s.m.load(self.cur, p);
+            let c = self.cur;
+            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
+            let three = self.s.m.i32(3);
+            let off_in_word = self.s.m.bin(c, Bin::And, at, lane_mask);
+            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
+            let raw = self.s.m.bin(c, Bin::LShr, word, shift);
+            let ext = if signed {
+                let k = self.s.m.i32(32 - 8 * bytes);
+                let hi = self.s.m.bin(c, Bin::Shl, raw, k);
+                self.s.m.bin(c, Bin::AShr, hi, k)
+            } else {
+                let m = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
+                self.s.m.bin(c, Bin::And, raw, m)
+            };
+            let x = match d16 {
+                None => ext,
+                Some(false) => self.low_half(inst, reg, ext),
+                Some(true) => self.high_half(inst, reg, ext),
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
-            let elements = if rest.starts_with('2') {
-                pair(name)
-            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                vec![(offset, width(name))]
-            } else {
-                return Err("an LDS write of bytes or halves");
-            };
-            let mut stores = Vec::new();
-            for (e, (off, w)) in elements.into_iter().enumerate() {
-                let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
-                for (k, x) in vals.into_iter().enumerate() {
-                    stores.push((off + 4 * k as u32, x));
+            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else {
+                    vec![(offset, width(name))]
+                };
+                let mut stores = Vec::new();
+                for (e, (off, w)) in elements.into_iter().enumerate() {
+                    let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+                    for (k, x) in vals.into_iter().enumerate() {
+                        stores.push((off + 4 * k as u32, x));
+                    }
                 }
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let p = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
             }
+            let (bytes, hi_src) = match rest {
+                "_b8" => (1u32, false),
+                "_b16" => (2, false),
+                "_b8_d16_hi" => (1, true),
+                "_b16_d16_hi" => (2, true),
+                _ => return Err("an LDS write of bytes or halves"),
+            };
+            let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+            let at_bytes = byte_addr(self, offset);
+            let p = dword_at(self, at_bytes);
+            let c = self.cur;
+            if hi_src {
+                let k16 = self.s.m.i32(16);
+                val = self.s.m.bin(c, Bin::LShr, val, k16);
+            }
+            let mask_val = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
+            let val = self.s.m.bin(c, Bin::And, val, mask_val);
+            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
+            let three = self.s.m.i32(3);
+            let off_in_word = self.s.m.bin(c, Bin::And, at_bytes, lane_mask);
+            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
+            let shifted_mask = self.s.m.bin(c, Bin::Shl, mask_val, shift);
+            let all_ones = self.s.m.i32(!0u32);
+            let clear_mask = self.s.m.bin(c, Bin::Xor, shifted_mask, all_ones);
+            let shifted_val = self.s.m.bin(c, Bin::Shl, val, shift);
+            // Atomic clear + set so concurrent lanes writing adjacent bytes or
+            // halves within the same 32-bit dword do not race.
             let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
-            }
+            self.s
+                .m
+                .atomic(self.cur, super::bitcode::Rmw::And, p, clear_mask);
+            self.s
+                .m
+                .atomic(self.cur, super::bitcode::Rmw::Or, p, shifted_val);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -11382,6 +11462,19 @@ impl<'a> Lower<'a> {
         let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
+        self.s.m.bin(c, Bin::Or, old, x)
+    }
+
+    /// `x` (low 16 bits) as the high half of VGPR `reg`, keeping its low half.
+    fn high_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
+        let c = self.cur;
+        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        };
+        let (low, k16) = (self.s.m.i32(0xFFFF), self.s.m.i32(16));
+        let old = self.s.m.bin(c, Bin::And, old, low);
+        let x = self.s.m.bin(c, Bin::Shl, x, k16);
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
