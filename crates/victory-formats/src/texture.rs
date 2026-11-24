@@ -1085,6 +1085,28 @@ mod tests {
 
     /// Sizes past the hardware's 16384 texels per side are refused instead
     /// of overflowing the size arithmetic (found by random-input testing).
+    /// A thick 3D layout's mip tail takes only mips that fit the block's
+    /// depth as well as its width and height (VIC-BT-014).
+    #[test]
+    fn deep_3d_mips_do_not_enter_the_mip_tail() {
+        let d = Desc {
+            dimension: Dimension::Tex3d,
+            depth: 64,
+            ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+        };
+        let layout = Layout::new(&d).unwrap();
+        assert!(
+            layout.mips[0].tail.is_none(),
+            "mip 0 has 64 slices and cannot fit one tail block: {:?}",
+            layout.mips[0]
+        );
+        assert!(
+            layout.first_tail_mip > 0,
+            "the deepest mip must not start the tail: {}",
+            layout.first_tail_mip
+        );
+    }
+
     #[test]
     fn extents_past_the_hardware_limit_are_invalid() {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
