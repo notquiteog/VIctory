@@ -3389,11 +3389,26 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Marks a phi and the phis feeding it as read. `fill_phis` reads an
+    /// incoming phi's stored value directly, without going through `get`, so
+    /// marking only the phi named here would lose a missing value at an
+    /// earlier join (issue #604).
+    fn mark_phi_live(&mut self, v: Value) {
+        let Some(&(block, index)) = self.phi_at.get(&v) else {
+            return;
+        };
+        if !self.read_phis.insert(v) {
+            return;
+        }
+        let args = self.x.p.blocks[block].phis[index].args.clone();
+        for arg in args {
+            self.mark_phi_live(arg);
+        }
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        if self.phi_at.contains_key(&v) {
-            self.read_phis.insert(v);
-        }
+        self.mark_phi_live(v);
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
