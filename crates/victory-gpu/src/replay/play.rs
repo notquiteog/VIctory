@@ -2176,7 +2176,7 @@ impl Player {
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
                 let cmds = self.commands[l as usize].clone();
                 let found = edit::find_clamps(&cmds, &psos, &mut next);
-                lists.push(edit::keep_clamped(cmds, &found));
+                lists.push(edit::keep_clamped(cmds, &found)?);
                 clamps.push(found);
             }
             submits.push(lists);
