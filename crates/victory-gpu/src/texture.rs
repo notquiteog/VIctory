@@ -986,6 +986,14 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// A copy footprint may leave the final row's trailing padding outside the
+/// allocation returned by GetCopyableFootprints.
+fn staging_subresource(data: &mut [u8], offset: u64, padded_bytes: usize) -> Option<&mut [u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.saturating_add(padded_bytes).min(data.len());
+    data.get_mut(offset..end)
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1312,14 +1320,18 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // SAFETY: the mapped upload buffer is at least this large and is
+        // written only by the staging refresh.
+        let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            let depth_pitch = pitch * rows as usize;
+            let bytes = depth_pitch.saturating_mul(f.Depth as usize);
+            let Some(linear) = staging_subresource(data, footprint.Offset, bytes) else {
+                tracing::warn!(mip, slice, "texture footprint starts beyond its staging buffer");
+                return;
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -1328,7 +1340,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, depth_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -2015,5 +2027,21 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_bounds_tests {
+    use super::staging_subresource;
+
+    #[test]
+    fn final_staging_row_does_not_include_unallocated_padding() {
+        let mut data = [0xff; 48];
+        let last = staging_subresource(&mut data, 16, 256).unwrap();
+        assert_eq!(last.len(), 32);
+        last.fill(0);
+        assert_eq!(&data[..16], &[0xff; 16]);
+        assert_eq!(&data[16..], &[0; 32]);
+        assert!(staging_subresource(&mut data, 49, 256).is_none());
     }
 }
