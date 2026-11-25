@@ -2011,7 +2011,8 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
-/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go; `=clock`: all that are idle
+/// for the time the card's use gives, not by need.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2035,14 +2036,35 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
+    // `VICTORY_TEXTURE_SWEEP=clock`: by the time the card's use gives alone,
+    // all that are idle, as before either rule by need.
+    static BY_CLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_clock = *BY_CLOCK.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "clock"));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
+        Some([budget, used, ..]) if keep && !by_clock => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    };
+    // The system's commit asks too (`crate::host::texture_bytes_wanted_back`):
+    // the card may have room while little commit is left. Then what it wants
+    // back goes, the longest idle first, whatever the card's rule keeps. (The
+    // second is what protects a host texture handed out and not yet recorded:
+    // see above.)
+    let for_commit = if by_clock {
+        0
+    } else {
+        crate::host::texture_bytes_wanted_back(crate::host::available_system_memory())
+    };
+    let (idle_ms, most) = match for_commit {
+        0 => (idle_ms, most),
+        u64::MAX => (1_000, u64::MAX),
+        // (a limit of the card's with it: the larger of the two)
+        wanted if most != u64::MAX => (1_000, wanted.max(most)),
+        wanted => (1_000, wanted),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
@@ -2129,9 +2151,20 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}; {}",
                 bytes >> 10,
-                first.unwrap_or(0)
+                first.unwrap_or(0),
+                if by_clock {
+                    "by the clock (VICTORY_TEXTURE_SWEEP=clock)".to_string()
+                } else if for_commit == u64::MAX {
+                    "under 512 MiB of commit left, everything idle".to_string()
+                } else if for_commit != 0 {
+                    format!("{} KiB wanted back for the commit, the longest idle first", for_commit >> 10)
+                } else if most != u64::MAX {
+                    format!("{} KiB wanted back for the card, the longest idle first", most >> 10)
+                } else {
+                    format!("idle for {idle_ms} ms")
+                }
             )
         });
     }

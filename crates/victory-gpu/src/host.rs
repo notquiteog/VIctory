@@ -134,6 +134,38 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// What the system has left, from `GlobalMemoryStatusEx`: available physical
+/// bytes, and the commit this process can still take (`ullAvailPageFile`).
+pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+/// How many bytes of idle host copies of textures the system's commit wants
+/// back now, for [`crate::resource::let_go_idle`]: 0 while 1 GiB of commit
+/// is left, under that as much as brings it to 2 GiB (the longest idle
+/// first), and `u64::MAX` (everything idle) under 512 MiB.
+///
+/// The card's side of the same rule is [`vram_keep`], which this tree had:
+/// nothing goes while the card has room, then enough to come down. That one
+/// does not see the commit: on a PC with 32 GB the card's memory is charged
+/// to it, and what is left of it stays between 1 and 2 GB in play however
+/// much of the card's budget is unused.
+pub(crate) fn texture_bytes_wanted_back(available: Option<(u64, u64)>) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    match available {
+        Some((_, left)) if left < 512 * MIB => u64::MAX,
+        Some((_, left)) if left < GIB => 2 * GIB - left,
+        _ => 0,
+    }
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -10382,6 +10414,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn textures_go_for_the_commit_only_when_little_is_left() {
+        use super::texture_bytes_wanted_back as wanted;
+        let (mib, gib) = (1u64 << 20, 1u64 << 30);
+        assert_eq!(wanted(None), 0);
+        assert_eq!(wanted(Some((0, 8 * gib))), 0);
+        assert_eq!(wanted(Some((0, gib))), 0);
+        assert_eq!(wanted(Some((0, gib - mib))), gib + mib);
+        assert_eq!(wanted(Some((0, 512 * mib))), 2 * gib - 512 * mib);
+        assert_eq!(wanted(Some((0, 512 * mib - 1))), u64::MAX);
     }
 
     #[test]
