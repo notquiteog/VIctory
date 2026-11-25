@@ -8527,6 +8527,37 @@ impl<'a> Lower<'a> {
                 let r = self.low_half(inst, reg, r);
                 int(self, r)
             }
+            "v_cvt_pk_i16_i32" | "v_cvt_pk_u16_u32" => {
+                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_cvt_pk_i16_i32";
+                let (lo_k, hi_k) = if signed {
+                    (
+                        self.s.m.i32((-32768i32) as u32),
+                        self.s.m.i32(32767u32),
+                    )
+                } else {
+                    (self.s.m.i32(0), self.s.m.i32(65535u32))
+                };
+                let clamp16 = |l: &mut Self, x: V| -> V {
+                    if signed {
+                        let lt = l.s.m.cmp(c, pred::SLT, x, lo_k);
+                        let t = l.s.m.select(c, lt, lo_k, x);
+                        let gt = l.s.m.cmp(c, pred::SGT, t, hi_k);
+                        l.s.m.select(c, gt, hi_k, t)
+                    } else {
+                        let gt = l.s.m.cmp(c, pred::IUGT, x, hi_k);
+                        l.s.m.select(c, gt, hi_k, x)
+                    }
+                };
+                let m16 = self.s.m.i32(0xFFFF);
+                let k16 = self.s.m.i32(16);
+                let lo = clamp16(self, a);
+                let lo = self.s.m.bin(c, Bin::And, lo, m16);
+                let hi = clamp16(self, bb);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                int(self, r)
+            }
             "v_pack_b32_f16" => {
                 // Two f16 sources (op_sel: their high halves; abs and neg on
                 // the sign bit) into the low and high half.
@@ -9242,6 +9273,8 @@ impl<'a> Lower<'a> {
         ];
         const FLOAT3: &[&str] = &[
             "v_fma_f16",
+            "v_fmaak_f16",
+            "v_fmamk_f16",
             "v_mad_f16",
             "v_fmac_f16",
             "v_mac_f16",
@@ -9405,7 +9438,8 @@ impl<'a> Lower<'a> {
             let r = match name {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_fma_f16" | "v_fmaak_f16" | "v_fmamk_f16" | "v_fmac_f16" | "v_mad_f16"
+                | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
