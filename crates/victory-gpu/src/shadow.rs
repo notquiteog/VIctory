@@ -559,7 +559,13 @@ mod card_tests {
             for (from, to) in [(0, len), (0, 1), (16, PIECE), (PIECE - 4, PIECE + 4), (2 * PIECE, len), (12345, 4 * PIECE + 7)] {
                 let span = card_span_of(start, from, to);
                 for i in 0..span.pieces {
-                    let (lo, hi) = card_piece_of(start, len, &span, i);
+                    // (All of the piece that lies in the span: every page of it changed.)
+                    let whole = span.changed_ranges(i, u16::MAX).fold(None, |all: Option<(usize, usize)>, (a, b)| {
+                        Some(all.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b))))
+                    });
+                    let Some((lo, hi)) = whole else {
+                        continue;
+                    };
                     let at = crate::host::inflight_piece_from(&span, i);
                     assert_eq!(at % 16, 0);
                     assert!(lo >= at && hi - at <= slot, "{start:#x} {from} {to} piece {i}: {lo}..{hi} from {at}");
@@ -4372,7 +4378,7 @@ mod card_merge_tests {
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
             slot[shader_byte] ^= 0xc3;
-            let written = shadow.card_merge_relay(0, &slot, 6, &mut Vec::new());
+            let written = shadow.card_merge_relay(0, &slot, 6, &mut Vec::new(), &crate::writeback::Owners::single(1));
             assert!(written > 0);
             drop(shadow);
             title

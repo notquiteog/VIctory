@@ -1606,7 +1606,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1653,7 +1653,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            0,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -1760,14 +1760,21 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
                 (2, 12, 1),
                 IN_PARTS,
             ));
-            done_on(&warp.list, &dst_buf);
+            // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )])
+            };
             // SAFETY: an open list and live buffers.
             unsafe { warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 24) };
             warp.submit_and_wait();
@@ -2006,7 +2013,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
-            false,
+            0,
         ));
 
         // SAFETY: open command list; copy clamped scratch buffer (left
@@ -2192,7 +2199,7 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_DRAW, STRIDE, counts.len() as u32),
-            false,
+            0,
         ));
         // SAFETY: an open list; the clamped records are copied for the check.
         unsafe {
@@ -2434,7 +2441,7 @@ void main() {
                 (src, 0),
                 None,
                 (KIND_DISPATCH, STEP, groups.len() as u32),
-                true,
+                AHEAD,
             ));
             state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
             // SAFETY: an open list; the worker's root signature and

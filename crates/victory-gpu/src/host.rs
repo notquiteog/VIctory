@@ -9973,13 +9973,13 @@ void main() {
         const LEFT: u32 = 0x600D_0002;
         // Flight A, and the card has run it.
         let a = record(20, HALF_WAY, LEFT, 16);
-        let (submitted, mut sent_a) = host.submit(&[&a], true).expect("flight A sent ahead");
+        let (submitted, mut sent_a, _) = host.submit(&[&a], true).expect("flight A sent ahead");
         let fence_a = *submitted;
         drop(submitted);
         wait_for(fence_a);
         // Flight B: the same piece, through the half-way value, for seconds.
         let b = record(20, HALF_WAY, LEFT, spin);
-        let (submitted, mut sent_b) = host.submit(&[&b], true).expect("flight B sent ahead");
+        let (submitted, mut sent_b, _) = host.submit(&[&b], true).expect("flight B sent ahead");
         let fence_b = *submitted;
         drop(submitted);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -9991,7 +9991,7 @@ void main() {
         let mut fetch = None;
         {
             let plan = sent_a.card.as_ref().expect("flight A has a plan for the card's copies");
-            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number);
+            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number, &crate::writeback::Owners::single(sent_a.number));
         }
         for (copy, ranges) in &sent_a.back {
             copy.copy_back_done(ranges);
@@ -10011,7 +10011,7 @@ void main() {
         wait_for(fence_b);
         {
             let plan = sent_b.card.as_ref().expect("flight B has a plan for the card's copies");
-            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number);
+            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number, &crate::writeback::Owners::single(sent_b.number));
         }
         for (copy, ranges) in &sent_b.back {
             copy.copy_back_done(ranges);
