@@ -918,13 +918,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            // A PC with an integrated and a discrete card: the default
-            // adapter is the one the desktop is on, which may be the
-            // integrated one.
-            match fastest_adapter() {
-                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-            }
+            device = Some(victory_shader::emit::host::create_preferred_device()?);
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -1006,10 +1000,15 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        if let Some(desc) = adapter.as_ref().and_then(|adapter| adapter.GetDesc1().ok()) {
-            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-            let name = String::from_utf16_lossy(&desc.Description[..end]);
-            tracing::info!(%name, vendor = format_args!("{:#06x}", desc.VendorId), device = format_args!("{:#06x}", desc.DeviceId), "host D3D12 adapter");
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            let name = String::from_utf16_lossy(&desc.Description);
+            tracing::info!(
+                adapter = name.trim_end_matches('\0'),
+                vendor = format_args!("{:#06x}", desc.VendorId),
+                device = format_args!("{:#06x}", desc.DeviceId),
+                vram_mb = desc.DedicatedVideoMemory >> 20,
+                "host D3D12 adapter"
+            );
         }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
@@ -1037,41 +1036,6 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
-    }
-}
-
-/// The first hardware adapter in DXGI's high-performance order (the discrete
-/// card before the integrated one). `VICTORY_ADAPTER=default` keeps the
-/// system's default adapter. None where the factory is too old to ask.
-/// (After Belobug 754f401.)
-fn fastest_adapter() -> Option<IDXGIAdapter1> {
-    if std::env::var_os("VICTORY_ADAPTER").is_some_and(|v| v == "default") {
-        return None;
-    }
-    // SAFETY: plain DXGI adapter queries.
-    unsafe {
-        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let found = (0..)
-            .map_while(|index| {
-                factory
-                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
-                    .ok()
-            })
-            .find(|adapter| {
-                adapter.GetDesc1().is_ok_and(|desc| {
-                    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !(desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
-                })
-            })?;
-        if let Ok(desc) = found.GetDesc1() {
-            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-            tracing::info!(
-                name = %String::from_utf16_lossy(&desc.Description[..end]),
-                vendor = format_args!("{:#06x}", desc.VendorId),
-                dedicated_mb = desc.DedicatedVideoMemory >> 20,
-                "host device on the high-performance adapter (VICTORY_ADAPTER=default: the system's default one)"
-            );
-        }
-        Some(found)
     }
 }
 
