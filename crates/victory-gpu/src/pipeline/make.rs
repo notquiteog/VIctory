@@ -506,6 +506,7 @@ fn wait(p: &Pending, frame: u64) {
     let waited = started.elapsed().min(left);
     past.fetch_add(waited.saturating_sub(base).as_millis() as u64, Ordering::Relaxed);
     frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(sharing, frame, left, waited, Instant::now());
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
