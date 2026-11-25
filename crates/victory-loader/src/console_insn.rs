@@ -97,6 +97,110 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// Whether a `mwaitx` sleeps in Windows until the value it watches moves, once its wait has
+/// spun for [`SPIN_US`]. The title waits for a fence by reading the fence's value in memory
+/// with `monitorx` / `mwaitx`; on an Intel processor each of the two is an exception, and
+/// the loop takes them a hundred thousand times a second and more, a hardware thread kept
+/// busy in Windows' exception dispatch. Asleep, the loop costs two exceptions per wake. The
+/// fence side wakes the address when it sets a value (`victory_gpu::fence::set`, the same
+/// switch); any other writer is seen within 1 ms. On by default; `VICTORY_MWAITX_SLEEP=0`
+/// spins as before. Hand-ported from fxceless/victory-fork#1029.
+pub fn sleeps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_SLEEP").is_none_or(|v| v != "0"))
+}
+
+/// Whether `monitorx` / `mwaitx` are patched in place at their first exception
+/// (`VICTORY_MWAITX_PATCH=1`; off by default): `monitorx` to a NOP, `mwaitx` to `pause` and
+/// NOPs. No exception after that: the title's loop spins in user mode. It goes before
+/// [`sleeps`] when both are set.
+fn patches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_PATCH").is_some_and(|v| v == "1"))
+}
+
+/// Microseconds a wait spins as before until it sleeps: short waits stay short.
+const SPIN_US: u128 = 50;
+/// A `mwaitx` this long after the thread's last one starts a new wait.
+const GAP_US: u128 = 2000;
+
+/// `mwaitx` waits slept so far: woken, and timed out after 1 ms.
+static SLEPT_WOKEN: AtomicU64 = AtomicU64::new(0);
+static SLEPT_TIMED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The address this thread's last `monitorx` armed.
+    static MONITOR: Cell<usize> = const { Cell::new(0) };
+    /// When this thread's current wait began and when its last `mwaitx` was.
+    static WAIT: Cell<Option<(std::time::Instant, std::time::Instant)>> = const { Cell::new(None) };
+    /// The monitored address this thread last found readable.
+    static WATCHED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The bytes that stand in for a `len`-byte instruction: `head`, then NOPs.
+fn stand_in(head: &[u8], len: usize) -> Vec<u8> {
+    let mut bytes = vec![0x90u8; len.max(head.len())];
+    bytes[..head.len()].copy_from_slice(head);
+    bytes.truncate(len);
+    bytes
+}
+
+/// Writes `bytes` over the code at `rip`; whether it was written.
+///
+/// # Safety
+/// `rip` is the start of an instruction of `bytes.len()` bytes the faulting thread stands at.
+unsafe fn patch_code(rip: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut old = 0u32;
+    // SAFETY: the instruction's own bytes, made writable for the patch and restored.
+    unsafe {
+        if VirtualProtect(rip as *const _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), rip as *mut u8, bytes.len());
+        VirtualProtect(rip as *const _, bytes.len(), old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), rip as *const _, bytes.len());
+    }
+    true
+}
+
+/// A `mwaitx` of this thread: asleep until the 8 bytes at the monitored address move, a wake
+/// comes or 1 ms goes by, once the wait has spun past [`SPIN_US`]. False: not slept (the
+/// wait is young, or the address is not one to sleep on); the caller spins as before.
+/// shortcut: an address found readable once is not asked about again for this thread: the
+/// title reads it itself around every `mwaitx` of its loop, so one freed meanwhile faults
+/// in the title's own read first.
+fn sleep_on_monitor() -> bool {
+    use windows_sys::Win32::System::Threading::WaitOnAddress;
+    let now = std::time::Instant::now();
+    let begin = match WAIT.with(Cell::get) {
+        Some((begin, last)) if now.duration_since(last).as_micros() < GAP_US => begin,
+        _ => now,
+    };
+    WAIT.with(|w| w.set(Some((begin, now))));
+    let address = MONITOR.with(Cell::get);
+    if address == 0 || !address.is_multiple_of(8) || now.duration_since(begin).as_micros() < SPIN_US {
+        return false;
+    }
+    if WATCHED.with(Cell::get) != address {
+        if !readable(address, 8) {
+            return false;
+        }
+        WATCHED.with(|w| w.set(address));
+    }
+    let word = address as *const u64;
+    // SAFETY: 8 readable, aligned bytes (above).
+    let seen = unsafe { std::ptr::read_volatile(word) };
+    // SAFETY: both pointers are to 8 readable bytes; Windows compares and sleeps.
+    let woke = unsafe { WaitOnAddress(word.cast(), (&raw const seen).cast(), 8, 1) } != 0;
+    if woke { &SLEPT_WOKEN } else { &SLEPT_TIMED }.fetch_add(1, Relaxed);
+    // the sleep is not part of the gap that starts a new wait
+    WAIT.with(|w| w.set(Some((begin, std::time::Instant::now()))));
+    true
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -149,8 +253,24 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        ConsoleOnly::Monitorx => {
+            // SAFETY: the `len` bytes of this instruction, which the thread stands at.
+            if patches() && unsafe { patch_code(rip, &stand_in(&[0x0F, 0x1F, 0x00], len)) } {
+                // nop dword [rax]: the same instruction runs again, patched
+                return CONTINUE_EXECUTION;
+            }
+            MONITOR.with(|m| m.set(ctx.Rax as usize));
+        }
+        ConsoleOnly::Mwaitx => {
+            // SAFETY: as above.
+            if patches() && unsafe { patch_code(rip, &stand_in(&[0xF3, 0x90], len)) } {
+                // pause: the same instruction runs again, patched
+                return CONTINUE_EXECUTION;
+            }
+            if !(sleeps() && sleep_on_monitor()) {
+                std::hint::spin_loop()
+            }
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -242,6 +362,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             emulated,
             asked = ASKED.load(Relaxed),
             zeroed_mb = ZEROED.load(Relaxed) >> 20,
+            mwaitx_slept_woken = SLEPT_WOKEN.load(Relaxed),
+            mwaitx_slept_timed_out = SLEPT_TIMED.load(Relaxed),
             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
         );
     }

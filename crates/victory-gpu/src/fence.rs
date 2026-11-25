@@ -109,11 +109,26 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
+/// Whether a fence that moves wakes the threads asleep on its value (the same switch as the
+/// loader's `console_insn::sleeps`, on unless `VICTORY_MWAITX_SLEEP=0`): the title waits for
+/// a fence by reading its value in memory with `monitorx` / `mwaitx`, which on an Intel
+/// processor the loader turns into a sleep on that address once the wait has spun a while.
+#[cfg(windows)]
+fn wakes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MWAITX_SLEEP").is_none_or(|v| v != "0"))
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    #[cfg(windows)]
+    if wakes() {
+        // SAFETY: the address of the fence's own value, alive while the fence is.
+        unsafe { windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast()) };
+    }
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
