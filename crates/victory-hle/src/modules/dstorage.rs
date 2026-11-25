@@ -568,21 +568,36 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let next_read = |without_staging| {
+            self.lanes
+                .iter()
+                .filter_map(|(&id, lane)| {
+                    let (seq, request) = lane.reads.front()?;
+                    let staging = staging_bytes(request);
+                    if without_staging && staging != 0 {
+                        return None;
+                    }
+                    let class = lane.class;
+                    Some((self.clock[class], class, lane.clock, *seq, id, staging))
+                })
+                .min()
+        };
+        let selected = next_read(false)?;
+        let (_, class, _, _, id, staging) = if selected.5 != 0
+            && self.staged > 0
+            && self.staged + selected.5 > self.staging
+        {
+            // Do not let smaller buffered reads keep a large read waiting
+            // forever, but other queues can still run without staging.
+            let raw = next_read(true);
             self.starved = true;
             self.refused += 1;
-            return None;
-        }
-        lane.reads.pop_front();
+            raw?
+        } else {
+            selected
+        };
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -1618,6 +1633,33 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn raw_reads_from_other_queues_can_run_while_staging_drains() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+        let running = l.start().unwrap();
+
+        l.lanes.insert(1, Lane::new(-1, 64));
+        l.lanes.insert(2, Lane::new(1, 64));
+        l.lanes.insert(3, Lane::new(0, 64));
+        read(&mut l, 1, ZLIB, 120);
+        read(&mut l, 2, 0, 1000);
+        read(&mut l, 3, ZLIB, 10);
+        for id in 1..=3 {
+            l.submit(id);
+        }
+
+        let raw = l.start().expect("a raw read does not need staging space");
+        assert_eq!((raw.lane, raw.staging), (2, 0));
+        assert_eq!(l.staged, 60);
+        assert!(l.start().is_none(), "reserve staging for the blocked request");
+        l.finish(&running, Ok(()));
+        let next = l.start().unwrap();
+        assert_eq!((next.lane, next.staging), (1, 120));
     }
 
     #[test]

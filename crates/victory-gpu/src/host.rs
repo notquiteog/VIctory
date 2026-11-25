@@ -741,6 +741,22 @@ fn create() -> windows::core::Result<Host> {
             supported = upload,
             "GPU upload heaps (the card's memory written by the CPU through a resizable BAR; VICTORY_WINDOW_UPLOAD=1 puts windows outside buffers there)"
         );
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_7,
+        };
+        let sm67 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0;
+        victory_shader::emit::set_helper_lane_waves(sm67);
+        tracing::info!(
+            sm67,
+            "host shader model 6.7 (wave operations over helper lanes)"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

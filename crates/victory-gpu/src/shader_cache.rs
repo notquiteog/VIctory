@@ -71,6 +71,9 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::group_sync()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
+            // And whether pixel shaders' wave operations include helper
+            // lanes (shader model 6.7 on the host).
+            u32::from(victory_shader::emit::helper_lane_waves()),
         ] {
             hash.update(&n.to_le_bytes());
         }
