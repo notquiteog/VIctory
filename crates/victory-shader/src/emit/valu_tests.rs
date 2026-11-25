@@ -399,6 +399,30 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
 }
 
 #[test]
+fn tbuffer_d16_loads_saturate_32_bit_integers() {
+    // tbuffer_load_format_d16_x of a 32-bit integer: RDNA2 saturates it to
+    // 16 bits (UINT to 0xFFFF, SINT to -32768..32767) rather than keeping
+    // its low half (measured on gfx1031 and gfx1036). Only the low half of
+    // the result is compared: what an odd last channel leaves in the high
+    // half is a separate question.
+    let x = 8;
+    // (format, dword stored, low half loaded)
+    let cases: &[(u8, u32, u32)] = &[
+        (20, 70000, 0xFFFF),              // 32_UINT: past 0xFFFF
+        (20, 5, 5),                       // in range: as stored
+        (21, 70000, 0x7FFF),              // 32_SINT: past 32767
+        (21, (-65536i32) as u32, 0x8000), // below -32768
+        (21, (-5i32) as u32, 0xFFFB),     // in range: the low half
+    ];
+    for &(format, stored, want) in cases {
+        let shader = tbuffer_load_of_v1(x, format);
+        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got & 0xFFFF, want, "{backend}: d16_x format {format} of {stored:#x} = {got:#010x}, want low half {want:#06x}");
+        });
+    }
+}
+
+#[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
     let x = 0;
