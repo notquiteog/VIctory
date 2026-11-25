@@ -599,6 +599,11 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = fastest_adapter() {
+            // A PC with an integrated and a discrete card: the default
+            // adapter is the one the desktop is on, which may be the
+            // integrated one.
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -704,6 +709,34 @@ impl Host {
 /// builds with `VICTORY_D3D12_WARP`.
 pub(crate) fn on_warp() -> bool {
     cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+}
+
+/// The first hardware adapter in DXGI's high-performance order (the discrete
+/// card before the integrated one). `VICTORY_ADAPTER=default` keeps the
+/// system's default adapter. None where the factory is too old to ask.
+fn fastest_adapter() -> Option<IDXGIAdapter1> {
+    if std::env::var_os("VICTORY_ADAPTER").is_some_and(|v| v == "default") {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..)
+            .map_while(|index| {
+                factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        index,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+            })
+            .find(|adapter| {
+                adapter.GetDesc1().is_ok_and(|desc| {
+                    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                        && !(desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+                })
+            })
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
