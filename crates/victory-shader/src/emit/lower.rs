@@ -5633,13 +5633,18 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        // AMD RDNA2 ISA Guide (Scalar Memory Operations): address components
+        // are in bytes, with their two LSBs ignored independently before summing.
+        let imm_offset = (*offset as u32) & !3;
+        let total_offset = imm_offset.wrapping_add(base);
+        let mut addr = self.s.m.i32(total_offset);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
+            let mask = self.s.m.i32(!3u32);
+            let so = self.s.m.bin(c, Bin::And, so, mask);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -5737,7 +5742,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(total_offset)
             }
             _ => None,
         };
