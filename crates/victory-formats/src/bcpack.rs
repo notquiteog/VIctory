@@ -352,9 +352,8 @@ impl Lane {
             return Ok(());
         }
         let mut x = self.x;
-        if x < LOW
-            && let Some(b) = self.latch.take()
-        {
+        let refill = if x < LOW { self.latch.take() } else { None };
+        if let Some(b) = refill {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
         }
@@ -378,17 +377,14 @@ impl Lane {
             };
             self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
             self.out = Some(sym as u8);
-        } else if self.left != 0 {
-            // At exactly 2^24 the lane neither reads nor decodes again; only a
-            // lane that has delivered its symbols may end up there.
+        } else if self.left != 0 || (refill.is_some() && x < LOW) {
+            // A final byte that still leaves x below LOW goes through the
+            // drain phase for one step before this lane asks for a header.
             self.x = x;
         } else {
-            // The fragment ends; a byte read in this step does not reach the carried state.
             self.phase = 0;
             self.need = self.latch.is_none();
-            if self.reset {
-                self.x = 0;
-            }
+            self.x = if self.reset { 0 } else { x };
         }
         Ok(())
     }
@@ -1333,6 +1329,24 @@ mod tests {
         };
         assert_eq!(dst[..8], block(138, 125, &|p| p & 7));
         assert_eq!(dst[8..], block(139, 126, &|p| (p + 1) & 7));
+    }
+
+    #[test]
+    fn unflushed_fragments_can_split_a_refill() {
+        // Both lanes decode 31 at state 0x0100ffff, leaving 0x100.
+        // They need two bytes to reach 0x0100fffe and decode 30. Lane 0
+        // takes the first byte before its fragment boundary and drains for
+        // a clock. Lane 1 takes both bytes after its boundary. The different
+        // boundaries make an early header request change the byte order.
+        let src = [
+            0x0c, 0x0c, 4, 3, 1, 1, 0, 0, 255, 255, 255, 255, 255, 0x1d, 0x1d, 1, 0, 255, 254, 254,
+        ];
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        let tables = Tables::builtin().unwrap();
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [31, 31, 30, 30]);
+        assert_eq!(bytes.next(), None);
     }
 
     #[test]
