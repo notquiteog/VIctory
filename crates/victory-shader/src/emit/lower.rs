@@ -9465,7 +9465,10 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // Float-source conversions (`v_cvt_{u16,i16}_f16`) apply `abs`/`neg`
+        // via `half_fsrc`, while integer-source ops reject them.
+        let float_src = matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16");
+        if v.clamp || v.omod != 0 || (!float_src && (v.abs != 0 || v.neg != 0)) {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
