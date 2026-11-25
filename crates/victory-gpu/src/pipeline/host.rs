@@ -808,6 +808,9 @@ impl HostPipeline {
                 return None;
             }
         };
+        #[cfg(feature = "diagnostics")]
+        tracing::info!(?shaders, state = %g.describe(), "host pipeline");
+        #[cfg(not(feature = "diagnostics"))]
         tracing::info!(?shaders, "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
