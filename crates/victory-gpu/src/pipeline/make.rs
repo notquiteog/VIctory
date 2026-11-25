@@ -52,7 +52,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
     } else if too_dear(shaders) {
-        Some("too dear to compile, left out")
+        Some("activates the screen probes' rays: too dear to compile, or no rays to activate; left out")
     } else {
         None
     }
@@ -72,9 +72,20 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// 0.8 GB more every 10 s for it and did not finish (RX 7800 XT: 47 GB after
 /// 8 minutes); cleaned up, it takes 85 s and 1.3 GB, once.
 /// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
+///
+/// It is also left out, unless `VICTORY_ACTIVATE_RAYS=1`, in a run whose rays
+/// cannot trace (no `VICTORY_BVH_BUILDER=1`): it tells the screen probes
+/// which rays to trace. After Belobug 6986a57: once its pipeline was made on
+/// an RX 9070 XT and it ran with no rays behind it, the whole picture lost
+/// light, shadows and reflections (its runs opt31b against sans39).
+/// shortcut: left out by name; not seen on a card of ours.
 fn too_dear(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let out = *OUT.get_or_init(|| match std::env::var_os("VICTORY_ACTIVATE_RAYS") {
+        Some(v) if v == "0" => true,
+        Some(v) if v == "1" => false,
+        _ => !super::rays_may_run(),
+    });
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 

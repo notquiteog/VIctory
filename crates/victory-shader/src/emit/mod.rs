@@ -98,6 +98,7 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
+mod uniform;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

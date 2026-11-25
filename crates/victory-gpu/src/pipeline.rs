@@ -84,9 +84,6 @@ pub(crate) struct Followed {
     /// It writes the title's reflections for the last time in a frame
     /// ([`crate::ambient::REFLECTED`]).
     pub(crate) ends_reflections: bool,
-    /// It tells the screen probes which rays to trace
-    /// ([`crate::ambient::ACTIVATES_RAYS`]).
-    pub(crate) activates_rays: bool,
 }
 
 #[cfg(windows)]
@@ -97,7 +94,6 @@ impl Followed {
             resolves_light: has(crate::ambient::PROGRAM),
             draws_sky: has(crate::ambient::SKY),
             ends_reflections: has(crate::ambient::REFLECTED),
-            activates_rays: has(crate::ambient::ACTIVATES_RAYS),
         }
     }
 }
@@ -515,37 +511,6 @@ pub(crate) fn builder_runs() -> bool {
 #[cfg(windows)]
 pub(crate) fn rays_may_run() -> bool {
     builder_allowed()
-}
-
-/// Whether a dispatch of the title's pipeline `this` is left out because it
-/// only serves rays that do not run: the program that tells the screen
-/// probes which rays to trace ([`crate::ambient::ACTIVATES_RAYS`]), in a run
-/// whose rays cannot trace. `VICTORY_ACTIVATE_RAYS=1` has it run.
-/// shortcut: left out. After Belobug 6986a57: once that program ran with no
-/// rays behind it, the whole picture lost light, shadows and reflections
-/// (its runs opt31b against sans39, on an RX 9070 XT); not seen on a card of
-/// ours.
-#[cfg(windows)]
-pub(crate) fn idle_without_rays(this: This) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
-    if this.is_null()
-        || rays_may_run()
-        || *RUN.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "1"))
-    {
-        return false;
-    }
-    let p = pipeline(this);
-    if !p.shaders.iter().any(|s| s.stage == "compute" && s.followed.activates_rays) {
-        return false;
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        tracing::info!(
-            shaders = ?p.shaders,
-            "the program that activates the screen probes' rays is left out: no rays run (VICTORY_ACTIVATE_RAYS=1 has it run)"
-        );
-    });
-    true
 }
 
 #[cfg(windows)]

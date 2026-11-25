@@ -70,6 +70,7 @@ translation_inputs! {
     "emit/shader.rs",
     "emit/threading.rs",
     "emit/typed_views.rs",
+    "emit/uniform.rs",
     "emit/validator.rs",
     "emit/wave.rs",
     "gfx10/fields.rs",

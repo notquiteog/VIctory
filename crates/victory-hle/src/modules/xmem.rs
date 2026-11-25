@@ -86,6 +86,92 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+/// Address space below 4 GiB kept free from the start of the run for the
+/// title's 32-bit graphics memory (start, bytes). The host's own startup
+/// (the graphics driver above all) takes pieces of the low 4 GiB before the
+/// title asks; on an NVIDIA RTX 5080 the title's first 32-bit reservation
+/// (185 MB) then found no room and the title stopped at its start
+/// (`STATUS_NO_MEMORY`; Belobug/VIctory-Belobug-AMD#157). Released at the
+/// title's first 32-bit request, which then has this hole.
+static LOW_KEPT: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+/// Keeps `VICTORY_LOW_RESERVE_MB` (1024 by default, 0 for none) of address
+/// space below 4 GiB free for the title, or half or a quarter of it if that
+/// much is not free in one piece. Called before anything else of the run.
+pub fn reserve_low_memory() {
+    let mb = std::env::var("VICTORY_LOW_RESERVE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1024)
+        .min(3072);
+    if mb == 0 {
+        return;
+    }
+    for size in [mb << 20, mb << 19, mb << 18] {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: std::ptr::null_mut(),
+            HighestEndingAddress: u32::MAX as usize as *mut c_void,
+            Alignment: 0,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a reservation of our own, no access; the parameter points
+        // at `requirements`, which outlives the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                size,
+                MEM_RESERVE,
+                PAGE_NOACCESS,
+                &mut parameter,
+                1,
+            )
+        };
+        if !at.is_null() {
+            tracing::info!(at = format_args!("{at:p}"), mb = size >> 20, "address space below 4 GiB kept for the title");
+            *LOW_KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some((at as usize, size));
+            return;
+        }
+    }
+    tracing::warn!(mb, "no address space below 4 GiB could be kept for the title");
+}
+
+/// Gives the address space [`reserve_low_memory`] kept back, once.
+fn release_low_memory() {
+    let kept = LOW_KEPT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some((at, size)) = kept {
+        // SAFETY: our own reservation, nothing in it.
+        unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+        tracing::info!(at = format_args!("{at:#x}"), mb = size >> 20, "address space below 4 GiB given to the title");
+    }
+}
+
+/// The largest free piece of address space below 4 GiB and all of it free
+/// there, in bytes (for the log when a 32-bit request fails).
+fn low_free() -> (usize, usize) {
+    let (mut at, mut largest, mut total) = (0x10000usize, 0, 0);
+    while at < u32::MAX as usize {
+        // SAFETY: plain data, filled by the query below.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into a sized structure.
+        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 || info.RegionSize == 0 {
+            break;
+        }
+        if info.State == 0x10000 {
+            // MEM_FREE
+            let end = (info.BaseAddress as usize + info.RegionSize).min(u32::MAX as usize + 1);
+            let len = end.saturating_sub(info.BaseAddress as usize);
+            largest = largest.max(len);
+            total += len;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+    (largest, total)
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -94,6 +180,9 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    if highest <= u32::MAX as usize {
+        release_low_memory();
+    }
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -173,6 +262,15 @@ pub extern "system" fn XMemVirtualAlloc(
                 error,
                 "XMemVirtualAlloc failed"
             );
+            if constrained && highest <= u32::MAX as usize {
+                let (largest, total) = low_free();
+                tracing::warn!(
+                    size,
+                    largest_free = largest,
+                    free_below_4gib = total,
+                    "XMemVirtualAlloc: no room below 4 GiB for 32-bit graphics memory"
+                );
+            }
         }
         // SAFETY: restores this thread's error after logging.
         unsafe { SetLastError(error) };

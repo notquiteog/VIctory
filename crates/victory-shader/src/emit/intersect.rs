@@ -25,7 +25,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, RootType, Tag, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
 
@@ -326,6 +326,86 @@ impl<'a> Lower<'a> {
         self.end_guarded(hit, &[]);
     }
 
+    /// Title memory at `lo`/`hi`: the raw view of the host copy holding the
+    /// page and the byte offset in it. A page without a copy reads zeros
+    /// and drops writes (the null view at `base`), and its 64 KiB page
+    /// number is left for the host, for lanes that run (`guard`).
+    pub(super) fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
+        use crate::emit::shader::{
+            MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
+        };
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k16, k8) = (k(self, 16), k(self, 0xFF));
+        let low = self.s.m.bin(c, Bin::LShr, lo, k16);
+        let high = self.s.m.bin(c, Bin::And, hi, k8);
+        let high = self.s.m.bin(c, Bin::Shl, high, k16);
+        let page = self.s.m.bin(c, Bin::Or, low, high);
+        // Inside the directory whatever the address (lanes that do not run
+        // compute one too); its last entry is never filled.
+        let last = k(self, MEMORY_PAGES - 1);
+        let page = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+        self.s.m.tag(page, Tag::Clamp);
+        let k3 = k(self, 3);
+        let at = self.s.m.bin(c, Bin::Shl, page, k3);
+        let directory = self.s.root_srv_handle(SLOT_MEMORY);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), k(self, 4));
+        let entry = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            res,
+            139,
+            &[directory, at, iu, both, align],
+        );
+        let (copy, start) = (self.s.m.extract(c, entry, 0), self.s.m.extract(c, entry, 1));
+        let (copy, start) = (self.as_int(copy), self.as_int(start));
+        // A page without a copy: its number, at a place by the number, only
+        // when an active lane misses; mapped accesses skip the modulo and store.
+        let zero = k(self, 0);
+        // A newer command list can publish more pages after this one has
+        // recorded. Only reference descriptors prepared for this particular bind.
+        let count = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 1);
+        let in_range = self.s.m.cmp(c, pred::IULE, copy, count);
+        let copy = self.s.m.select(c, in_range, copy, zero);
+        let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
+        if let Some(g) = guard {
+            missing = self.s.m.bin(c, Bin::And, missing, g);
+        }
+        let fault_gate = self.begin_guarded(Some(missing));
+        let fc = self.cur;
+        let places = k(self, MEMORY_FAULTS - 1);
+        let place = self.s.m.bin(fc, Bin::URem, page, places);
+        let one = k(self, 1);
+        let place = self.s.m.bin(fc, Bin::Add, place, one);
+        let k2 = k(self, 2);
+        let place = self.s.m.bin(fc, Bin::Shl, place, k2);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let void = self.s.t.void;
+        let mask = self.s.m.i8(1);
+        self.s.op(
+            fc,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[faults, place, iu, page, iu, iu, iu, mask, align],
+        );
+        self.end_guarded(fault_gate, &[]);
+        let c = self.cur;
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
+        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
+        (h, byte, mapped)
+    }
+
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
@@ -350,29 +430,6 @@ impl<'a> Lower<'a> {
             return (handle, at, inside);
         }
         self.memory(low, high, guard)
-    }
-
-    /// The second 64-byte half of a Box32 node can belong to a different
-    /// guest page and a different host buffer.
-    fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
-        match at {
-            NodeAt::Buffer { handle, byte } => {
-                let size = self.s.m.i32(64);
-                let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
-                NodeAt::Buffer { handle, byte }
-            }
-            NodeAt::Memory { low, high, .. } => {
-                let (low, high) = self.address_plus(low, high, 64);
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
-                NodeAt::Memory {
-                    handle,
-                    byte,
-                    low,
-                    high,
-                    mapped,
-                }
-            }
-        }
     }
 
     /// Reads within a single aligned 64-byte part of the node, in groups
@@ -443,13 +500,103 @@ impl<'a> Lower<'a> {
             .m
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
         // 32-bit floats: 24 dwords from byte 16.
+        // The first 12 dwords sit in the first 64-byte half (already resolved).
+        // The second 12 dwords lie in the same 64 KiB page for 1,023 of 1,024
+        // 64-byte-aligned addresses; only nodes starting at offset >= 0xFFC0
+        // cross into the next page and need a second directory lookup.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let words0 = self.bvh_node_words(at, None, 16, 12);
+        let floats0: Vec<V> = words0.iter().map(|&w| self.as_float(w)).collect();
+        enum WideJoin {
+            Buffer {
+                end: usize,
+                floats1: Vec<V>,
+            },
+            Memory {
+                first_mapped: V,
+                same_end: usize,
+                same_floats: Vec<V>,
+                cross_end: usize,
+                cross_floats: Vec<V>,
+                cross_mapped: V,
+            },
+        }
+        let wide_join = match at {
+            NodeAt::Buffer { handle, byte } => {
+                let size = self.s.m.i32(64);
+                let byte64 = self.s.m.bin(wide_block, Bin::Add, byte, size);
+                let words1 = self.bvh_node_words(
+                    NodeAt::Buffer {
+                        handle,
+                        byte: byte64,
+                    },
+                    None,
+                    0,
+                    12,
+                );
+                let floats1: Vec<V> = words1.iter().map(|&w| self.as_float(w)).collect();
+                let end = self.cur;
+                self.s.m.terminate(end, Term::Br(join));
+                WideJoin::Buffer { end, floats1 }
+            }
+            NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped: first_mapped,
+            } => {
+                let k64k = self.s.m.i32(0xFFFF);
+                let boundary = self.s.m.i32(0xFFC0);
+                let within = self.s.m.bin(wide_block, Bin::And, low, k64k);
+                let crosses = self.s.m.cmp(wide_block, pred::IUGE, within, boundary);
+                let (cross_block, same_block) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s
+                    .m
+                    .terminate(wide_block, Term::CondBr(crosses, cross_block, same_block));
+                // Fast path (99.9%): second 64 bytes stay in the same 64 KiB page.
+                self.cur = same_block;
+                let size = self.s.m.i32(64);
+                let byte64 = self.s.m.bin(same_block, Bin::Add, byte, size);
+                let same_words = self.bvh_node_words(
+                    NodeAt::Buffer {
+                        handle,
+                        byte: byte64,
+                    },
+                    None,
+                    0,
+                    12,
+                );
+                let same_floats: Vec<V> = same_words.iter().map(|&w| self.as_float(w)).collect();
+                let same_end = self.cur;
+                self.s.m.terminate(same_end, Term::Br(join));
+                // Slow path (0.1%): second 64 bytes cross a 64 KiB page boundary.
+                self.cur = cross_block;
+                let (nlow, nhigh) = self.address_plus(low, high, 64);
+                let (shandle, sbyte, cross_mapped) = self.bvh_memory(nlow, nhigh, None);
+                let cross_words = self.bvh_node_words(
+                    NodeAt::Buffer {
+                        handle: shandle,
+                        byte: sbyte,
+                    },
+                    None,
+                    0,
+                    12,
+                );
+                let cross_floats: Vec<V> = cross_words.iter().map(|&w| self.as_float(w)).collect();
+                let cross_end = self.cur;
+                self.s.m.terminate(cross_end, Term::Br(join));
+                WideJoin::Memory {
+                    first_mapped,
+                    same_end,
+                    same_floats,
+                    cross_end,
+                    cross_floats,
+                    cross_mapped,
+                }
+            }
+        };
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -471,29 +618,59 @@ impl<'a> Lower<'a> {
                 &[h],
             ));
         }
-        self.s.m.terminate(half_block, Term::Br(join));
+        let half_end = self.cur;
+        self.s.m.terminate(half_end, Term::Br(join));
         self.cur = join;
         // All child IDs are in the first part. The last two Box32 bounds
         // also require the second. A zero returned by a missing page is a
         // valid child pointer or coordinate, so the slab test alone cannot
         // distinguish it from real geometry.
-        let residency = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
-                let mapped = self.s.m.phi(join, self.s.m.type_of(first));
-                self.s
-                    .m
-                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
-                let both = self.s.m.bin(join, Bin::And, first, mapped);
-                Some([first, first, both, both])
+        let residency = match wide_join {
+            WideJoin::Memory {
+                first_mapped,
+                same_end,
+                cross_end,
+                cross_mapped,
+                ..
+            } => {
+                let mapped = self.s.m.phi(join, self.s.m.type_of(first_mapped));
+                self.s.m.set_phi(
+                    mapped,
+                    vec![
+                        (first_mapped, same_end),
+                        (cross_mapped, cross_end),
+                        (first_mapped, half_end),
+                    ],
+                );
+                let both = self.s.m.bin(join, Bin::And, first_mapped, mapped);
+                Some([first_mapped, first_mapped, both, both])
             }
-            _ => None,
+            WideJoin::Buffer { .. } => None,
         };
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
-            self.s
-                .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+            let incoming = match &wide_join {
+                WideJoin::Buffer { end, floats1 } => {
+                    let w = if n < 12 { floats0[n] } else { floats1[n - 12] };
+                    vec![(w, *end), (halves[n], half_end)]
+                }
+                WideJoin::Memory {
+                    same_end,
+                    same_floats,
+                    cross_end,
+                    cross_floats,
+                    ..
+                } => {
+                    let (sw, cw) = if n < 12 {
+                        (floats0[n], floats0[n])
+                    } else {
+                        (same_floats[n - 12], cross_floats[n - 12])
+                    };
+                    vec![(sw, *same_end), (cw, *cross_end), (halves[n], half_end)]
+                }
+            };
+            self.s.m.set_phi(phi, incoming);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

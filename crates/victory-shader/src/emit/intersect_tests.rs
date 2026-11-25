@@ -817,6 +817,11 @@ fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
             1.,
             "the unlinked leaf really intersects"
         );
+        // Mapped accesses must skip the fault UAV write completely (including slot 0).
+        assert!(
+            controls[3].iter().all(|&w| w == 0),
+            "{adapter}: mapped guest-memory accesses should not write to the fault buffer"
+        );
         let absent = query(&[Some((0, 0, ray))], PAGE + (1 << 16));
         assert_eq!(absent[0][..4], bvh::MISS.map(f32::to_bits));
         let through_origin = Ray::new([-2.; 3], [1.; 3], 20.);
@@ -860,7 +865,10 @@ fn reflected_rays_walk_linked_nodes_through_the_guest_directory() {
             [8, 16, 24, 32],
             "{adapter}: page became resident"
         );
-        assert_eq!(retried[3][fault_slot], 0);
+        assert!(
+            retried[3].iter().all(|&w| w == 0),
+            "{adapter}: mapped cross-page Box32 lookup should not write to the fault buffer"
+        );
         for (step, expected) in [Some((0, 2.)), Some((1, 3.)), Some((0, 3.)), None]
             .into_iter()
             .enumerate()
