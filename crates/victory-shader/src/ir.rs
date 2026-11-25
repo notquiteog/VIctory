@@ -732,25 +732,34 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
-/// Whether block `b` only executes scalar/no-op instructions and unconditionally
-/// ends the program within a short jump chain (including `s_getpc`/`s_setpc`
-/// long-jump trampolines to `s_endpgm`).
+/// Whether block `b` reaches the end through a short chain containing only
+/// unconditional branches and resolved far-jump trampolines.
 fn ends_trivially(p: &Program, mut b: usize) -> bool {
     for _ in 0..8 {
         let block = &p.blocks[b];
-        let trivial = block.insts.iter().all(|i| {
-            matches!(i.fields, crate::gfx10::Fields::Sopp { .. } | crate::gfx10::Fields::Sop { .. })
-                && !matches!(
-                    i.name(),
-                    "s_barrier" | "s_sendmsg" | "s_sendmsghalt" | "s_sethalt" | "s_trap"
-                )
-        });
-        if !trivial {
-            return false;
-        }
         match block.exit {
-            Exit::End => return true,
-            Exit::Jump(next) => b = next,
+            Exit::End => {
+                return block.insts.iter().all(|i| matches!(i.name(), "s_endpgm" | "s_code_end"));
+            }
+            Exit::Jump(next) => {
+                let trampoline = match block.insts.as_slice() {
+                    [] => true,
+                    [jump] => jump.name() == "s_branch",
+                    [get_pc, low, high, set_pc] => {
+                        get_pc.name() == "s_getpc_b64"
+                            && matches!(
+                                (low.name(), high.name()),
+                                ("s_add_u32", "s_addc_u32") | ("s_sub_u32", "s_subb_u32")
+                            )
+                            && set_pc.name() == "s_setpc_b64"
+                    }
+                    _ => false,
+                };
+                if !trampoline {
+                    return false;
+                }
+                b = next;
+            }
             _ => return false,
         }
     }
