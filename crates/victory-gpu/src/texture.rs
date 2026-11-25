@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -463,11 +464,33 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
+/// Whether the set above holds anything. Readers check this first: most
+/// submissions have no host-written textures, and a texture use should not
+/// take a global lock just to find an empty set.
+static HOST_WRITTEN_ANY: AtomicBool = AtomicBool::new(false);
+
+/// Whether a host copy or resolve has written `resource`.
+fn is_host_written(resource: usize) -> bool {
+    if !HOST_WRITTEN_ANY.load(Ordering::Acquire) {
+        return false;
+    }
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource))
+}
+
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
+        let new = set.get_or_insert_with(Default::default).insert(resource as usize);
+        // Store while the lock is held: a reader that sees `false` cannot
+        // see a half-inserted set, and one that sees `true` waits for the
+        // insert.
+        HOST_WRITTEN_ANY.store(true, Ordering::Release);
+        new
     };
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
@@ -536,11 +559,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
-    HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+    is_host_written(resource)
 }
 
 /// The title released a resource.
@@ -549,7 +568,22 @@ pub(crate) fn forget(resource: usize, address: u64) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    if HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|set| set.remove(&resource)) {
+    let removed = {
+        let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        match written.as_mut() {
+            Some(set) => {
+                let removed = set.remove(&resource);
+                if set.is_empty() {
+                    // Still under the lock, so a concurrent `host_written`
+                    // cannot have its store overwritten by this one.
+                    HOST_WRITTEN_ANY.store(false, Ordering::Release);
+                }
+                removed
+            }
+            None => false,
+        }
+    };
+    if removed {
         HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address, resource));
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
@@ -578,14 +612,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// placed texture the title may have no memory for the larger ones, and
 /// what lies there is another texture's.
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
+    if is_host_written(resource as usize)
+        || !list.first_use(resource as usize) && staged_from(resource) <= first
+    {
         return;
     }
     let Some(staging) = staging(resource, texture, first) else {
@@ -1308,6 +1339,76 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod host_written_tests {
+    use super::*;
+
+    /// The fast path must go back to skipping the lock once the last
+    /// host-written texture is gone.
+    #[test]
+    fn host_written_flag_clears_with_the_last_texture() {
+        const RESOURCE: usize = 0x1234_5678;
+        let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        written.replace(Default::default());
+        HOST_WRITTEN_ANY.store(false, Ordering::Release);
+        written.get_or_insert_with(Default::default).insert(RESOURCE);
+        HOST_WRITTEN_ANY.store(true, Ordering::Release);
+        drop(written);
+
+        assert!(is_host_written(RESOURCE));
+        forget(RESOURCE, 0);
+        assert!(!HOST_WRITTEN_ANY.load(Ordering::Acquire));
+        assert!(!is_host_written(RESOURCE));
+    }
+
+    /// CPU-only A/B of the check every texture use makes. Run with
+    /// `cargo test --release -p victory-gpu host_written_check_fast_path -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "synthetic CPU release benchmark"]
+    fn host_written_check_fast_path() {
+        let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = written.as_mut() {
+            set.clear();
+        }
+        HOST_WRITTEN_ANY.store(false, Ordering::Release);
+        drop(written);
+
+        const CALLS: usize = 500_000;
+        let slow = |resource: usize| {
+            HOST_WRITTEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|set| set.contains(&resource))
+        };
+
+        let mut samples = Vec::new();
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for i in 0..CALLS {
+                std::hint::black_box(slow(std::hint::black_box(i)));
+            }
+            let old = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            let started = std::time::Instant::now();
+            for i in 0..CALLS {
+                std::hint::black_box(is_host_written(std::hint::black_box(i)));
+            }
+            let new = started.elapsed().as_secs_f64() * 1e9 / CALLS as f64;
+            println!("sample {sample}: lock {old:.1} ns, atomic {new:.1} ns");
+            samples.push((old, new));
+        }
+        let mut old: Vec<f64> = samples.iter().map(|s| s.0).collect();
+        let mut new: Vec<f64> = samples.iter().map(|s| s.1).collect();
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        println!(
+            "median: lock {:.1} ns, atomic {:.1} ns",
+            old[old.len() / 2],
+            new[new.len() / 2]
+        );
+    }
 }
 
 #[cfg(test)]
