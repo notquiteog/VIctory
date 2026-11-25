@@ -433,13 +433,19 @@ fn lanes(
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
     // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
     let mut at = 0;
-    while pos < blocks * per {
+    let symbols = blocks * per;
+    while pos < symbols {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
                 lane.step(t)?;
+            }
+            // A lane may still need the tail of its current payload after its
+            // last symbol. Once both are exhausted it cannot start a header.
+            if pos + 1 == symbols && done & bit != 0 && lane.left == 0 {
+                continue;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -1235,9 +1241,7 @@ mod tests {
         out
     }
 
-    /// Interleaves per-lane fragments the way the decoder takes bytes. A lane
-    /// that has finished still asks: a filler fragment (two payload bytes)
-    /// brings its state to 2^24 with a byte latched, which parks it for good.
+    /// Interleaves per-lane fragments in the order the decoder takes bytes.
     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
         let stride = widths.len() * per;
         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
@@ -1246,9 +1250,7 @@ mod tests {
                     .iter()
                     .flat_map(|r| r[j * per..j * per + per].to_vec())
                     .collect();
-                let mut bytes = fragment(widths[j], &syms);
-                bytes.extend([0, 1, 0, 0]);
-                bytes.into()
+                fragment(widths[j], &syms).into()
             })
             .collect();
         let mut out = Vec::new();
@@ -1256,7 +1258,7 @@ mod tests {
         let fetch = |j: usize| {
             let b = queues[j]
                 .pop_front()
-                .expect("a parked lane asked for input");
+                .expect("a lane read past its fragment");
             out.push(b);
             Some(b)
         };
@@ -1273,6 +1275,44 @@ mod tests {
         } else {
             (-2 * v - 1) as u8
         }
+    }
+
+    #[test]
+    fn finished_lanes_leave_the_remaining_payload_for_their_peers() {
+        // One zero symbol per BC4 lane, using the uniform 6-bit alphabet.
+        // Symbol 0 has frequency 1023 and starts at 1. Inverting the rANS
+        // step from 2^24 gives the four big-endian payload bytes below.
+        let state = ((LOW / 1023) << 16) + (LOW % 1023) + 1;
+        let mut src = Vec::new();
+        // The feeder serves eight lanes per round. These fragments request
+        // a byte on every round, so lanes 0..8 finish before 8..12 start.
+        for batch in [0..8, 8..12] {
+            src.extend(batch.clone().map(|lane| if lane < 4 { 0x90 } else { 0x10 }));
+            src.extend(std::iter::repeat_n(3, batch.len()));
+            for byte in state.to_be_bytes() {
+                src.extend(std::iter::repeat_n(byte, batch.len()));
+            }
+        }
+        let mut dst = [0xff; 8];
+        decode(4, &src, &mut dst, &Tables::parse(&tables()).unwrap()).unwrap();
+        assert_eq!(dst, [128, 128, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_last_symbol_can_precede_its_final_payload_bytes() {
+        // Lane 0 produces 0 and 31 in one fragment and retains the two
+        // trailing zero bytes that refill its state to LOW. Lane 1 produces
+        // its two zeros in separate fragments. If lane 0 stops as soon as
+        // it emits 31, lane 1 takes the second zero as its fragment length.
+        let src = [
+            0x1c, 0x10, 5, 3, 1, 0x20, 0x3c, 4, 0x0c, 0, 0x28, 5, 0, 0x10, 0, 3, 0x20, 4, 0, 5,
+        ];
+        let tables = Tables::builtin().unwrap();
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0, 31, 0]);
+        assert_eq!(bytes.next(), None);
     }
 
     #[test]
