@@ -1152,6 +1152,64 @@ impl State {
     }
 
     /// The bound heap holding `handle`.
+    /// After a dispatch of `p`: the least indirect light, if `p` is the
+    /// program that resolves that, or the reflections held to that light,
+    /// if it is the one that writes them last ([`crate::ambient`]). Such a
+    /// pass sets a descriptor heap, a compute root signature and a pipeline
+    /// of ours: the title's are set again by the next `bind`, told here
+    /// that the list holds none of them (as `after_our_pass` tells it).
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.followed.resolves_light || s.shader.followed.ends_reflections)
+        else {
+            return;
+        };
+        if crate::ambient::level().is_none() {
+            return;
+        }
+        // The texture behind the view the program reads at that place of
+        // that table, with what keeps a placed one alive.
+        let texture = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let handle = table.checked_add(u64::from(offset) * 4)?;
+            self.heap_of(handle)?;
+            let view = crate::descriptor::view(handle)?;
+            let placed = crate::descriptor::host::placed_texture(&view);
+            let resource = match (placed.as_ref().map_or(&view, |p| &p.view), kind) {
+                (View::Unordered(r, ..), ResourceType::Uav) | (View::Shader(r, _), ResourceType::Srv) => *r,
+                _ => 0,
+            };
+            (resource != 0).then_some((resource, placed))
+        };
+        let recorded = if stage.shader.followed.resolves_light {
+            let Some(light) = texture(ResourceType::Uav, crate::ambient::LIGHT) else {
+                once!("no ambient light: the resolve's light is not where it is looked for");
+                return;
+            };
+            let depth = texture(ResourceType::Srv, crate::ambient::DEPTH);
+            crate::ambient::raise(list, light.0 as This, depth.as_ref().map(|d| d.0 as This))
+        } else {
+            match texture(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(image) => crate::ambient::hold(list, image.0 as This),
+                None => false,
+            }
+        };
+        if recorded {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [usize::MAX; 2];
+        }
+    }
+
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
             .iter()
@@ -1185,6 +1243,13 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        // The sky as the title reflects it: what the ambient light follows.
+        if p.stages.iter().any(|s| s.shader.followed.draws_sky)
+            && crate::ambient::level().is_some()
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -2450,6 +2515,13 @@ impl State {
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
+        // The program that activates the screen probes' rays, without rays.
+        if crate::pipeline::idle_without_rays(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if builder && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2549,6 +2621,7 @@ impl State {
             crate::pipeline::builder_recorded(self.pipeline as This, false);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, p);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3496,6 +3569,13 @@ impl State {
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return false;
         }
+        // The program that activates the screen probes' rays, without rays:
+        // dropped before the argument clamp too.
+        if kind == 2 && crate::pipeline::idle_without_rays(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
+            return false;
+        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -3843,6 +3923,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

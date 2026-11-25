@@ -28,6 +28,10 @@ pub(crate) fn enabled() -> bool {
 
 pub(crate) fn fields(hash: &str) -> Option<&'static [u32]> {
     match hash {
+        // The deferred character shaders read heap indices from the same
+        // material buffer; the packed variant also samples fields 28 and 32.
+        "a402e650d0acbc92" => Some(&[0, 4, 8, 12, 16, 20, 24]),
+        "b15ba4896d650511" => Some(&[0, 4, 8, 12, 16, 20, 24, 28, 32]),
         "d9fcb8a4425fc59b" | "43fc2af1f70920f1" => Some(&[0, 4, 8]),
         "271a87c54ac648a5" => Some(&[0, 4, 12, 16]),
         "d2e683031b764939" => Some(&[0, 4, 8, 16]),
@@ -391,6 +395,19 @@ mod tests {
         assert_eq!(byte_range(12, fields, 35), None);
         assert_eq!(byte_range(u32::MAX - 3, fields, u64::MAX), None);
         assert_eq!(byte_range(3, fields, 36), None);
+    }
+
+    #[test]
+    fn character_material_sampling_covers_both_record_layouts() {
+        let words = [11, 12, 13, 14, 15, 16, 17, 0xf8000012, 19];
+        let regular = fields("a402e650d0acbc92").expect("deferred character material");
+        let packed = fields("b15ba4896d650511").expect("packed deferred character material");
+
+        assert_eq!(indices(&words, regular, 20), [11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(indices(&words, packed, 20), [11, 12, 13, 14, 15, 16, 17, 18, 19]);
+        assert_eq!(byte_range(16, regular, 44), Some((16, 28)));
+        assert_eq!(byte_range(16, packed, 44), None);
+        assert_eq!(byte_range(16, packed, 52), Some((16, 36)));
     }
 
     #[test]

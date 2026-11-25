@@ -67,6 +67,39 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// What [`crate::ambient`] follows it for, by the names in its
+    /// container ([`Followed::of`]).
+    #[cfg(windows)]
+    pub(crate) followed: Followed,
+}
+
+/// The programs [`crate::ambient`] follows, by the names in a container.
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Followed {
+    /// Its result gets the least indirect light ([`crate::ambient::PROGRAM`]).
+    pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    pub(crate) ends_reflections: bool,
+    /// It tells the screen probes which rays to trace
+    /// ([`crate::ambient::ACTIVATES_RAYS`]).
+    pub(crate) activates_rays: bool,
+}
+
+#[cfg(windows)]
+impl Followed {
+    fn of(container: &[u8]) -> Self {
+        let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+        Self {
+            resolves_light: has(crate::ambient::PROGRAM),
+            draws_sky: has(crate::ambient::SKY),
+            ends_reflections: has(crate::ambient::REFLECTED),
+            activates_rays: has(crate::ambient::ACTIVATES_RAYS),
+        }
+    }
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +152,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                followed: Followed::of(bytes),
             })
         })
         .clone()
@@ -138,6 +173,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        followed: Followed::default(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -470,6 +506,45 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     b.frame_decision = Some((frame, true));
+    true
+}
+
+/// Whether the title's rays may run at all in this run: only with the
+/// structure builder (`VICTORY_BVH_BUILDER=1`). [`crate::ambient`] stands in
+/// for their light only while they cannot.
+#[cfg(windows)]
+pub(crate) fn rays_may_run() -> bool {
+    builder_allowed()
+}
+
+/// Whether a dispatch of the title's pipeline `this` is left out because it
+/// only serves rays that do not run: the program that tells the screen
+/// probes which rays to trace ([`crate::ambient::ACTIVATES_RAYS`]), in a run
+/// whose rays cannot trace. `VICTORY_ACTIVATE_RAYS=1` has it run.
+/// shortcut: left out. After Belobug 6986a57: once that program ran with no
+/// rays behind it, the whole picture lost light, shadows and reflections
+/// (its runs opt31b against sans39, on an RX 9070 XT); not seen on a card of
+/// ours.
+#[cfg(windows)]
+pub(crate) fn idle_without_rays(this: This) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    if this.is_null()
+        || rays_may_run()
+        || *RUN.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "1"))
+    {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.followed.activates_rays) {
+        return false;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            shaders = ?p.shaders,
+            "the program that activates the screen probes' rays is left out: no rays run (VICTORY_ACTIVATE_RAYS=1 has it run)"
+        );
+    });
     true
 }
 
