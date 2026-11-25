@@ -2554,11 +2554,11 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// - only the copy holds its host buffer: no descriptor slot views it (a
 ///   slot keeps the buffer it views, `HostHeap::kept`), so no draw can read
 ///   it through a slot made earlier;
-/// - nothing asked for it for `idle_ms` milliseconds and four frames.
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
 ///
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle(idle_ms: u64) {
+pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
@@ -2567,6 +2567,7 @@ pub(crate) fn let_go_idle(idle_ms: u64) {
         if map.is_empty() {
             return;
         }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
