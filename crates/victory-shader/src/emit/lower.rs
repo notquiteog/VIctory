@@ -10335,24 +10335,28 @@ impl<'a> Lower<'a> {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
                 let f16 = ty == "f16";
-                let x = if f16 {
-                    let Fields::Valu(v) = &inst.fields else {
-                        unreachable!()
-                    };
-                    let mut h = self.half_src(inst, 0)?;
-                    if v.abs & 1 != 0 {
-                        let m = self.s.m.i32(0x7FFF);
-                        h = self.s.m.bin(c, Bin::And, h, m);
-                    }
-                    if v.neg & 1 != 0 {
-                        let s = self.s.m.i32(0x8000);
-                        h = self.s.m.bin(c, Bin::Xor, h, s);
-                    }
-                    h
-                } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
                 };
+                let (mut x, abs_mask, sign_bit) = if f16 {
+                    (self.half_src(inst, 0)?, 0x7FFF, 0x8000)
+                } else {
+                    let op = *v.src.first().ok_or("a missing operand")?;
+                    let x = self.operand(inst, &op)?;
+                    let x = match Self::sdwa_src(inst, 0) {
+                        Some((sel, sext)) => self.select_bits(x, sel, sext),
+                        None => x,
+                    };
+                    (x, 0x7FFF_FFFF, 0x8000_0000)
+                };
+                if v.abs & 1 != 0 {
+                    let m = self.s.m.i32(abs_mask);
+                    x = self.s.m.bin(c, Bin::And, x, m);
+                }
+                if v.neg & 1 != 0 {
+                    let s = self.s.m.i32(sign_bit);
+                    x = self.s.m.bin(c, Bin::Xor, x, s);
+                }
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                 let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
