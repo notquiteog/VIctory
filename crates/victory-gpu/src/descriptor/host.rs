@@ -2102,15 +2102,17 @@ impl HostHeap {
         allow: impl FnOnce(&View, bool) -> bool,
     ) -> Result<Option<View>, ()> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
+            // Diagnostic (NVIDIA heap cap): the title walks its slots in
+            // increasing order, so a line per new highest slot is a line per
+            // slot, on the thread recording the frame. Said once, and the
+            // highest kept for whoever asks (Marvisak/VIctory#2634).
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) == 0 {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "title slot past the host heap: slots above the host heap's count are not mirrored (logged once)"
                 );
             }
             return Ok(None);
