@@ -42,6 +42,11 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
 
+/// The program that tells the screen probes which rays to trace, by the
+/// start of its name: left out while no rays run
+/// ([`crate::pipeline::idle_without_rays`]).
+pub(crate) const ACTIVATES_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
+
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
     static LEVEL: OnceLock<f32> = OnceLock::new();

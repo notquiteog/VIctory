@@ -2515,6 +2515,13 @@ impl State {
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
+        // The program that activates the screen probes' rays, without rays.
+        if crate::pipeline::idle_without_rays(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if builder && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3560,6 +3567,13 @@ impl State {
         if crate::pipeline::walk_held(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_why("a walk of ray-tracing structures that are not built (VICTORY_BVH_HOLD=1)".to_owned());
+            return false;
+        }
+        // The program that activates the screen probes' rays, without rays:
+        // dropped before the argument clamp too.
+        if kind == 2 && crate::pipeline::idle_without_rays(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
             return false;
         }
         const DRAW: u32 = 0;
