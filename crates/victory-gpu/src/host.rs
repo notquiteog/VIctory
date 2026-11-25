@@ -205,6 +205,39 @@ pub(crate) fn texture_idle_ms(
     vram_idle_ms(video_memory).min(system_ram_idle_ms(available))
 }
 
+/// How many bytes of idle host copies of textures should be let go now, for
+/// [`crate::resource::let_go_idle`] by need: 0 while the card and the system
+/// have room, `u64::MAX` when the system is about to run out of commit.
+///
+/// Letting go by the clock (every copy idle for 1 to 5 seconds, the time
+/// shrinking with the card's use and the commit left) empties the card of
+/// what the next turn of the camera asks for again. In one session of 40
+/// minutes on an RTX 5060 Ti 16 GB with 32 GB of memory, where the commit
+/// left stayed between 1.1 and 1.6 GB, 580,423 copies (183 GB) were let go
+/// and 370,787 (118 GB) made again, each a staging buffer, a detile and an
+/// upload, while the card had 2.5 GB of its budget unused.
+///
+/// By need: nothing goes while the card is under 86 % of its budget and the
+/// system has 1 GiB of commit left. Past either line, as much as brings the
+/// card back to 80 % and the commit left to 2 GiB, the longest idle first.
+/// Under 512 MiB of commit left everything idle goes, as by the clock.
+pub(crate) fn texture_bytes_wanted_back(video_memory: Option<[u64; 4]>, available: Option<(u64, u64)>) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    let commit = match available {
+        Some((_, left)) if left < 512 * MIB => return u64::MAX,
+        Some((_, left)) if left < GIB => 2 * GIB - left,
+        _ => 0,
+    };
+    let card = match video_memory {
+        Some([budget, used, ..]) if budget > 0 && u128::from(used) * 100 > u128::from(budget) * 86 => {
+            used.saturating_sub((u128::from(budget) * 80 / 100) as u64)
+        }
+        _ => 0,
+    };
+    commit.max(card)
+}
+
 /// How many references are held on a host object (its COM count): ours
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it

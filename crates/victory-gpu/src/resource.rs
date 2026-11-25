@@ -1803,19 +1803,46 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::texture_idle_ms(
-        crate::host::host().and_then(|h| h.video_memory()),
-        crate::host::available_system_memory(),
-    );
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let system = crate::host::available_system_memory();
+    // By need (`crate::host::texture_bytes_wanted_back`), the longest idle
+    // first, and only as much as is wanted back. `VICTORY_TEXTURE_SWEEP=clock`:
+    // every copy idle for the time the card's use and the commit left give,
+    // as before.
+    static BY_CLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_clock = *BY_CLOCK.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "clock"));
+    let wanted = if by_clock { u64::MAX } else { crate::host::texture_bytes_wanted_back(video, system) };
+    if wanted == 0 {
+        return;
+    }
+    // (By need the idle time is only what protects a host texture handed out
+    // and not yet recorded: see above.)
+    let idle_ms = if by_clock { crate::host::texture_idle_ms(video, system) } else { 1_000 };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
+    // Those that may go, by when they were last used (frame, then time).
+    let mut idle: Vec<(u64, usize)> = all
+        .iter()
+        .filter_map(|&at| {
+            // SAFETY: a texture leaves the table before it is freed, under the
+            // lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            let used = r.host.used.load(Relaxed);
+            (fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES)).then_some((used, at))
+        })
+        .collect();
+    if !by_clock {
+        idle.sort_unstable();
+    }
+    for (_, at) in idle {
+        if bytes >= wanted {
+            break;
+        }
+        // SAFETY: as above.
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        if crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
@@ -1849,9 +1876,16 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}; {}",
                 bytes >> 10,
-                first.unwrap_or(0)
+                first.unwrap_or(0),
+                if by_clock {
+                    "by the clock (VICTORY_TEXTURE_SWEEP=clock)".to_string()
+                } else if wanted == u64::MAX {
+                    "by need: under 512 MiB of commit left, everything idle".to_string()
+                } else {
+                    format!("by need: {} KiB wanted back, the longest idle first", wanted >> 10)
+                }
             )
         });
     }
