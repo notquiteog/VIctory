@@ -113,6 +113,19 @@ impl Host {
                     size_of_val(&sm) as u32,
                 )
                 .map_err(err)?;
+            let mut sm67 = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_7,
+            };
+            super::set_helper_lane_waves(
+                device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut sm67).cast(),
+                        size_of_val(&sm67) as u32,
+                    )
+                    .is_ok()
+                    && sm67.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0,
+            );
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
                     "the device supports SM {:#x} only",

@@ -855,9 +855,18 @@ impl Shader {
         let ident = self.m.md_str("victory");
         let ident = self.m.md_node(vec![Some(ident)]);
         self.m.named_md("llvm.ident", vec![ident]);
+        // Pixel shaders with wave operations run them over helper lanes
+        // too, as the console does (shader model 6.7), where the host can.
+        let helper_lanes =
+            self.pixel && self.flags & flags::WAVE_OPS != 0 && super::helper_lane_waves();
+        if helper_lanes {
+            self.m.set_function_attr(self.main, Attr::HelperLaneWaves);
+        }
+        let minor = if helper_lanes { 7 } else { 6 };
         let one = i32c(&mut self, 1);
         let six = i32c(&mut self, 6);
-        let version = self.m.md_node(vec![Some(one), Some(six)]);
+        let minor_c = i32c(&mut self, minor);
+        let version = self.m.md_node(vec![Some(one), Some(minor_c)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
@@ -869,17 +878,17 @@ impl Shader {
             (None, false) => ("vs", 1),
         };
         let name = self.m.md_str(name);
-        let sm = self.m.md_node(vec![Some(name), Some(six), Some(six)]);
+        let sm = self.m.md_node(vec![Some(name), Some(six), Some(minor_c)]);
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
-        dxil.extend((kind << 16 | 0x66).to_le_bytes());
+        dxil.extend((kind << 16 | 0x60 | minor).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
         dxil.extend(b"DXIL");
-        dxil.extend(0x106u32.to_le_bytes());
+        dxil.extend((0x100 | minor).to_le_bytes());
         dxil.extend(16u32.to_le_bytes());
         dxil.extend((bitcode.len() as u32).to_le_bytes());
         dxil.extend(&bitcode);

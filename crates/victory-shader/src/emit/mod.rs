@@ -126,6 +126,27 @@ pub use shader::{
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells translation that the host runs shader model 6.7: pixel shaders
+/// with wave operations then include helper lanes in them, as the
+/// console's do. Without it a loop that serves one lane's value per pass
+/// (sampling with a per-lane descriptor) never serves a helper lane and
+/// runs to the loop limit, which hangs NVIDIA GPUs. Part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn set_helper_lane_waves(on: bool) {
+    HELPER_LANE_WAVES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_helper_lane_waves`]. `VICTORY_HELPER_LANE_WAVES=0`: never, the
+/// shaders stay shader model 6.6 and a helper lane takes its own value
+/// ([`helper_own`]).
+pub fn helper_lane_waves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    HELPER_LANE_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_LANE_WAVES").is_none_or(|v| v != "0"))
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -151,10 +172,12 @@ pub fn loop_limit() -> u32 {
 
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
-/// the shader cache keys on it.
+/// the shader cache keys on it. Not where the host's wave operations run over helper lanes
+/// as the console's do ([`helper_lane_waves`], Marvisak/VIctory#2373): the first lane's value
+/// is then the console's.
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0")) && !helper_lane_waves()
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -295,6 +318,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    out.push(u8::from(helper_lane_waves()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());

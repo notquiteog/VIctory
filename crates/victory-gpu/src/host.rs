@@ -932,6 +932,22 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_7,
+        };
+        let sm67 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0;
+        victory_shader::emit::set_helper_lane_waves(sm67);
+        tracing::info!(
+            sm67,
+            "host shader model 6.7 (wave operations over helper lanes)"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
