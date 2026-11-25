@@ -453,6 +453,15 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(cs) = compute
+            && let Some(required) = cs.translated()?.host.fixed_wave_size()
+        {
+            let max = victory_shader::emit::host_max_wave();
+            if max != 0 && required > max {
+                tracing::warn!(?shaders, required, max, "host compute pipeline requires more wave lanes than the adapter supports");
+                return None;
+            }
+        }
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         // SAFETY: the feature query writes the structure of the given size.
