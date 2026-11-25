@@ -2462,6 +2462,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
+        let mut tabled = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2493,12 +2494,15 @@ impl HostHeap {
                 // A table's slot lately: left to its draws, and looked at
                 // again next time.
                 if !tables && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tabled += 1;
                     continue;
                 }
                 *last = print;
                 due.push((index as u32, handle));
             }
+        }
+        if tabled != 0 {
+            COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
         }
         for &(index, handle) in &due {
             self.mirror(index, handle, false);
