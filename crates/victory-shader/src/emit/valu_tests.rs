@@ -2235,3 +2235,81 @@ fn v_pk_int16_clamp_saturates_as_rdna2() {
         },
     );
 }
+
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+#[test]
+fn v_ldexp_f16_matches_rdna2() {
+    // VOP2 `v_ldexp_f16 v0, v1, v2` (opcode 0x3b), preserving upper half from v3.
+    let vop2_cs = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),   // v_mov_b32 v0, v3 (sentinel upper half)
+        vop2(0x3b, 0, vgpr(1), 2), // v_ldexp_f16 v0, v1, v2
+    ]);
+    // VOP3 `v_ldexp_f16 v0, |v1|, v2 clamp` (opcode 0x13b) with op_sel:[1, 0, 0, 1]
+    // (reads high half of v1, low half of v2, writes high half of v0).
+    let [mut w0, w1] = vop3(0x13b, 0, vgpr(1), vgpr(2), 0);
+    w0 |= (1 << 8) | (1 << 11) | (1 << 14) | (1 << 15); // abs[0], opsel[0], opsel[3], clamp
+    let vop3_cs = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (sentinel lower half)
+        w0,
+        w1,
+    ]);
+
+    let sentinel = 0xCAFE_0000u32;
+    // (f16 input, i16 exponent, expected f16 output)
+    let cases: &[(u16, i16, u16)] = &[
+        (0x3C00, 0, 0x3C00),         // 1.0 * 2^0 = 1.0
+        (0x3E00, 3, 0x4A00),         // 1.5 * 2^3 = 12.0
+        (0xC200, -2, 0xBA00),        // -3.0 * 2^-2 = -0.75
+        (0x3C00, -15, 0x0200),       // 1.0 * 2^-15 = f16 subnormal 0x0200
+        (0x0001, 24, 0x3C00),        // min f16 subnormal (2^-24) * 2^24 = 1.0
+        (0x7BFF, 0, 0x7BFF),         // max finite f16 * 2^0 stays 65504 (no premature inf)
+        (0x3C00, 16, 0x7C00),        // 1.0 * 2^16 = 65536 -> +inf (RTE overflow)
+        (0xBC00, 1000, 0xFC00),      // -1.0 * 2^1000 -> -inf
+        (0x0001, i16::MAX, 0x7C00),  // min subnormal * 2^32767 -> +inf
+        (0x7BFF, i16::MIN, 0x0000),  // max finite * 2^-32768 -> +0.0
+        (0xFBFF, i16::MIN, 0x8000),  // -max finite * 2^-32768 -> -0.0
+        (0x0000, i16::MAX, 0x0000),  // +0.0 * 2^32767 = +0.0 (not NaN)
+        (0x8000, i16::MAX, 0x8000),  // -0.0 * 2^32767 = -0.0 (not NaN)
+        (0x7C00, i16::MIN, 0x7C00),  // +inf * 2^-32768 = +inf (not NaN)
+        (0xFC00, i16::MIN, 0xFC00),  // -inf * 2^-32768 = -inf (not NaN)
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(a, e, _)| [u32::from(a), u32::from(e as u16), sentinel, 0])
+        .collect();
+    run_cases(&vop2_cs, &inputs, |backend, i, _, got| {
+        let (a, e, want_h) = cases[i];
+        let want = sentinel | u32::from(want_h);
+        assert_eq!(
+            got, want,
+            "{backend}: v_ldexp_f16({a:#06x}, {e}) = {got:#010x}, want {want:#010x}",
+        );
+    });
+
+    // NaN stays NaN (upper half preserved).
+    run_cases(&vop2_cs, &[[0x7E00, 4, sentinel, 0]], |backend, _, _, got| {
+        assert_eq!(got & 0xFFFF_0000, sentinel);
+        let lo = (got & 0x7FFF) as u16;
+        assert!(lo > 0x7C00, "{backend}: v_ldexp_f16(NaN, 4) lo={lo:#06x}, want NaN");
+    });
+
+    // VOP3 abs[0] + opsel:[1,0,0,1] + clamp:
+    // |-0.25(=0xB400)| * 2^1 = 0.5 (0x3800) into high half; |-1.0(=0xBC00)| * 2^2 = 4.0 -> clamped 1.0 (0x3C00)
+    let lo_sentinel = 0x0000_1234u32;
+    let vop3_cases: &[([u32; 4], u32)] = &[
+        ([0xB400_0000, 1, lo_sentinel, 0], (0x3800u32 << 16) | lo_sentinel),
+        ([0xBC00_0000, 2, lo_sentinel, 0], (0x3C00u32 << 16) | lo_sentinel),
+    ];
+    let vop3_in: Vec<[u32; 4]> = vop3_cases.iter().map(|c| c.0).collect();
+    run_cases(&vop3_cs, &vop3_in, |backend, i, _, got| {
+        let want = vop3_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_ldexp_f16_e64 case {i} = {got:#010x}, want {want:#010x}",
+        );
+    });
+}

@@ -9285,7 +9285,7 @@ impl<'a> Lower<'a> {
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
-            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
+            && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16" | "v_ldexp_f16")
         {
             return None;
         }
@@ -9338,6 +9338,36 @@ impl<'a> Lower<'a> {
         if name == "v_cvt_f16_f32" {
             let f = self.fsrc(inst, 0)?;
             return float_result(self, f);
+        }
+        if name == "v_ldexp_f16" {
+            // D.f16 = S0.f16 * 2^(S1.i16). S1 is a signed 16-bit integer exponent,
+            // so float abs/neg modifiers apply only to S0.
+            if (v.abs | v.neg) & 2 != 0 {
+                return Err("float modifier on v_ldexp_f16 exponent");
+            }
+            let a = self.half_fsrc(inst, 0)?;
+            let raw_e = self.half_src(inst, 1)?;
+            let k16 = self.s.m.i32(16);
+            let e = self.s.m.bin(c, Bin::Shl, raw_e, k16);
+            let e = self.s.m.bin(c, Bin::AShr, e, k16);
+            // Clamp exponent to [-64, 64] so 2^e is always a normal finite f32:
+            // - +-0 * finite = +-0 (never 0 * inf = NaN),
+            // - +-inf * finite = +-inf (never inf * 0 = NaN),
+            // - min f16 (2^-24) * 2^64 overflows f16 to +-inf,
+            // - max f16 (~2^16) * 2^-64 underflows f16 to +-0.
+            let lo = self.s.m.i32((-64i32) as u32);
+            let hi = self.s.m.i32(64);
+            let under = self.s.m.cmp(c, pred::SLT, e, lo);
+            let e = self.s.m.select(c, under, lo, e);
+            let over = self.s.m.cmp(c, pred::SGT, e, hi);
+            let e = self.s.m.select(c, over, hi, e);
+            let bias = self.s.m.i32(127);
+            let k23 = self.s.m.i32(23);
+            let biased = self.s.m.bin(c, Bin::Add, e, bias);
+            let scale_bits = self.s.m.bin(c, Bin::Shl, biased, k23);
+            let scale = self.as_float(scale_bits);
+            let r = self.s.m.bin(c, Bin::Mul, a, scale);
+            return float_result(self, r);
         }
         if float2.contains(&name) {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
