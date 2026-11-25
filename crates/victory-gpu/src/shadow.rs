@@ -2328,6 +2328,15 @@ impl Drop for Shadow {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
+            // The heap locks the title's pages: while it stands, the title's
+            // own `VirtualFree` of them fails with `ERROR_INVALID_PARAMETER`
+            // (87). Holding it until the submissions running now have
+            // finished is what makes that call succeed. The buffer that stands
+            // in the heap is the field dropped by the glue that runs after
+            // this call returns, so it is let go first, as it must be.
+            if let Some((heap, _bias)) = self.place.take() {
+                crate::host::retire(heap);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
