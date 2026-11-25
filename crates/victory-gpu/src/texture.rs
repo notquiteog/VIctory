@@ -107,10 +107,16 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// dip. Buffers of up to 8 MiB are now kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
+/// `VICTORY_STAGING_POOL=alt`: twenty seconds with the pool, twenty
+/// without, in turn, each change said in the log: a buffer made without
+/// is freed as before, and the spare ones wait for the next turn.
+/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+    if size > SPARE_MOST.1 || !staging_pool() {
+        // (Counted as made: the frame log's "staging N made" is then the
+        // buffers of a run without the pool too.)
+        SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -130,6 +136,41 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+}
+
+/// Whether staging buffers are taken from and returned to the spare ones
+/// now (`VICTORY_STAGING_POOL`).
+fn staging_pool() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "texture staging buffers are taken from the spare ones from now (VICTORY_STAGING_POOL=alt): {}",
+                    if on { "ON" } else { "off, made and freed each time" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
+fn spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -474,7 +515,7 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }
@@ -945,6 +986,14 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// A copy footprint may leave the final row's trailing padding outside the
+/// allocation returned by GetCopyableFootprints.
+fn staging_subresource(data: &mut [u8], offset: u64, padded_bytes: usize) -> Option<&mut [u8]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.saturating_add(padded_bytes).min(data.len());
+    data.get_mut(offset..end)
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1271,14 +1320,18 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // SAFETY: the mapped upload buffer is at least this large and is
+        // written only by the staging refresh.
+        let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+            let depth_pitch = pitch * rows as usize;
+            let bytes = depth_pitch.saturating_mul(f.Depth as usize);
+            let Some(linear) = staging_subresource(data, footprint.Offset, bytes) else {
+                tracing::warn!(mip, slice, "texture footprint starts beyond its staging buffer");
+                return;
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -1287,7 +1340,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, linear, pitch, depth_pitch)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1974,5 +2027,21 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_bounds_tests {
+    use super::staging_subresource;
+
+    #[test]
+    fn final_staging_row_does_not_include_unallocated_padding() {
+        let mut data = [0xff; 48];
+        let last = staging_subresource(&mut data, 16, 256).unwrap();
+        assert_eq!(last.len(), 32);
+        last.fill(0);
+        assert_eq!(&data[..16], &[0xff; 16]);
+        assert_eq!(&data[16..], &[0; 32]);
+        assert!(staging_subresource(&mut data, 49, 256).is_none());
     }
 }
