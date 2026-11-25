@@ -766,7 +766,15 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    // The barrier names the host resource by a borrowed pointer: the list
+    // holds it until it is reset, as it does the textures it moves, since
+    // the title may release its resource (and the sweep its host copy)
+    // before the list has run.
+    let held = |texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| -> This {
+        list.keep(texture);
+        texture.as_raw().cast_const().cast()
+    };
+    let host = |r: This| crate::resource::host_resource(r).map(held);
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -807,7 +815,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 // (the host gives the depth texture none): the barrier is
                 // on the texture shaders write.
                 match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
+                    Some(twin) => held(twin),
                     None => host(b.first)?,
                 }
             },
