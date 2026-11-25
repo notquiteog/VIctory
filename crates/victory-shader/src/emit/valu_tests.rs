@@ -2078,3 +2078,80 @@ fn v_ldexp_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn fma_k_f16_and_cvt_pk_16_match_rdna2() {
+    let vop2 = |op: u32, vdst: u32, src0: u16, vsrc1: u32| -> u32 {
+        (op << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | u32::from(src0 & 0x1FF)
+    };
+
+    // v_fmamk_f16 v0, v1, 0x4000 (2.0), v2 (VOP2 0x037), with v0 pre-seeded to 0xCAFE_0000
+    // to verify high-half preservation.
+    let fmamk = build_valu_cs(&[
+        vop1(0x001, 0, 255),
+        0xCAFE_0000,
+        vop2(0x037, 0, vgpr(1), 2),
+        0x0000_4000, // 2.0f16
+    ]);
+    // v_fmaak_f16 v0, v1, v2, 0x3C00 (1.0) (VOP2 0x038), with v0 pre-seeded to 0xCAFE_0000.
+    let fmaak = build_valu_cs(&[
+        vop1(0x001, 0, 255),
+        0xCAFE_0000,
+        vop2(0x038, 0, vgpr(1), 2),
+        0x0000_3C00, // 1.0f16
+    ]);
+    // v1 = 3.0 (0x4200), v2 = 0.5 (0x3800):
+    // fmamk: 3.0 * 2.0 + 0.5 = 6.5 (0x4680) -> 0xCAFE_4680
+    // fmaak: 3.0 * 0.5 + 1.0 = 2.5 (0x4100) -> 0xCAFE_4100
+    let fma_in = [[0x1234_4200, 0x5678_3800, 0, 0]];
+    run_cases(&fmamk, &fma_in, |b, _, _, g| {
+        assert_eq!(g, 0xCAFE_4680, "{b}: v_fmamk_f16(3.0, 2.0, 0.5)");
+    });
+    run_cases(&fmaak, &fma_in, |b, _, _, g| {
+        assert_eq!(g, 0xCAFE_4100, "{b}: v_fmaak_f16(3.0, 0.5, 1.0)");
+    });
+
+    // v_cvt_pk_i16_i32 (VOP3 0x36b) & v_cvt_pk_u16_u32 (VOP3 0x36a).
+    let pk_i16 = build_valu_cs(&vop3(0x36b, 0, vgpr(1), vgpr(2), 0));
+    let pk_u16 = build_valu_cs(&vop3(0x36a, 0, vgpr(1), vgpr(2), 0));
+    let pk_i16_cases: &[([u32; 4], u32)] = &[
+        // (-100, 250) -> 0x00FA_FF9C
+        ([(-100i32) as u32, 250, 0, 0], 0x00FA_FF9C),
+        // (-100_000 -> -32768 = 0x8000, +100_000 -> 32767 = 0x7FFF)
+        ([(-100_000i32) as u32, 100_000, 0, 0], 0x7FFF_8000),
+        // (i32::MAX -> 0x7FFF, i32::MIN -> 0x8000)
+        ([i32::MAX as u32, i32::MIN as u32, 0, 0], 0x8000_7FFF),
+    ];
+    let pk_i16_in: Vec<[u32; 4]> = pk_i16_cases.iter().map(|c| c.0).collect();
+    run_cases(&pk_i16, &pk_i16_in, |b, i, _, g| {
+        assert_eq!(g, pk_i16_cases[i].1, "{b}: v_cvt_pk_i16_i32 case {i}");
+    });
+
+    let pk_u16_cases: &[([u32; 4], u32)] = &[
+        ([123, 456, 0, 0], (456 << 16) | 123),
+        ([0, 65535, 0, 0], 0xFFFF_0000),
+        // Unsigned clamping: 70000 -> 0xFFFF, u32::MAX -> 0xFFFF.
+        ([70_000, u32::MAX, 0, 0], 0xFFFF_FFFF),
+    ];
+    let pk_u16_in: Vec<[u32; 4]> = pk_u16_cases.iter().map(|c| c.0).collect();
+    run_cases(&pk_u16, &pk_u16_in, |b, i, _, g| {
+        assert_eq!(g, pk_u16_cases[i].1, "{b}: v_cvt_pk_u16_u32 case {i}");
+    });
+
+    // VOP3 CLAMP=1 on v_cvt_pk_{i16_i32,u16_u32} is refused by `write_i`.
+    for op in [0x36au16, 0x36b] {
+        let mut clamped = vop3(op, 0, vgpr(1), vgpr(2), 0);
+        clamped[0] |= 1 << 15;
+        let err = try_build_valu_cs(&clamped).expect_err("clamped v_cvt_pk_* must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "integer output modifiers",
+                    ..
+                }
+            ),
+            "op {op:#x}: {err:?}"
+        );
+    }
+}
