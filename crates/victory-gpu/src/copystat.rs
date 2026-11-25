@@ -805,16 +805,6 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
-    let pooled = crate::host::upload_pool::kept();
-    let pool: Vec<u64> = crate::host::upload_pool::STATS.iter().map(|s| s.load(Relaxed)).collect();
-    tracing::info!(
-        "memory, small upload buffers kept and used again (VICTORY_UPLOAD_POOL): {} kept now {:.0} MB; since the start {} requests          answered from the kept ones, {} kept when made, {} given back to the host after 10 s unasked",
-        pooled.0,
-        mb(pooled.1),
-        pool[0],
-        pool[1],
-        pool[2],
-    );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
