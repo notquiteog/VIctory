@@ -2,6 +2,26 @@
 
 DexNom Runtime is a community fork of Marvisak's VIctory for Windows x64. It runs an Xbox Series executable from your own game installation and translates its GPU work for Direct3D 12. It builds on the Radeon runtime tested at `e061c69032b84ec6e2ec17340469cd689500dafd` and adds fixes for static sampler selection, wave64 lane masks and integer render targets. Game files, executables, saves and generated shader caches stay on your own computer.
 
+## This branch: NVIDIA and Intel integration (`nvidia-integration`)
+
+This branch takes DexNom Runtime, which is tested on Radeon, and works on getting it right on an NVIDIA card with an Intel hybrid CPU. Everything below was measured on one PC: RTX 5060 Ti 16 GB, Core i5-13600K, 32 GB RAM, Windows 11. Nothing here has been reproduced by anyone else yet.
+
+Where it stands (2026-11-25):
+
+- The game boots through the profile, first-run settings and legal screens into the story world and ran there for 7.5 minutes without a device loss.
+- In the world: median 288 ms a frame (about 3.5 fps) over 74 one-second samples; the better stretches are 85-190 ms. The card is about 18% busy, so the frame is bound on the CPU side.
+- Compute pipelines the host refuses, over the whole shader archive (`victory warm`): 32 on DexNom `2e01ab4`, 8 on this branch. 7 of the 8 still need 64-lane waves.
+- Known wrong: the picture is far too dark (geometry, textures and emissive lights only), draws are still dropped for want of a pipeline, and the process commits about 28 GB, which is the ceiling on a 32 GB PC.
+
+What is different from DexNom `main`:
+
+- The wave-wide form is tried as a last resort for a console wave64 compute program that a 32-lane host would otherwise refuse (`VICTORY_WAVE_WIDE=0` turns that off). It makes pipelines for `sr_tracing:CS_Tiling_Generate_Opaque` and `GpuParticleUpdate:CS_Visibility`.
+- The host device is created on the high-performance adapter, not the system default (`VICTORY_ADAPTER=default` keeps the old choice). Hand-ported from Belobug's fork.
+- `mwaitx` sleeps on the monitored fence value on processors without it, in place of an exception per poll (`VICTORY_MWAITX_SLEEP=0` spins as before). Hand-ported from fxceless/victory-fork#1029 by alexis27yt.
+- Applied as they are: DexNom/VIctory #7, #16, #17, #18, #22, #24 and fxceless/victory-fork #1006. Hand-ported: Marvisak/VIctory #1129, #2634, #2569. Each is its own commit and names its author.
+
+No game files, executables or shader caches are in this repository.
+
 ## Run it on your PC
 
 1. Use 64-bit Windows and a current Direct3D 12 driver. The game uses mesh shaders and Shader Model 6.6. The Radeon gameplay results and known issues are listed below.
