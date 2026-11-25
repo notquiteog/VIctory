@@ -67,6 +67,35 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// What [`crate::ambient`] follows it for, by the names in its
+    /// container ([`Followed::of`]).
+    #[cfg(windows)]
+    pub(crate) followed: Followed,
+}
+
+/// The programs [`crate::ambient`] follows, by the names in a container.
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Followed {
+    /// Its result gets the least indirect light ([`crate::ambient::PROGRAM`]).
+    pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    pub(crate) ends_reflections: bool,
+}
+
+#[cfg(windows)]
+impl Followed {
+    fn of(container: &[u8]) -> Self {
+        let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+        Self {
+            resolves_light: has(crate::ambient::PROGRAM),
+            draws_sky: has(crate::ambient::SKY),
+            ends_reflections: has(crate::ambient::REFLECTED),
+        }
+    }
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +148,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                followed: Followed::of(bytes),
             })
         })
         .clone()
@@ -138,6 +169,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         container: container.to_vec(),
         translated: OnceLock::new(),
         walks: OnceLock::new(),
+        followed: Followed::default(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -471,6 +503,14 @@ pub(crate) fn builder_runs() -> bool {
     }
     b.frame_decision = Some((frame, true));
     true
+}
+
+/// Whether the title's rays may run at all in this run: only with the
+/// structure builder (`VICTORY_BVH_BUILDER=1`). [`crate::ambient`] stands in
+/// for their light only while they cannot.
+#[cfg(windows)]
+pub(crate) fn rays_may_run() -> bool {
+    builder_allowed()
 }
 
 #[cfg(windows)]
