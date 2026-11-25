@@ -981,7 +981,12 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
+        // A table's base is a 32-bit address (its high half is zero), and an
+        // offset added to it stays inside the same 4 GiB, so the high half of
+        // such an address is not checked. Only a descriptor's own 64-bit
+        // address has a high half to match.
+        if high.is_some()
+            && !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             return Err("an address with an untracked high half");
@@ -2822,6 +2827,26 @@ pub(crate) mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    #[test]
+    fn a_tables_address_is_not_checked_for_a_high_half() {
+        // A table's base is a 32-bit address (its high half is zero), and an
+        // offset added to it stays inside the same 4 GiB, so the address's
+        // high half is not matched: here it is a system SGPR of unknown
+        // value, and the load still resolves to the table.
+        let r = track_words(
+            &[
+                0xBE82_0304, // s_mov_b32 s2, s4
+                0xBE83_0306, // s_mov_b32 s3, s6
+                0xF408_0001,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 4, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
