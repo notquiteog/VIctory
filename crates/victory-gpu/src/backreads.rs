@@ -290,13 +290,26 @@ fn valid(seen: &Seen) -> Option<(u32, u32)> {
     Some((touched[..pages].iter().filter(|&&t| t).count() as u32, pages as u32))
 }
 
+/// The range of title memory that holds the stretch `from..to` of a page at
+/// every address in `shown`; `None` if it is shown nowhere.
+fn covering(shown: &[usize], from: usize, to: usize) -> Option<std::ops::Range<usize>> {
+    let low = *shown.iter().min()?;
+    let high = *shown.iter().max()?;
+    Some(low + from..high + to)
+}
+
 /// Takes the stretch's 4 KiB pages out of the working set at every title
 /// address of the page; false, with nothing done, while the runtime
 /// changes a mapping.
 fn trim(shown: &[usize], from: usize, to: usize) -> bool {
     use windows_sys::Win32::System::Memory::VirtualUnlock;
-    // No mapping changes until the addresses have been used.
-    let Some(_still) = crate::watch::title_memory_reading_now() else {
+    // No mapping changes until the addresses have been used. (Our tree pins a
+    // range, not all of title memory: the one that covers the stretch at
+    // every address the page is shown at.)
+    let Some(range) = covering(shown, from, to) else {
+        return true;
+    };
+    let Some(_still) = crate::watch::title_memory_reading_now(range) else {
         return false;
     };
     for &base in shown {
@@ -318,9 +331,12 @@ fn judge(seen: &Seen) -> Judged {
         && seen.clean
         && (!crate::watch::clean(seen.page) || crate::watch::stamp(seen.page) > seen.stamp);
     let looked = if seen.trimmed {
-        match crate::watch::title_memory_reading_now() {
-            Some(_still) => valid(seen),
-            None => None,
+        match covering(&seen.shown, seen.from, seen.to).map(crate::watch::title_memory_reading_now) {
+            Some(Some(_still)) => valid(seen),
+            // (the mapping is changing: asked again later)
+            Some(None) => None,
+            // (shown nowhere: nothing to pin, and `valid` asks about no page)
+            None => valid(seen),
         }
     } else {
         None
