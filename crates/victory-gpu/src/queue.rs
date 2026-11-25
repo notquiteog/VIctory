@@ -2,6 +2,8 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
@@ -40,7 +42,7 @@ struct Queue {
     /// What the queue was given after a wait for a fence that had not been
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
-    held: std::sync::Mutex<Vec<Held>>,
+    held: Arc<Mutex<Vec<Held>>>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -58,9 +60,26 @@ enum Held {
     Signal(usize, u64),
 }
 
-/// The queues that hold something (their addresses).
+// SAFETY: D3D12 COM objects retained inside `Detached`/`HostList` are
+// free-threaded, and `Held` is already consumed across threads in `release_held`.
 #[cfg(windows)]
-static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+unsafe impl Send for Held {}
+
+/// The queues that hold something: `(queue_addr, weak_held)` so `release_held`
+/// upgrades the `Arc` safely without dereferencing a concurrently freed `Queue`.
+#[cfg(windows)]
+static WAITING: Mutex<Vec<(usize, Weak<Mutex<Vec<Held>>>)>> = Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn register_waiting(this: This) {
+    let id = this as usize;
+    let weak = Arc::downgrade(&queue(this).held);
+    let mut waiting = lock(&WAITING);
+    if !waiting.iter().any(|(q, w)| *q == id && w.ptr_eq(&weak)) {
+        waiting.retain(|(q, _)| *q != id);
+        waiting.push((id, weak));
+    }
+}
 
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -196,10 +215,7 @@ fn submit_cut(this: This, lists: &[This]) {
                 held.push(Held::Run(taken, order));
             }
         }
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
@@ -284,10 +300,7 @@ fn submit_split(this: This, lists: &[This]) {
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
-        let mut waiting = lock(&WAITING);
-        if !waiting.contains(&(this as usize)) {
-            waiting.push(this as usize);
-        }
+        register_waiting(this);
     }
     // What ran may be what another queue waits for, and what was just held
     // may be free to run already.
@@ -331,10 +344,12 @@ pub(crate) fn release_held(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
-        for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+        for (q, weak) in queues {
+            let Some(held_arc) = weak.upgrade() else {
+                lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
+                continue;
+            };
+            let mut held = lock(&held_arc);
             loop {
                 match held.first() {
                     None => break,
@@ -429,7 +444,7 @@ pub(crate) fn release_held(all: bool) {
                 moved = true;
             }
             if held.is_empty() {
-                lock(&WAITING).retain(|&w| w != q);
+                lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
             }
         }
         if !moved {
@@ -561,10 +576,14 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(windows)]
+    let weak = (!this.is_null()).then(|| Arc::downgrade(&queue(this).held));
     let left = object::release_boxed::<Queue>(this);
     #[cfg(windows)]
-    if left == 0 {
-        lock(&WAITING).retain(|&q| q != this as usize);
+    if left == 0
+        && let Some(weak) = weak
+    {
+        lock(&WAITING).retain(|(_, w)| !w.ptr_eq(&weak));
     }
     left
 }
@@ -616,10 +635,7 @@ fn execute_now(this: This, count: u32, lists: *const This) {
                     tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
+                register_waiting(this);
             }
         }
         let kept = hold(this, || {
@@ -762,12 +778,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             }
         }
         if behind && waits() {
-            {
-                let mut waiting = lock(&WAITING);
-                if !waiting.contains(&(this as usize)) {
-                    waiting.push(this as usize);
-                }
-            }
+            register_waiting(this);
             // The fence may have got there meanwhile.
             release_held(false);
         }
@@ -1465,5 +1476,84 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn releasing_waiting_queue_prunes_waiting_and_never_uafs_on_release_held() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+
+        let wait_fn = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+        assert_eq!(wait_fn(q, fence, 99), S_OK);
+
+        let id = q as usize;
+        let weak = lock(&WAITING)
+            .iter()
+            .find(|(addr, _)| *addr == id)
+            .map(|(_, w)| w.clone())
+            .expect("waiting queue must be registered");
+
+        // Dropping the queue must drop its strong Arc<Mutex<Vec<Held>>> and remove it.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+        assert!(weak.upgrade().is_none());
+        assert!(!lock(&WAITING).iter().any(|(_, w)| w.ptr_eq(&weak)));
+
+        // Even if a stale entry lingered in WAITING when release_held runs,
+        // release_held skips and prunes it without touching freed Queue memory.
+        lock(&WAITING).push((id, weak.clone()));
+        release_held(true);
+        assert!(!lock(&WAITING).iter().any(|(_, w)| w.ptr_eq(&weak)));
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_release_held_and_queue_release_do_not_uaf() {
+        use std::sync::Barrier;
+
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut fence = null;
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        for _ in 0..64 {
+            let mut q = null;
+            assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+            let wait_fn =
+                slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q) + 8);
+            assert_eq!(wait_fn(q, fence, 100), S_OK);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = barrier.clone();
+            let releaser = std::thread::spawn(move || {
+                b2.wait();
+                release_held(true);
+            });
+            barrier.wait();
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+            releaser.join().unwrap();
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
     }
 }
