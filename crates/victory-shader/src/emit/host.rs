@@ -140,6 +140,21 @@ impl Host {
         software(&self.device)
     }
 
+    /// The widest wave supported by this D3D12 device.
+    pub fn max_wave_lanes(&self) -> Option<u32> {
+        let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the corresponding structure.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut caps).cast(),
+                size_of_val(&caps) as u32,
+            )
+        }
+        .ok()?;
+        (caps.WaveLaneCountMax != 0).then_some(caps.WaveLaneCountMax)
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -257,6 +272,12 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        if let Some(required) = cs.fixed_wave_size()
+            && let Some(max) = self.max_wave_lanes()
+            && required > max
+        {
+            return Err(format!("shader requires wave{required}, host supports at most wave{max}"));
+        }
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))

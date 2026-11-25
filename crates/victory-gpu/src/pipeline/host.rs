@@ -421,6 +421,15 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(cs) = compute
+            && let Some(required) = cs.translated()?.host.fixed_wave_size()
+        {
+            let max = victory_shader::emit::host_max_wave();
+            if max != 0 && required > max {
+                tracing::warn!(?shaders, required, max, "host compute pipeline requires more wave lanes than the adapter supports");
+                return None;
+            }
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
