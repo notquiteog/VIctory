@@ -799,6 +799,35 @@ fn v_med3_f16_matches_rdna2_with_nan() {
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
 /// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
 #[test]
+fn v_cmp_f_and_tru_are_constants_and_keep_the_device() {
+    // v_cmp_{f,tru}_{f32,f16}_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20.
+    // `fcmp false` / `fcmp true` made WARP remove its device.
+    let nan = f32::NAN.to_bits();
+    let cases = [
+        [1.0f32.to_bits(), 2.0f32.to_bits(), 0, 0],
+        [nan, nan, 0, 0],
+        [0x3C00, 0x7E00, 0, 0],
+    ];
+    for (op, what, want) in [
+        (0x000u16, "v_cmp_f_f32", 0),
+        (0x00f, "v_cmp_tru_f32", 1),
+        (0x0c8, "v_cmp_f_f16", 0),
+        (0x0ef, "v_cmp_tru_f16", 1),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x})",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
+#[test]
 fn v_cmp_lg_is_false_for_nan() {
     // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
     // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)

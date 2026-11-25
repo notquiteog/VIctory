@@ -11992,6 +11992,10 @@ impl<'a> Lower<'a> {
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)
+                } else if op == "f" || op == "tru" {
+                    // Always false / always true: constants, not `fcmp false`
+                    // / `fcmp true`, which WARP removes its device over.
+                    self.s.m.bool(op == "tru")
                 } else {
                     let p = match op {
                         "f" => pred::FALSE,
