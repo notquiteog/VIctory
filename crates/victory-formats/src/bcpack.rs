@@ -273,22 +273,30 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
-    }
+     let stride = widths.len() * per;
+ thread_local! {
+     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+ }
+ SCRATCH.with(|cell| {
+     let mut records = cell.borrow_mut();
+     records.resize(blocks * stride, 0);
+     let mut next = src.iter().copied();
+     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
+     let records = records.chunks_exact(stride);
+     let out = dst.chunks_exact_mut(block);
+     let t = tables;
+             match bc {
+            1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+            3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+            4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+            5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+            6 => bc6(records, out, &t.bc6),
+            _ => bc7(records, out, t),
+        }
+    })
 }
+
+
 
 // Lanes.
 
@@ -534,7 +542,7 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    let mut history = [Plain::default(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
@@ -762,7 +770,7 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let mut history = [(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -1062,7 +1070,7 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    let mut history = [(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
