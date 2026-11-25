@@ -18,8 +18,60 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, GetLastError, INVALID_HANDLE_VALUE, SetLastError,
+};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+static TRACE_FILE_PROBES: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("VICTORY_TRACE_FILE_PROBES").is_some());
+
+fn trace_probe(path: *const u16, result: usize, succeeded: bool) {
+    let code = unsafe { GetLastError() };
+    if !*TRACE_FILE_PROBES {
+        unsafe { SetLastError(code) };
+        return;
+    }
+    let path = if path.is_null() {
+        String::new()
+    } else {
+        let mut len = 0;
+        while unsafe { *path.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(path, len) })
+    };
+    tracing::info!(
+        path,
+        result = format_args!("{result:#x}"),
+        succeeded,
+        last_error = code,
+        "title file probe"
+    );
+    unsafe { SetLastError(code) };
+}
+
+fn trace_probe_a(path: *const c_char, result: usize, succeeded: bool) {
+    let code = unsafe { GetLastError() };
+    if !*TRACE_FILE_PROBES {
+        unsafe { SetLastError(code) };
+        return;
+    }
+    let path = if path.is_null() {
+        String::new()
+    } else {
+        String::from_utf8_lossy(unsafe { CStr::from_ptr(path) }.to_bytes()).into_owned()
+    };
+    tracing::info!(
+        path,
+        result = format_args!("{result:#x}"),
+        succeeded,
+        last_error = code,
+        "title file probe"
+    );
+    unsafe { SetLastError(code) };
+}
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -37,12 +89,24 @@ macro_rules! host {
 }
 pub(crate) use host;
 
-/// Mounted drives: upper-case letter and host root (UTF-16, no trailing
-/// separator, no NUL).
-static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
+/// Mounted drives: upper-case letter, host root (UTF-16, no trailing
+/// separator, no NUL) and whether the mount may not be written (the
+/// console's package: the host's package files are hard links to the user's
+/// own input, so a write through one corrupts files the user owns).
+static DRIVES: Mutex<Vec<(u16, Vec<u16>, bool)>> = Mutex::new(Vec::new());
 
-fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
+/// The title's current drive: what a path with no drive of its own
+/// (`\appdata0.rpf`) is relative to. The console starts a title on its
+/// package drive, where the title's own files are.
+static CURRENT_DRIVE: Mutex<Option<u16>> = Mutex::new(None);
+
+fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>, bool)>> {
     DRIVES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Never held while [`drives`] is held: nothing takes them both.
+fn current_drive() -> MutexGuard<'static, Option<u16>> {
+    CURRENT_DRIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Gives the host folder `root` a drive letter (the same one if it already
@@ -50,16 +114,16 @@ fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
 pub fn mount(root: &Path) -> Option<char> {
     let wide = root_wide(root);
     let mut drives = drives();
-    if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
+    if let Some(&(letter, _, _)) = drives.iter().find(|(_, r, _)| *r == wide) {
         return char::from_u32(letter.into());
     }
     // SAFETY: no arguments.
     let host = unsafe { GetLogicalDrives() };
     let letter = (b'D'..=b'Z').rev().find(|&l| {
-        host >> (l - b'A') & 1 == 0 && !drives.iter().any(|(m, _)| *m == u16::from(l))
+        host >> (l - b'A') & 1 == 0 && !drives.iter().any(|(m, _, _)| *m == u16::from(l))
     })?;
     tracing::info!(drive = %char::from(letter), root = %root.display(), "virtual drive");
-    drives.push((letter.into(), wide));
+    drives.push((letter.into(), wide, false));
     Some(letter.into())
 }
 
@@ -78,8 +142,33 @@ pub fn mount_at(letter: char, root: &Path) {
     let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
     tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
     let mut drives = drives();
-    drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
-    drives.push((letter as u16, root_wide(root)));
+    drives.retain(|(l, _, _)| u32::from(*l) != u32::from(letter));
+    drives.push((letter as u16, root_wide(root), false));
+}
+
+/// The console's package: the drive the title starts on, which is read-only.
+/// A path with no drive of its own is relative to this drive's root, as the
+/// title's own files are on the console. Reads resolve through the mount as
+/// usual; a write or delete that lands in it is refused with
+/// `ERROR_ACCESS_DENIED`, not rewritten: the host gives the package's files to
+/// the title as hard links to the user's own input, so a write would change the
+/// user's own files behind their back. A title that writes uses its `T:` drive
+/// or its storage instead, as it does on the console, whose package is
+/// read-only.
+pub fn mount_package(letter: char, root: &Path) {
+    let letter = letter.to_ascii_uppercase();
+    let Some(index) = u32::from(letter)
+        .checked_sub(u32::from('A'))
+        .filter(|i| *i < 26)
+    else {
+        return;
+    };
+    let index = index as u16;
+    mount_at(letter, root);
+    if let Some((_, _, read_only)) = drives().iter_mut().find(|(l, _, _)| *l == index) {
+        *read_only = true;
+    }
+    *current_drive() = Some(index);
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
@@ -142,13 +231,60 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
-/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive.
+/// The host path, NUL-terminated, for `path` (without its NUL) if it is on a
+/// virtual drive, or at the root of the title's current drive — which is what
+/// a path with no drive of its own (`\appdata0.rpf`) means. Read-only mounts
+/// still resolve here: reads of the package are wanted. A caller that may
+/// write resolves through [`resolve_drive`] and checks the drive's read-only
+/// flag itself, refusing the call when the target is the package.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+    resolve_drive(path).map(|(path, _)| path)
+}
+
+/// A CreateFile access mask asks to modify the target when it carries any
+/// generic write/all, file-data/append/EA/attribute write, delete, or
+/// write-DAC/write-owner bit; a read-only or query-only mask does not.
+fn has_write_intent(access: u32) -> bool {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const FILE_WRITE_DATA: u32 = 0x0002;
+    const FILE_APPEND_DATA: u32 = 0x0004;
+    const FILE_WRITE_EA: u32 = 0x0010;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    access
+        & (GENERIC_WRITE
+            | GENERIC_ALL
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER)
+        != 0
+}
+
+fn resolve_drive(path: &[u16]) -> Option<(Vec<u16>, bool)> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
         None => (&[][..], path),
     };
+    // A lone leading separator is the root of the title's current drive: the
+    // console starts a title on its package drive, so this is the package's
+    // own root. The host's current drive is the launcher's instead (the
+    // working directory it was started in, `Z:` under Wine), and a title path
+    // must never be resolved against it. `\\server\share` and `\\.\device`
+    // paths belong to the host and are left alone.
+    if prefix.is_empty() && path.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        if path.starts_with(&[u16::from(b'\\'); 2]) {
+            return None;
+        }
+        let letter = *current_drive();
+        return on_drive(prefix, letter?, &rest[1..]);
+    }
     let &[letter, colon, ..] = rest else {
         return None;
     };
@@ -156,14 +292,21 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         return None;
     }
     let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
-    let letter = u16::from(letter.to_ascii_uppercase());
+    on_drive(prefix, u16::from(letter.to_ascii_uppercase()), &rest[2..])
+}
+
+/// The host path for the title's `tail` on the drive `letter`: the drive's
+/// root with the tail appended. A tail with no leading separator is relative
+/// to the root, as `X:` and `X:name` are. The bool is the drive's read-only
+/// flag.
+fn on_drive(prefix: &[u16], letter: u16, tail: &[u16]) -> Option<(Vec<u16>, bool)> {
     let drives = drives();
-    let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
-    let tail = &rest[2..];
+    let (_, root, read_only) = drives.iter().find(|(l, _, _)| *l == letter)?;
+    let read_only = *read_only;
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
-        return Some(out);
+        return Some((out, read_only));
     }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
@@ -180,7 +323,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         }
     }));
     out.push(0);
-    Some(out)
+    Some((out, read_only))
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
@@ -197,14 +340,22 @@ fn wide(path: *const u16) -> Wide {
     if path.is_null() {
         return Wide(path, None);
     }
-    // SAFETY: the title passes a NUL-terminated path.
-    let path_slice = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        std::slice::from_raw_parts(path, len)
-    };
+    let path_slice = wide_slice(path);
     let host = translate(path_slice);
     trace(path_slice, host.as_deref());
     Wide(path, host)
+}
+
+/// A title string (NUL-terminated) as a slice; empty for a null pointer.
+fn wide_slice(path: *const u16) -> &'static [u16] {
+    if path.is_null() {
+        return &[];
+    }
+    // SAFETY: the title passes a NUL-terminated string.
+    unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    }
 }
 
 /// Every title path at debug level, with the host path if rewritten.
@@ -232,17 +383,28 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
             return None;
         }
     }
-    let len = i32::try_from(bytes.len()).ok()?;
-    // SAFETY: sizing call, then a call with room for `n` units.
-    let wide = unsafe {
-        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
-        let mut wide = vec![0u16; usize::try_from(n).ok()?];
-        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
-        wide
-    };
+    let wide = decode(path)?;
     let host = translate(&wide);
     trace(&wide, host.as_deref());
     host
+}
+
+/// A narrow title string (ANSI code page, as the host decodes it) as wide
+/// text; `None` for a null pointer or an unrepresentable length.
+fn decode(path: *const c_char) -> Option<Vec<u16>> {
+    if path.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a NUL-terminated string.
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: sizing call, then a call with room for `n` units.
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        let mut wide = vec![0u16; usize::try_from(n).ok()?];
+        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        Some(wide)
+    }
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
@@ -269,8 +431,15 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if has_write_intent(access) && matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return INVALID_HANDLE_VALUE;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
+    let result = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -278,7 +447,9 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result as usize != usize::MAX);
+    result
 }
 
 pub extern "system" fn CreateFileA(
@@ -292,7 +463,18 @@ pub extern "system" fn CreateFileA(
 ) -> Handle {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            if has_write_intent(access) {
+                if let Some(wide_path) = decode(path) {
+                    if resolve_drive(&wide_path)
+                        .as_ref()
+                        .is_some_and(|(_, read_only)| *read_only)
+                    {
+                        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+                        return INVALID_HANDLE_VALUE;
+                    }
+                }
+            }
+            let result = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
                 access,
                 share,
@@ -300,10 +482,12 @@ pub extern "system" fn CreateFileA(
                 disposition,
                 flags,
                 template,
-            )
+            );
+            trace_probe(p.as_ptr(), result as usize, result as usize != usize::MAX);
+            result
         }
         None => {
-            host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            let result = host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
                 access,
                 share,
@@ -311,7 +495,9 @@ pub extern "system" fn CreateFileA(
                 disposition,
                 flags,
                 template,
-            )
+            );
+            trace_probe_a(path, result as usize, result as usize != usize::MAX);
+            result
         }
     }
 }
@@ -324,19 +510,37 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
-    let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if has_write_intent(access) && matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return INVALID_HANDLE_VALUE;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
+    let result = host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
         share,
         disposition,
         params,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result as usize != usize::MAX);
+    result
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
+            if let Some(wide_path) = decode(path) {
+                if resolve_drive(&wide_path)
+                    .as_ref()
+                    .is_some_and(|(_, read_only)| *read_only)
+                {
+                    unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+                    return 0;
+                }
+            }
             host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
         }
         None => {
@@ -346,17 +550,38 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
-    let p = wide(path);
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return 0;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
-    let p = wide(path);
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return 0;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
-    let p = wide(path);
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return 0;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
     host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
         p.ptr(),
         attributes,
@@ -366,20 +591,27 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
-                p.as_ptr(),
-            )
+            let result = host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.as_ptr());
+            trace_probe(p.as_ptr(), result as usize, result != u32::MAX);
+            result
         }
         None => {
-            host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)(
-                path,
-            )
+            let result = host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)(path);
+            trace_probe_a(path, result as usize, result != u32::MAX);
+            result
         }
     }
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
-    let p = wide(path);
+    let slice = wide_slice(path);
+    let resolved = resolve_drive(slice);
+    trace(slice, resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if matches!(resolved.as_ref(), Some((_, true))) {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return 0;
+    }
+    let p = Wide(path, resolved.map(|(p, _)| p));
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
         security,
@@ -392,16 +624,21 @@ pub extern "system" fn GetFileAttributesExW(
     info: *mut c_void,
 ) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
+    let result = host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
         p.ptr(),
         level,
         info,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result != 0);
+    result
+
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
     let p = wide(path);
-    host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
+    let result = host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr());
+    trace_probe(p.ptr(), result as usize, result != u32::MAX);
+    result
 }
 
 pub extern "system" fn GetDiskFreeSpaceExW(
@@ -447,10 +684,12 @@ pub extern "system" fn GetDiskFreeSpaceW(
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
+    let result = host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
         p.ptr(),
         data,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result as usize != usize::MAX);
+    result
 }
 
 pub extern "system" fn FindFirstFileExW(
@@ -462,18 +701,31 @@ pub extern "system" fn FindFirstFileExW(
     flags: u32,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
+    let result = host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
         p.ptr(),
         level,
         data,
         search,
         filter,
         flags,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result as usize != usize::MAX);
+    result
 }
-
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
-    let (from, to) = (wide(from), wide(to));
+    let (from_slice, to_slice) = (wide_slice(from), wide_slice(to));
+    let from_resolved = resolve_drive(from_slice);
+    let to_resolved = resolve_drive(to_slice);
+    trace(from_slice, from_resolved.as_ref().map(|(p, _)| p.as_slice()));
+    trace(to_slice, to_resolved.as_ref().map(|(p, _)| p.as_slice()));
+    if matches!(from_resolved.as_ref(), Some((_, true)))
+        || matches!(to_resolved.as_ref(), Some((_, true)))
+    {
+        unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+        return 0;
+    }
+    let from = Wide(from, from_resolved.map(|(p, _)| p));
+    let to = Wide(to, to_resolved.map(|(p, _)| p));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
         from.ptr(),
         to.ptr(),
@@ -500,25 +752,31 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    let result = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode);
+    trace_probe(p.ptr(), result as usize, !result.is_null());
+    result
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+    let result = host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
         mode,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result == 0);
+    result
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
+    let result = host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
         share,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, !result.is_null());
+    result
 }
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
@@ -578,14 +836,18 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
-            p.as_ptr(),
-            widen(mode).as_ptr(),
-        ),
+        Some(p) => {
+            let result = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+                p.as_ptr(),
+                widen(mode).as_ptr(),
+            );
+            trace_probe(p.as_ptr(), result as usize, !result.is_null());
+            result
+        }
         None => {
-            host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
-                path, mode,
-            )
+            let result = host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(path, mode);
+            trace_probe_a(path, result as usize, !result.is_null());
+            result
         }
     }
 }
@@ -593,16 +855,18 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+            let result = host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
                 out,
                 p.as_ptr(),
                 widen(mode).as_ptr(),
-            )
+            );
+            trace_probe(p.as_ptr(), result as usize, result == 0);
+            result
         }
         None => {
-            host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
-                out, path, mode,
-            )
+            let result = host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(out, path, mode);
+            trace_probe_a(path, result as usize, result == 0);
+            result
         }
     }
 }
@@ -611,25 +875,33 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
-            p.as_ptr(),
-            flags,
-            mode,
-        ),
-        None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
-            path, flags, mode,
-        ),
+        Some(p) => {
+            let result = host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+                p.as_ptr(),
+                flags,
+                mode,
+            );
+            trace_probe(p.as_ptr(), result as usize, result >= 0);
+            result
+        }
+        None => {
+            let result = host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(path, flags, mode);
+            trace_probe_a(path, result as usize, result >= 0);
+            result
+        }
     }
 }
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+    let result = host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
         flags,
         mode,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, result >= 0);
+    result
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
@@ -681,27 +953,34 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+    let result = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
         mode,
         protection,
-    )
+    );
+    trace_probe(p.ptr(), result as usize, !result.is_null());
+    result
+
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+            let result = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
                 p.as_ptr(),
                 mode,
                 protection,
-            )
+            );
+            trace_probe(p.as_ptr(), result as usize, !result.is_null());
+            result
         }
         None => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
+            let result = host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
                 path, mode, protection,
-            )
+            );
+            trace_probe_a(path, result as usize, !result.is_null());
+            result
         }
     }
 }

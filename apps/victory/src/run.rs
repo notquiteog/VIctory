@@ -84,7 +84,14 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // A caller that passes a bare file name (no directory part) would give an
+    // empty parent, and an empty package root leaves the package drive with
+    // nothing behind it. Fall back to the working directory, which is where
+    // the package's files are when a title is started by name.
+    let title_dir = match exe.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -97,9 +104,13 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
+    // `T:` is mounted first so that the package mount, which also makes its
+    // drive the title's current drive, is the one left in force: a title path
+    // with no drive of its own (`\appdata0.rpf`) then means the package's own
+    // root, as it does on the console. The package mount is read-only.
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    victory_hle::modules::files::mount_package('G', title_dir);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
