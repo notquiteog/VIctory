@@ -93,6 +93,8 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -567,6 +569,14 @@ impl Shader {
                 }
             }
         }
+        // UAVs outside pixel and compute programs, as DXC counts them: UAV
+        // ranges declared below (the root UAVs), not UAVs indexed from the
+        // heap. The validator refuses the program otherwise ("Flags must
+        // match usage"), and a driver may trust the flags.
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -878,6 +888,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
