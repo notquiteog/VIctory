@@ -61,7 +61,10 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
         if on {
-            install();
+            if !install() {
+                tracing::warn!("plain copies unavailable: the exception handler could not be registered; using kernel copies");
+                return false;
+            }
             tracing::info!(
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
                  page that is not there (VICTORY_COPY_PLAIN=1)"
@@ -129,7 +132,7 @@ fn note_fault(from: usize, len: usize) {
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+fn install() -> bool {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
@@ -153,15 +156,18 @@ fn install() {
         }
         EXCEPTION_CONTINUE_SEARCH
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: a handler that reads the record it is given and nothing else.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_fault));
-    });
+    registered(&INSTALLED, || unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn registered(state: &std::sync::OnceLock<bool>, register: impl FnOnce() -> *mut std::ffi::c_void) -> bool {
+    *state.get_or_init(|| !register().is_null())
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn install() {}
+fn install() -> bool { false }
 
 /// Copies `len` bytes from `from` to `to` in place; false if a page of the
 /// source was not there (then some of `to` may have been written).
@@ -170,10 +176,14 @@ fn install() {}
 /// `from` may be anything.
 #[cfg(target_arch = "x86_64")]
 fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
-    install();
+    guarded_with(to, from, len, install)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn guarded_with(to: *mut u8, from: *const u8, len: usize, install_handler: impl FnOnce() -> bool) -> bool {
     // SAFETY: the destination is the caller's to write; a source page that
     // is not there ends the copy with 0 instead of a fault ([`install`]).
-    unsafe { victory_copy_guarded(to, from, len) != 0 }
+    install_handler() && unsafe { victory_copy_guarded(to, from, len) != 0 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -229,6 +239,19 @@ mod tests {
     };
 
     const PAGE: usize = 4096;
+
+    #[test]
+    fn failed_registration_leaves_plain_copies_unavailable() {
+        let state = std::sync::OnceLock::new();
+        let src = [17u8; 512];
+        let mut dst = [0u8; 512];
+        let copied = guarded_with(dst.as_mut_ptr(), src.as_ptr(), src.len(), || {
+            registered(&state, std::ptr::null_mut)
+        });
+        assert!(!copied);
+        assert_eq!(dst, [0; 512]);
+        assert!(!registered(&state, || panic!("registration already attempted")));
+    }
 
     #[test]
     fn memory_that_is_there_is_copied() {
