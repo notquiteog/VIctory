@@ -248,6 +248,11 @@ struct Builder {
     whole: bool,
     /// One could not be made.
     off: bool,
+    /// Per-frame all-or-none decision `(frame, allow)`: every builder dispatch
+    /// in a frame gets the same answer so partial builder stages never run.
+    frame_decision: Option<(u64, bool)>,
+    /// Whether we already logged deferring the builder on a slow frame.
+    deferred_logged: bool,
 }
 
 #[cfg(windows)]
@@ -255,6 +260,8 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
     off: false,
+    frame_decision: None,
+    deferred_logged: false,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -307,34 +314,74 @@ pub(crate) fn builder_off(why: &'static str) {
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
-/// [`Builder`]).
+/// [`Builder`]). Never blocks the title's recording thread to compile missing
+/// builder pipelines synchronously, and defers the entire builder for a frame
+/// if the frame has already spent >= [`make::WATCHDOG_WAIT_CEILING`] since the
+/// last completed `Present` (e.g. first-world-frame buffer creation), keeping
+/// the per-frame all-or-none invariant intact.
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     if !builder_allowed() {
         return false;
     }
+    let frame = crate::frame::current();
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if b.off {
         return false;
     }
-    if b.whole {
-        return true;
+    if let Some((decided_frame, allow)) = b.frame_decision
+        && decided_frame == frame
+    {
+        return allow;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
-        tracing::warn!(
-            missing,
-            of = b.pipelines.len(),
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+    if !b.whole {
+        let mut failed = 0usize;
+        let mut pending = 0usize;
+        for p in &b.pipelines {
+            match make::poll(p) {
+                Some(true) => {}
+                Some(false) => failed += 1,
+                None => pending += 1,
+            }
+        }
+        if failed > 0 {
+            b.off = true;
+            b.frame_decision = Some((frame, false));
+            tracing::warn!(
+                missing = failed,
+                of = b.pipelines.len(),
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            return false;
+        }
+        if pending > 0 {
+            // Queue the remaining builder pipelines asynchronously and defer
+            // the whole builder for this frame instead of stalling the title's
+            // recording thread against the 30 s GPU watchdog.
+            b.frame_decision = Some((frame, false));
+            return false;
+        }
+        tracing::info!(
+            pipelines = b.pipelines.len(),
+            "the ray-tracing structure builder runs: all of its programs have host pipelines"
         );
+        b.whole = true;
+    }
+    if let Some(elapsed) = crate::queue::since_last_present()
+        && elapsed >= make::WATCHDOG_WAIT_CEILING
+    {
+        if !b.deferred_logged {
+            b.deferred_logged = true;
+            tracing::info!(
+                frame,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "deferring ray-tracing structure builder on a slow frame to stay under the 30 s GPU watchdog"
+            );
+        }
+        b.frame_decision = Some((frame, false));
         return false;
     }
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
-    );
-    b.whole = true;
+    b.frame_decision = Some((frame, true));
     true
 }
 

@@ -745,6 +745,24 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic millisecond timestamp (`crate::host::now_ms`, clamped to >= 1) of
+/// the most recent completed `present` (`0` before the first present).
+#[cfg(windows)]
+static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Wall-clock time elapsed since the most recent completed `present`, or `None`
+/// before any frame has been presented.
+#[cfg(windows)]
+pub(crate) fn since_last_present() -> Option<std::time::Duration> {
+    let last = LAST_PRESENT_MS.load(Ordering::Relaxed);
+    (last != 0).then(|| std::time::Duration::from_millis(crate::host::now_ms().saturating_sub(last)))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn since_last_present() -> Option<std::time::Duration> {
+    None
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -835,6 +853,8 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
+    #[cfg(windows)]
+    LAST_PRESENT_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK

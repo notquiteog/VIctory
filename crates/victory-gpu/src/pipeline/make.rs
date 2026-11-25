@@ -203,8 +203,36 @@ const DEFAULT_WAIT_MS: u64 = 12_000;
 /// The title's GPU watchdog: one frame of more than this ends the run.
 const TITLE_WATCHDOG: Duration = Duration::from_secs(30);
 
+/// Maximum wall-clock time since the most recent completed `Present` during
+/// which pipeline waits are allowed by default. Combined graphics + compute
+/// waits and overlapping in-flight frames share this single ceiling, leaving
+/// 20 s of headroom for frame preparation, copies, RT work and presentation
+/// before [`TITLE_WATCHDOG`] fires.
+pub(crate) const WATCHDOG_WAIT_CEILING: Duration = Duration::from_secs(10);
+
 // Both kinds' windows, one after the other, stay under the watchdog.
 const _: () = assert!(2 * DEFAULT_WAIT_MS < TITLE_WATCHDOG.as_millis() as u64);
+const _: () = assert!(WATCHDOG_WAIT_CEILING.as_millis() < TITLE_WATCHDOG.as_millis());
+
+/// Caps `budget` so pipeline waiting never extends past `ceiling` since the
+/// most recent completed `Present`.
+fn watchdog_cap(budget: Duration, since_present: Option<Duration>, ceiling: Duration) -> Duration {
+    match since_present {
+        Some(elapsed) => budget.min(ceiling.saturating_sub(elapsed)),
+        None => budget,
+    }
+}
+
+/// Whether `VICTORY_PIPELINE_WAIT_MS` was explicitly configured by the user.
+fn explicit_wait_budget() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some()
+    })
+}
 
 #[cfg(test)]
 thread_local! {
@@ -281,8 +309,24 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Non-blocking check of whether `p` has a host pipeline: queues `p` on the
+/// background workers at `REQUESTED` priority if not yet made, and returns
+/// `Some(true)` if compiled, `Some(false)` if refused/left out, or `None` if
+/// still being made.
+pub(crate) fn poll(p: &Arc<Pending>) -> Option<bool> {
+    if p.left_out.is_some() {
+        return Some(false);
+    }
+    if let Some(made) = p.made.get() {
+        return Some(made.is_some());
+    }
+    start(p, REQUESTED);
+    p.made.get().map(|made| made.is_some())
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
+#[allow(dead_code)]
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     if p.left_out.is_some() {
         return false;
@@ -428,6 +472,15 @@ fn wait(p: &Pending, frame: u64) {
     let compute = p.computes();
     let past = &PAST[usize::from(compute)];
     let budget = frame_budget(base, compute, loading_allowance(), Duration::from_millis(past.load(Ordering::Relaxed)));
+    let ceiling = if explicit_wait_budget() {
+        base.max(WATCHDOG_WAIT_CEILING)
+    } else {
+        WATCHDOG_WAIT_CEILING
+    };
+    let budget = watchdog_cap(budget, crate::queue::since_last_present(), ceiling);
+    if budget.is_zero() {
+        return;
+    }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now), by kind.
     static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
@@ -600,8 +653,33 @@ fn drained() {
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long, sharing_from};
+    use super::{
+        FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, WATCHDOG_WAIT_CEILING,
+        frame_budget, held_too_long, sharing_from, watchdog_cap,
+    };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn watchdog_cap_stops_pipeline_waits_past_present_ceiling() {
+        let budget = Duration::from_secs(12);
+        // Before the first Present, no cap applies.
+        assert_eq!(watchdog_cap(budget, None, WATCHDOG_WAIT_CEILING), budget);
+        // Early in a frame, remaining time is capped to the ceiling.
+        assert_eq!(
+            watchdog_cap(budget, Some(Duration::from_secs(2)), WATCHDOG_WAIT_CEILING),
+            Duration::from_secs(8)
+        );
+        // Once the frame has already spent >= ceiling since the last Present,
+        // stop waiting immediately so the frame finishes before the 30 s watchdog.
+        assert_eq!(
+            watchdog_cap(budget, Some(WATCHDOG_WAIT_CEILING), WATCHDOG_WAIT_CEILING),
+            Duration::ZERO
+        );
+        assert_eq!(
+            watchdog_cap(budget, Some(Duration::from_secs(15)), WATCHDOG_WAIT_CEILING),
+            Duration::ZERO
+        );
+    }
 
     /// Two threads ask for pipelines still being made in one frame, the
     /// second 1 ms after the first: by default both may wait, inside one
@@ -700,6 +778,19 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn poll_queues_without_blocking_and_reports_completion() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let first = poll(&p);
+        assert!(matches!(first, None | Some(false)));
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while poll(&p).is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert_eq!(poll(&p), Some(false));
     }
 
     #[test]

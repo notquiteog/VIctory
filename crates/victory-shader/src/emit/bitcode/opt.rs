@@ -196,6 +196,17 @@ pub(super) enum Effect {
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
+        // Dynamic descriptor heap handles and their annotations must not be
+        // reused across basic blocks by dominator-tree CSE: AMD's D3D12
+        // compiler (amdxc64.dll on RDNA 4) dereferences null when an
+        // `annotateHandle(createHandleFromHeap(...))` is shared across
+        // control-flow blocks. Keeping them as `Effect::Lanes` still allows
+        // same-block deduplication and dead-code elimination.
+        Some(Attr::ReadNone)
+            if name == "createHandleFromHeap" || name == "annotateHandle" =>
+        {
+            Effect::Lanes
+        }
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
@@ -1621,6 +1632,61 @@ mod tests {
         let stores = stores(&m, join);
         assert_eq!(stores[0], [x, p]);
         assert_eq!(stores[1][1], p);
+        m.write();
+    }
+
+    #[test]
+    fn heap_handles_are_not_reused_across_blocks() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let hty = m.func_ty(i32t, vec![i32t, i32t]);
+        let heap = m.function(
+            "dx.op.createHandleFromHeap",
+            hty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let ann = m.function("dx.op.annotateHandle", hty, Some(Attr::ReadNone), false);
+        let one = m.i32(1);
+        let two = m.i32(2);
+
+        // Two identical heap handle + annotate pairs in the entry block:
+        // deduplicated within the same block.
+        let h1 = m.call(b, heap, vec![one, two]);
+        let a1 = m.call(b, ann, vec![h1, one]);
+        let h2 = m.call(b, heap, vec![one, two]);
+        let a2 = m.call(b, ann, vec![h2, one]);
+        m.call(b, writes, vec![a1, a2]);
+
+        // An identical pair in a dominated child block: must NOT be reused
+        // across blocks (AMD's RDNA 4 compiler crashes on cross-block CSE of
+        // dynamic descriptor heap handles).
+        let h3 = m.call(then, heap, vec![one, two]);
+        let a3 = m.call(then, ann, vec![h3, one]);
+        m.call(then, writes, vec![a3, a3]);
+
+        // An unused pair: still dropped by DEAD.
+        let h_dead = m.call(then, heap, vec![two, two]);
+        let _a_dead = m.call(then, ann, vec![h_dead, one]);
+
+        m.optimise(REUSE | LOADS | DEAD);
+        assert_eq!(stores(&m, b)[0], [a1, a1], "same-block handle is reused");
+        assert_eq!(
+            stores(&m, then)[0],
+            [a3, a3],
+            "cross-block handle is kept local to its block"
+        );
+        assert!(
+            !m.blocks[then].body.contains(&match h_dead {
+                V::Inst(i) => i,
+                _ => unreachable!(),
+            }),
+            "unused heap handle is still dropped by DEAD"
+        );
         m.write();
     }
 
