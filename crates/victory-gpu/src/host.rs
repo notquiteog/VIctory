@@ -205,6 +205,121 @@ pub(crate) fn texture_idle_ms(
     vram_idle_ms(video_memory).min(system_ram_idle_ms(available))
 }
 
+/// Small upload buffers kept and handed out again.
+///
+/// Every copy a list sends up took an upload buffer of its own from the host
+/// and gave it back at the list's reset (`HostList::upload`: "one buffer per
+/// copy; pool them once uploads are frequent"). In a 40 minute session on an
+/// RTX 5060 Ti that was 174,708 buffers, 153 KiB each on average, and the
+/// driver, which carves small upload buffers out of write-combined blocks of
+/// 32 MiB, was left holding 396 such blocks: 9.5 GB of commit with 0.9 GB of
+/// it ever touched, on a PC whose commit left was 1.6 GB.
+///
+/// A buffer of up to 1 MiB is now kept here with a reference of the pool's
+/// own when it is made. Once the pool's is the only reference left (no list
+/// holds the buffer any more: `references`), the next request for that
+/// size gets it, zeroed as a new one is. A kept buffer nobody asked for in
+/// 10 seconds goes back to the host. Buffers are matched by their exact
+/// size, so what a caller gets is what the host would have made.
+/// `VICTORY_UPLOAD_POOL=0`: made and freed each time, as before.
+/// `VICTORY_UPLOAD_POOL_MB`: the most kept (512 unless said).
+pub(crate) mod upload_pool {
+    use super::{ID3D12Resource, now_ms, references};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+
+    struct Kept {
+        buffer: ID3D12Resource,
+        data: usize,
+        /// When it was made or last handed out ([`now_ms`]).
+        last: u64,
+    }
+
+    // SAFETY: a D3D12 buffer and its mapping; the mapping is written here
+    // only while the pool holds the buffer's one reference.
+    unsafe impl Send for Kept {}
+
+    /// The buffers kept by size, their bytes in all, and when the idle ones
+    /// were last looked for.
+    static POOL: Mutex<(Option<HashMap<u64, Vec<Kept>>>, u64, u64)> = Mutex::new((None, 0, 0));
+    /// The largest buffer kept.
+    const LARGEST: u64 = 1 << 20;
+    /// A kept buffer nobody asked for in this long goes back to the host.
+    const IDLE_MS: u64 = 10_000;
+    /// Requests answered from the pool, buffers the pool kept when they were
+    /// made, and buffers given back to the host, since the start.
+    pub(crate) static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
+    }
+
+    fn most() -> u64 {
+        static MOST: OnceLock<u64> = OnceLock::new();
+        *MOST.get_or_init(|| std::env::var("VICTORY_UPLOAD_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20)
+    }
+
+    /// Kept buffers and their bytes, for the memory line.
+    pub(crate) fn kept() -> (u64, u64) {
+        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.0.as_ref().map_or(0, |m| m.values().map(|v| v.len() as u64).sum()), pool.1)
+    }
+
+    /// A kept buffer of exactly `size` bytes that nothing else holds, zeroed.
+    pub(super) fn take(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if size == 0 || size > LARGEST || !on() {
+            return None;
+        }
+        let now = now_ms();
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (map, bytes, looked) = &mut *pool;
+        let map = map.as_mut()?;
+        if now >= *looked + 2_000 {
+            *looked = now;
+            let mut gone = (0u64, 0u64);
+            for (&of, list) in map.iter_mut() {
+                list.retain(|k| {
+                    let idle = k.last + IDLE_MS < now && references(&k.buffer) == 1;
+                    if idle {
+                        gone = (gone.0 + 1, gone.1 + of);
+                    }
+                    !idle
+                });
+            }
+            map.retain(|_, list| !list.is_empty());
+            *bytes -= gone.1;
+            STATS[2].fetch_add(gone.0, Relaxed);
+        }
+        let kept = map.get_mut(&size)?.iter_mut().find(|k| references(&k.buffer) == 1)?;
+        kept.last = now;
+        // SAFETY: the buffer's own mapping of `size` bytes, and the pool's is
+        // the only reference to the buffer: no list reads it any more.
+        unsafe { std::ptr::write_bytes(kept.data as *mut u8, 0, size as usize) };
+        STATS[0].fetch_add(1, Relaxed);
+        Some((kept.buffer.clone(), kept.data as *mut u8))
+    }
+
+    /// Keeps a buffer just made, if it is small and there is room.
+    pub(super) fn keep(buffer: &ID3D12Resource, data: *mut u8, size: u64) {
+        if size == 0 || size > LARGEST || !on() {
+            return;
+        }
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.1 + size > most() {
+            return;
+        }
+        pool.1 += size;
+        pool.0.get_or_insert_with(HashMap::new).entry(size).or_default().push(Kept {
+            buffer: buffer.clone(),
+            data: data as usize,
+            last: now_ms(),
+        });
+        STATS[1].fetch_add(1, Relaxed);
+    }
+}
+
 /// How many bytes of idle host copies of textures should be let go now, for
 /// [`crate::resource::let_go_idle`] by need: 0 while the card and the system
 /// have room, `u64::MAX` when the system is about to run out of commit.
@@ -8727,6 +8842,16 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(kept) = upload_pool::take(size) {
+            return Some(kept);
+        }
+        let made = self.new_upload_buffer(size)?;
+        upload_pool::keep(&made.0, made.1, size);
+        Some(made)
+    }
+
+    /// A new mapped upload buffer of `size` bytes from the host.
+    fn new_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
