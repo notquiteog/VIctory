@@ -5360,6 +5360,22 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_cmov_b64" => {
+                    let cond = self.scc_in(inst)?;
+                    let d = dst_code.ok_or("a missing operand")?;
+                    for (h, v) in [(0u8, lo), (1u8, hi)] {
+                        let new = half(self, 0, h)?;
+                        let old = if d == NULL {
+                            self.s.m.i32(0)
+                        } else {
+                            let r = inst.read(Reg::S(d + h)).ok_or("an unread operand")?;
+                            self.i32_of(r)?
+                        };
+                        let r = self.s.m.select(c, cond, new, old);
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -5372,6 +5388,16 @@ impl<'a> Lower<'a> {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
+            }
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                let cond = self.scc_in(inst)?;
+                let new = if name == "s_cmovk_i32" {
+                    sext16(self)
+                } else {
+                    src32(self, 0)?
+                };
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                (self.s.m.select(c, cond, new, old), None)
             }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
@@ -5541,6 +5567,8 @@ impl<'a> Lower<'a> {
                     "s_mov_b32"
                         | "s_movk_i32"
                         | "s_cselect_b32"
+                        | "s_cmov_b32"
+                        | "s_cmovk_i32"
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
