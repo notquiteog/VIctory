@@ -186,6 +186,13 @@ impl Owners {
         Some(joined)
     }
 
+    /// Whether all of `range` is still as it was mapped for every
+    /// submission of this landing: [`Owners::publish`] would write all of
+    /// it. The caller holds the mapping still over this and its write.
+    pub(crate) fn owns_all(&self, shadow: u64, range: Range<usize>) -> bool {
+        self.current(&CHANGED.lock().unwrap_or_else(|e| e.into_inner()), shadow, range).is_none()
+    }
+
     pub(crate) fn publish(&self, shadow: u64, address: usize, data: &[u8]) -> usize {
         self.publish_with(&CHANGED, shadow, address, data)
     }

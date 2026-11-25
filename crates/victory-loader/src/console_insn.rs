@@ -201,6 +201,99 @@ fn sleep_on_monitor() -> bool {
     true
 }
 
+/// Whether the title's 15-byte `clzero` loop is zeroed whole at its first exception
+/// (`VICTORY_CLZERO_LOOP15=0`: one exception a line, as before).
+fn loop15() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_LOOP15").is_none_or(|v| v != "0"))
+}
+
+/// The register `r` of `ctx` (CONTEXT order: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15).
+fn register(ctx: &mut CONTEXT, r: u8) -> &mut u64 {
+    match r & 15 {
+        0 => &mut ctx.Rax,
+        1 => &mut ctx.Rcx,
+        2 => &mut ctx.Rdx,
+        3 => &mut ctx.Rbx,
+        4 => &mut ctx.Rsp,
+        5 => &mut ctx.Rbp,
+        6 => &mut ctx.Rsi,
+        7 => &mut ctx.Rdi,
+        8 => &mut ctx.R8,
+        9 => &mut ctx.R9,
+        10 => &mut ctx.R10,
+        11 => &mut ctx.R11,
+        12 => &mut ctx.R12,
+        13 => &mut ctx.R13,
+        14 => &mut ctx.R14,
+        _ => &mut ctx.R15,
+    }
+}
+
+/// Where the lines of the loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` end,
+/// from the state the loop has at its `clzero`: the line at `rax` is zeroed now, and one
+/// more at `ptr` for every pass the `cmp` sends back. None if this is not the plain case
+/// the loop makes (the line at `rax` on a 64-byte boundary, `ptr` the next line, under
+/// 2 GiB in all): then every line is taken alone, as the instruction itself does it.
+fn loop15_end(rax: usize, ptr: usize, end: usize) -> Option<usize> {
+    if rax & 63 != 0 || ptr != rax.wrapping_add(64) || ptr < rax {
+        return None;
+    }
+    let more = if ptr < end { (end - ptr).div_ceil(64) } else { 0 };
+    let last = ptr.checked_add(more.checked_mul(64)?)?;
+    (last - rax < 2 << 30).then_some(last)
+}
+
+/// The `clzero` at `rip` in the loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb`,
+/// with all the lines the loop would still zero: `Some(true)` when they are zeroed and the
+/// registers stand as the loop leaves them at its last `clzero` (the caller steps over the
+/// instruction; the title's own `cmp` and `jb` then leave the loop), `Some(false)` when the
+/// first line is not writable (the real instruction faults there too), and when only a
+/// first part was writable the registers stand at the line after it, where the instruction
+/// runs again. None if it is not that loop: the lone instruction is emulated.
+///
+/// # Safety
+/// `rip` is the faulting instruction of `ctx`, whose bytes were read.
+unsafe fn clzero_loop15(ctx: &mut CONTEXT, rip: usize, ptr_reg: u8, end_reg: u8) -> Option<bool> {
+    // The seven bytes in front of it: in the same page as the instruction, which ran.
+    if rip & 0xFFF < 7 && !readable(rip - 7, 7) {
+        return None;
+    }
+    // SAFETY: readable, as checked or as the instruction's own page.
+    let before = unsafe { std::slice::from_raw_parts((rip - 7) as *const u8, 7) };
+    if !decode::loop15_head(before, ptr_reg) || end_reg == 0 || end_reg == ptr_reg {
+        return None;
+    }
+    let rax = ctx.Rax as usize;
+    let ptr = *register(ctx, ptr_reg) as usize;
+    let end = *register(ctx, end_reg) as usize;
+    let last = loop15_end(rax, ptr, end)?;
+    // Region by region, as the 12-byte loop: a block may lie across several views.
+    let mut at = rax;
+    while at < last {
+        let Some(to) = writable_to(at, last) else { break };
+        // A region ends on a page boundary, so `to` is on a line boundary as `at` is.
+        // SAFETY: committed and writable from `at` to `to`.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+        at = to;
+    }
+    if at == rax {
+        return Some(false);
+    }
+    ZEROED.fetch_add((at - rax) as u64, Relaxed);
+    if at < last {
+        // What follows is not writable: the loop stands at that line's `clzero` now, where
+        // the real one faults too. The instruction runs again (the caller must not step).
+        ctx.Rax = at as u64;
+        *register(ctx, ptr_reg) = (at + 64) as u64;
+        ctx.Rip = (rip as u64).wrapping_sub(3);
+        return Some(true);
+    }
+    ctx.Rax = (last - 64) as u64;
+    *register(ctx, ptr_reg) = last as u64;
+    Some(true)
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -271,15 +364,28 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 std::hint::spin_loop()
             }
         }
-        ConsoleOnly::Clzero => {
-            // with an address-size prefix (0x67) the line is at EAX, zero-extended
-            let a32 = code[..len - 3].contains(&0x67);
-            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
-                return 0; // the real instruction faults there too
+        ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
+            // The 15-byte loop around it, whole (fxceless 3973179): the lines it would
+            // still zero, each an exception of its own before.
+            let whole = match what {
+                // SAFETY: `rip` is the faulting instruction, whose bytes were read.
+                ConsoleOnly::ClzeroStep { ptr_reg, end_reg } if loop15() => unsafe { clzero_loop15(ctx, rip, ptr_reg, end_reg) },
+                _ => None,
+            };
+            match whole {
+                Some(true) => {}
+                Some(false) => return 0, // the real instruction faults there too
+                None => {
+                    // with an address-size prefix (0x67) the line is at EAX, zero-extended
+                    let a32 = code[..len - 3].contains(&0x67);
+                    let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
+                    if !writable(line, 64) {
+                        return 0; // the real instruction faults there too
+                    }
+                    // SAFETY: the 64-byte line is committed and writable.
+                    unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+                }
             }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
         }
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
@@ -368,4 +474,103 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the title's loop leaves, run line by line as the processor would: the lines it
+    /// zeroed and the registers (rax, ptr) at the end, from the state at its first `clzero`.
+    fn by_hand(mut rax: usize, mut ptr: usize, end: usize) -> (Vec<usize>, usize, usize) {
+        let mut lines = vec![rax & !63];
+        while ptr < end {
+            rax = ptr;
+            ptr += 0x40;
+            lines.push(rax & !63);
+        }
+        (lines, rax, ptr)
+    }
+
+    #[test]
+    fn the_15_byte_loop_ends_where_the_processor_would_end_it() {
+        for (rax, len) in [(0x1000usize, 7040usize), (0x1000, 3264), (0x1000, 3776), (0x1000, 896), (0x4000, 64), (0x4000, 65), (0x4000, 100), (0x4000, 1), (0x4000, 0), (0x8000, 128)] {
+            let (ptr, end) = (rax + 64, rax + len);
+            let (lines, last_rax, last_ptr) = by_hand(rax, ptr, end);
+            let last = loop15_end(rax, ptr, end).expect("the plain case");
+            assert_eq!(last, last_ptr, "rax {rax:#x} len {len}");
+            assert_eq!(last - 64, last_rax, "rax {rax:#x} len {len}");
+            assert_eq!((last - rax) / 64, lines.len(), "rax {rax:#x} len {len}");
+            assert_eq!(*lines.last().unwrap(), last - 64);
+        }
+        // an end before the pointer: the line at rax alone
+        assert_eq!(loop15_end(0x1000, 0x1040, 0x800), Some(0x1040));
+        // not the plain case: a line not on a boundary, a pointer that is not the next line
+        assert_eq!(loop15_end(0x1008, 0x1048, 0x2000), None);
+        assert_eq!(loop15_end(0x1000, 0x1080, 0x2000), None);
+        assert_eq!(loop15_end(0x1000, 0x1040, 0x1000 + (3 << 30)), None, "over 2 GiB");
+    }
+
+    /// The loop as the title has it at +0x4e8ab4c, for the given registers.
+    fn code(ptr_reg: u8, end_reg: u8) -> Vec<u8> {
+        let (ph, pl, eh, el) = (ptr_reg >> 3, ptr_reg & 7, end_reg >> 3, end_reg & 7);
+        vec![
+            0x48 | ph << 2, 0x89, 0xC0 | pl << 3, // mov rax, ptr
+            0x48 | ph, 0x83, 0xC0 | pl, 0x40, // add ptr, 0x40
+            0x0F, 0x01, 0xFC, // clzero
+            0x48 | eh << 2 | ph, 0x39, 0xC0 | el << 3 | pl, // cmp ptr, end
+            0x72, 0xF1, // jb -15
+            0x90,
+        ]
+    }
+
+    #[test]
+    fn the_15_byte_loop_is_zeroed_whole_and_leaves_the_loop_s_registers() {
+        for (ptr_reg, end_reg, len) in [(10u8, 11u8, 7040usize), (9, 10, 3264), (8, 9, 3776), (2, 8, 896), (10, 11, 64), (10, 11, 100)] {
+            let code = code(ptr_reg, end_reg);
+            // a block of 0xAA with room on both sides, its start on a line boundary
+            let mut block = vec![0xAAu8; 16384];
+            let base = (block.as_mut_ptr() as usize + 4096 + 63) & !63;
+            // SAFETY: plain data.
+            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+            ctx.Rip = code.as_ptr() as u64 + 7;
+            ctx.Rax = base as u64;
+            *register(&mut ctx, ptr_reg) = base as u64 + 64;
+            *register(&mut ctx, end_reg) = (base + len) as u64;
+            // SAFETY: the context points at the code above.
+            assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+            let (lines, last_rax, last_ptr) = by_hand(base, base + 64, base + len);
+            assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10, "at the loop's own cmp");
+            assert_eq!(ctx.Rax as usize, last_rax);
+            assert_eq!(*register(&mut ctx, ptr_reg) as usize, last_ptr);
+            assert_eq!(*register(&mut ctx, end_reg) as usize, base + len, "the end is left alone");
+            let zeroed = lines.len() * 64;
+            let at = base - block.as_ptr() as usize;
+            assert!(block[at..at + zeroed].iter().all(|&b| b == 0), "{zeroed} bytes zeroed");
+            assert!(block[..at].iter().all(|&b| b == 0xAA), "nothing before the block");
+            assert!(block[at + zeroed..].iter().all(|&b| b == 0xAA), "nothing after its last line");
+        }
+    }
+
+    #[test]
+    fn a_clzero_that_only_looks_like_the_loop_is_one_line() {
+        // the same bytes behind it, another head in front (add ptr, 0x80): one line, one step
+        let mut code = code(10, 11);
+        code[6] = 0x80;
+        let mut block = vec![0xAAu8; 8192];
+        let base = (block.as_mut_ptr() as usize + 2048 + 63) & !63;
+        // SAFETY: plain data.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = code.as_ptr() as u64 + 7;
+        ctx.Rax = base as u64;
+        ctx.R10 = base as u64 + 64;
+        ctx.R11 = base as u64 + 640;
+        // SAFETY: the context points at the code above.
+        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+        assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10);
+        assert_eq!((ctx.Rax, ctx.R10), (base as u64, base as u64 + 64), "registers untouched");
+        let at = base - block.as_ptr() as usize;
+        assert!(block[at..at + 64].iter().all(|&b| b == 0));
+        assert!(block[at + 64..].iter().all(|&b| b == 0xAA), "one line only");
+    }
 }
