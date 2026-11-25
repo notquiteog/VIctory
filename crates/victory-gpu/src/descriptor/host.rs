@@ -4491,8 +4491,14 @@ fn twin_uav(
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
 fn constant_bytes(size: u32) -> u32 {
-    const LARGEST: u32 = 64 << 10;
-    size.min(LARGEST).next_multiple_of(256)
+    constant_view_bytes(size).next_multiple_of(256)
+}
+
+/// The bytes of a title's constant buffer of `size` a shader can index: at
+/// most 64 KiB. A world load gave one of 1 MiB, more than the host copy
+/// holds.
+pub(crate) fn constant_view_bytes(size: u32) -> u32 {
+    size.min(D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4513,6 +4519,10 @@ fn make_twinned(
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let size = constant_view_bytes(size);
+            if size == 0 || address == 0 {
+                return None;
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -5733,6 +5743,19 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    #[test]
+    fn constant_view_from_world_load_fits_the_device() {
+        assert_eq!(constant_view_bytes(1_087_744), 65_536);
+        assert_eq!(constant_view_bytes(u32::MAX), 65_536);
+        assert_eq!(constant_view_bytes(320), 320);
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let data = vec![0u8; 128 * 1024];
+        let address = (data.as_ptr() as u64).next_multiple_of(65_536);
+        assert!(make(&View::Constant(address, 1_087_744), heap.cpu(0)).is_some());
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
