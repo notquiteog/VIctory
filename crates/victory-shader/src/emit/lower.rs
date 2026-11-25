@@ -96,17 +96,20 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// Whether the title dispatches the program by a count of threads whose last
 /// group may be partial: the structure builder's programs of one dimension.
 /// Their lanes past the count must not run (they count the lanes of a wave
-/// and store). Not where a group barrier would wait for lanes that left, nor
-/// where two host waves of 32 stand for a console wave (they exchange, which
-/// takes all lanes).
+/// and store). Not where a group barrier would wait for lanes that left.
+/// Where two host waves of 32 stand for a console wave (they exchange, which
+/// takes all lanes) those lanes stay and are masked ([`Lower::enter_counted`],
+/// DexNom/VIctory#22; `VICTORY_COUNTED_WAVE32=0`: such programs are not
+/// counted, as before).
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
     };
+    let masked = || host_max_wave() == 32 && std::env::var_os("VICTORY_COUNTED_WAVE32").is_none_or(|v| v != "0");
     cs.threads[0] > 1
         && cs.threads[1..] == [1, 1]
         && crate::spill::is_spilled(parts.native)
-        && (!parts.native.wave64 || host_max_wave() >= 64)
+        && (!parts.native.wave64 || host_max_wave() >= 64 || masked())
         && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
 }
 
@@ -366,6 +369,10 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Active-lane predicate for a partial-dispatch wave64 compute shader
+    /// lowered onto 32-lane host waves (inactive tail threads stay alive for
+    /// group barriers instead of returning in the prologue).
+    partial_active: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1679,6 +1686,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            partial_active: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -1989,6 +1997,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.with_partial(c, on);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -2138,6 +2147,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.with_partial(c, on);
         let lo = self.i32_of(lo)?;
         let hi = self.i32_of(hi)?;
         let z = self.s.m.i32(0);
@@ -2304,31 +2314,51 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::Or, first, total))
     }
 
+    /// The start of a program dispatched by a count of threads
+    /// ([`counted_in_threads`]): the lanes past the count are kept out of wave
+    /// counts, reads of the first lane and stores. They leave at once, before
+    /// anything else; but where two host waves of 32 stand for a console wave
+    /// (`halves`) they must stay for the group barriers of the exchanges, and
+    /// are masked instead ([`Self::with_partial`]; DexNom/VIctory#22).
+    fn enter_counted(&mut self) {
+        let original = self.s.entry;
+        let width = self.s.threads.expect("compute thread count")[0];
+        let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(thread) = self.thread_id(0) else {
+            unreachable!()
+        };
+        let width = self.s.m.i32(width);
+        let first = self.s.m.bin(original, Bin::Mul, group, width);
+        let x = self.s.m.bin(original, Bin::Add, first, thread);
+        let zero = self.s.m.i32(0);
+        let all = self.s.m.cmp(original, pred::EQ, limit, zero);
+        let inside = self.s.m.cmp(original, pred::IULT, x, limit);
+        let runs = self.s.m.bin(original, Bin::Or, all, inside);
+        if self.halves.is_some() {
+            self.partial_active = Some(runs);
+            return;
+        }
+        let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(original, Term::CondBr(runs, body, done));
+        self.s.m.terminate(done, Term::Ret);
+        self.s.entry = body;
+    }
+
+    /// `cond` in the lanes a counted dispatch runs ([`Self::enter_counted`]).
+    fn with_partial(&mut self, at: usize, cond: V) -> V {
+        match self.partial_active {
+            Some(active) => self.s.m.bin(at, Bin::And, cond, active),
+            None => cond,
+        }
+    }
+
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
         if counted {
-            // Before anything else, so that wave counts, reads of the first
-            // lane and stores know only the lanes that run.
-            let original = self.s.entry;
-            let width = self.s.threads.expect("compute thread count")[0];
-            let limit = self.host_word(RootType::Other(super::shader::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
-                unreachable!()
-            };
-            let Val::I32(thread) = self.thread_id(0) else {
-                unreachable!()
-            };
-            let width = self.s.m.i32(width);
-            let first = self.s.m.bin(original, Bin::Mul, group, width);
-            let x = self.s.m.bin(original, Bin::Add, first, thread);
-            let zero = self.s.m.i32(0);
-            let all = self.s.m.cmp(original, pred::EQ, limit, zero);
-            let inside = self.s.m.cmp(original, pred::IULT, x, limit);
-            let runs = self.s.m.bin(original, Bin::Or, all, inside);
-            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
-            self.s.m.terminate(original, Term::CondBr(runs, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            self.enter_counted();
         }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3458,7 +3488,7 @@ impl<'a> Lower<'a> {
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None, false);
+            let (h, byte) = self.memory(lo, hi, self.partial_active, false);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
@@ -3512,6 +3542,11 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                let bit = if self.x.st.active.contains(&lo) {
+                    self.with_partial(at, bit)
+                } else {
+                    bit
+                };
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -4300,6 +4335,7 @@ impl<'a> Lower<'a> {
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
         let bit = self.boolean(m, at)?;
+        let bit = self.with_partial(at, bit);
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
@@ -4345,6 +4381,16 @@ impl<'a> Lower<'a> {
             // A thread group of at most 32 threads is a single host wave: no exchange needed.
             let c = self.cur;
             let mine = self.boolean(when, c)?;
+            // (the lanes past a count of threads say nothing: [`Self::enter_counted`])
+            let mine = match self.partial_active {
+                Some(_) if any => self.with_partial(c, mine),
+                Some(active) => {
+                    let t = self.s.m.bool(true);
+                    let away = self.s.m.bin(c, Bin::Xor, active, t);
+                    self.s.m.bin(c, Bin::Or, mine, away)
+                }
+                None => mine,
+            };
             let i1t = self.s.t.i1;
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
@@ -4361,6 +4407,7 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bool(true);
             self.s.m.bin(c, Bin::Xor, mine, t)
         };
+        let set = self.with_partial(c, set);
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
@@ -4475,10 +4522,14 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(match g {
+            Some(g) => Some(self.with_partial(self.cur, g)),
+            None => self.partial_active,
+        })
     }
 
     // ---- results ----
@@ -10694,6 +10745,7 @@ impl<'a> Lower<'a> {
             }
         };
         if let Some(lo) = code.and_then(|c| inst.write(Reg::S(c))) {
+            let r = self.with_partial(self.cur, r);
             self.lane_bits.insert(lo, r);
         }
         for &(_, w) in &inst.writes {
