@@ -1,6 +1,8 @@
 //! A scalar bitwise instruction can pack a number drawn from a join of masks
 //! and numbers. Preserve the numeric operation when its inputs have exact words.
-use super::{Bin, Bool, Fields, LaneExit, Lower, MaskData, Operand, Reg, V, Val, Value};
+use super::{
+    Bin, Bool, Fields, LaneExit, Lower, MaskData, Operand, Reg, RootType, Term, V, Val, Value, pred,
+};
 
 impl Lower<'_> {
     pub(super) fn packed_mask_word(&mut self, value: Value) -> Option<V> {
@@ -105,6 +107,50 @@ impl Lower<'_> {
             return false;
         }
         (when == Bool::FALSE && to == taken) || (when == Bool::TRUE && to == not_taken)
+    }
+
+    pub(super) fn enter_partial_dispatch(&mut self) {
+        // Keep inactive threads out of wave counts, packed-header reads, and
+        // stores. When a console wave64 shader is lowered onto two 32-lane host
+        // waves (`self.halves.is_some()`), tail threads must stay alive for
+        // group barriers, so mask them via `partial_active` instead of
+        // returning early in the prologue.
+        let original = self.s.entry;
+        let width = self.s.threads.expect("compute thread count")[0];
+        let limit = self.host_word(
+            RootType::Other(crate::emit::USER_DISPATCH_THREADS_X),
+            0,
+            width,
+        );
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(thread) = self.thread_id(0) else {
+            unreachable!()
+        };
+        let width = self.s.m.i32(width);
+        let first = self.s.m.bin(original, Bin::Mul, group, width);
+        let x = self.s.m.bin(original, Bin::Add, first, thread);
+        let zero = self.s.m.i32(0);
+        let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
+        let inside = self.s.m.cmp(original, pred::IULT, x, limit);
+        let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
+        if self.halves.is_some() {
+            self.partial_active = Some(active);
+        } else {
+            let body = self.s.m.new_block();
+            let done = self.s.m.new_block();
+            self.s.m.terminate(original, Term::CondBr(active, body, done));
+            self.s.m.terminate(done, Term::Ret);
+            self.s.entry = body;
+        }
+    }
+
+    pub(super) fn with_partial(&mut self, at: usize, cond: V) -> V {
+        match self.partial_active {
+            Some(active) => self.s.m.bin(at, Bin::And, cond, active),
+            None => cond,
+        }
     }
 }
 

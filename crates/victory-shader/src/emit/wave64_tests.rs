@@ -572,3 +572,73 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+#[test]
+fn partial_thread_dispatch_on_32_lane_host_emits_wave32_and_masks_wave_counts_and_writes() {
+    use crate::dxbc::{Container, FourCC};
+
+    // Wave64 kernel with cross-lane EXEC popcount (`s_bcnt1_i32_b64 s6, exec`)
+    // and per-lane store (`out[thread_x] = active_count`), lowered with partial
+    // tail-group masking for a 32-lane host (such as NVIDIA).
+    let native = native(&[
+        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_for_dispatch(&native, &p, &HashSet::new(), 32, true).expect("lower");
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .expect("partial thread limit user data");
+    assert_eq!((limit.slot, limit.dword), (0, 64));
+
+    // Must declare WaveSize(32) in PSV0 rather than WaveSize(64) so 32-lane
+    // devices accept the pipeline.
+    let c = Container::parse(&shader.dxil).expect("Container::parse");
+    let psv = c.part(FourCC::PSV0).expect("PSV0").data;
+    let min_wave = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+    let max_wave = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+    assert_eq!((min_wave, max_wave), (32, 32));
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped live wave32 partial dispatch check");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("hardware device does not take this 32-lane pipeline; skipped");
+        return;
+    };
+    for count in [0u32, 1, 7, 31, 32, 33, 45, 63, 64] {
+        let mut constants = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        constants[limit.index as usize] = count;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        let active = if count == 0 { 64 } else { count };
+        for (i, &got) in out[0].iter().enumerate() {
+            let want = if (i as u32) < active { active } else { 0 };
+            assert_eq!(got, want, "count {count}, thread {i}");
+        }
+    }
+}

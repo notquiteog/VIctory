@@ -111,7 +111,7 @@ pub(super) fn lower_program(
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, partial, uint_srvs).run(partial) {
+        match Lower::new(parts, &bad, uint_srvs).run(partial) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -294,6 +294,10 @@ struct Lower<'a> {
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Active-lane predicate for a partial-dispatch wave64 compute shader
+    /// lowered onto 32-lane host waves (inactive tail threads stay alive for
+    /// group barriers instead of returning in the prologue).
+    partial_active: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1256,7 +1260,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 
 impl<'a> Lower<'a> {
     fn new(
-        x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, partial: bool,
+        x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>,
         uint_srvs: &'static [(u8, u32, u32)],
     ) -> Self {
         let p = x.p;
@@ -1313,7 +1317,7 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if !partial && wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1573,6 +1577,7 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             wave_base: None,
+            partial_active: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -1875,6 +1880,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.with_partial(c, on);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -2021,6 +2027,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.with_partial(c, on);
         let lo = self.i32_of(lo)?;
         let hi = self.i32_of(hi)?;
         let z = self.s.m.i32(0);
@@ -2172,26 +2179,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
         if partial {
-            // Keep inactive threads out of wave counts, packed-header
-            // reads, and stores. Wave64 emulation through group barriers
-            // requires full participation and cannot run this prologue.
-            let original = self.s.entry;
-            let width = self.s.threads.expect("compute thread count")[0];
-            let limit = self.host_word(RootType::Other(super::USER_DISPATCH_THREADS_X), 0, width);
-            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else { unreachable!() };
-            let Val::I32(thread) = self.thread_id(0) else { unreachable!() };
-            let width = self.s.m.i32(width);
-            let first = self.s.m.bin(original, Bin::Mul, group, width);
-            let x = self.s.m.bin(original, Bin::Add, first, thread);
-            let zero = self.s.m.i32(0);
-            let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
-            let inside = self.s.m.cmp(original, pred::IULT, x, limit);
-            let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
-            let body = self.s.m.new_block();
-            let done = self.s.m.new_block();
-            self.s.m.terminate(original, Term::CondBr(active, body, done));
-            self.s.m.terminate(done, Term::Ret);
-            self.s.entry = body;
+            self.enter_partial_dispatch();
         }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3117,7 +3105,7 @@ impl<'a> Lower<'a> {
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte, _) = self.memory(lo, hi, None);
+            let (h, byte, _) = self.memory(lo, hi, self.partial_active);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -3203,6 +3191,11 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                let bit = if self.x.st.active.contains(&lo) {
+                    self.with_partial(at, bit)
+                } else {
+                    bit
+                };
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -3858,6 +3851,7 @@ impl<'a> Lower<'a> {
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
         let bit = self.boolean(m, at)?;
+        let bit = self.with_partial(at, bit);
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
@@ -3907,6 +3901,7 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bool(true);
             self.s.m.bin(c, Bin::Xor, mine, t)
         };
+        let set = self.with_partial(c, set);
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
@@ -3983,10 +3978,14 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(match g {
+            Some(g) => Some(self.with_partial(self.cur, g)),
+            None => self.partial_active,
+        })
     }
 
     // ---- results ----
@@ -9073,6 +9072,7 @@ impl<'a> Lower<'a> {
             }
         };
         if let Some(lo) = code.and_then(|c| inst.write(Reg::S(c))) {
+            let r = self.with_partial(self.cur, r);
             self.lane_bits.insert(lo, r);
         }
         for &(_, w) in &inst.writes {
