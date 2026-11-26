@@ -1470,7 +1470,8 @@ fn own_bits_on() -> bool {
 /// what it writes for the console's own hardware, and whether pixel shaders'
 /// wave operations include helper lanes (shader model 6.7 on the host,
 /// [`super::set_helper_lane_waves`]), and whether heap handles stay in
-/// their blocks ([`heap_handles_local`]).
+/// their blocks ([`heap_handles_local`]), and whether wide indirect
+/// dispatches are split (`split_group_base`).
 pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
@@ -1478,7 +1479,9 @@ pub fn host_settings() -> [u32; 6] {
         super::shader::raw_views(),
         host_rdna(),
         u32::from(super::helper_lane_waves()),
-        u32::from(heap_handles_local()),
+        // (One word for both, so that a cache made before the second
+        // existed keeps its key while it is off.)
+        u32::from(heap_handles_local()) | u32::from(split_group_base()) << 1,
     ]
 }
 
@@ -1553,10 +1556,24 @@ pub fn host_max_wave() -> u32 {
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Experimental portable split for the 32-lane GPUs on which the native
+/// AMD over-limit dispatch is unavailable.
+fn split_group_base() -> bool {
+    if host_max_wave() != 32 {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(enabled) = TEST_GROUP_BASE.get() {
+        return enabled;
+    }
+    std::env::var_os("VICTORY_DISPATCH_SPLIT").is_some_and(|v| v == "1")
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(super) static TEST_GROUP_BASE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -3039,6 +3056,15 @@ impl<'a> Lower<'a> {
                 return Val::I32(v);
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            // The host's group id plus the dispatch's first group in x
+            // (`shader.rs` `USER_GROUP_BASE`).
+            Input::GroupId(0) if split_group_base() => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
+            }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {

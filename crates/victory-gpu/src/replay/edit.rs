@@ -166,6 +166,8 @@ pub struct Clamp {
     /// The scratch buffer it writes the arguments to, from its start.
     pub scratch: u32,
     pub bytes: u64,
+    /// The scratch holds a second set of indirect dispatch records.
+    pub split: bool,
     /// Where its arguments are in [`RESULTS`].
     pub result: u64,
 }
@@ -200,11 +202,19 @@ pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Cla
             } => to = Some(*res),
             Cmd::Dispatch { .. } if psos.contains(&bound) => {
                 if let Some(scratch) = to {
-                    let bytes = u64::from(constants[1]) * u64::from(constants[2]);
+                    let split = constants[0] == 2 && constants[4] & crate::indirect::SPLIT_FLAG != 0;
+                    let mut bytes = u64::from(constants[1]) * u64::from(constants[2]);
+                    if split {
+                        let Some(both) = bytes.checked_mul(2).filter(|&n| u32::try_from(n).is_ok()) else {
+                            continue;
+                        };
+                        bytes = both;
+                    }
                     found.push(Clamp {
                         at,
                         scratch,
                         bytes,
+                        split,
                         result: *next,
                     });
                     *next += bytes.next_multiple_of(256);
@@ -339,6 +349,8 @@ pub struct Batched {
     pub jobs: u32,
     /// The bytes of the scratch buffer.
     pub scratch: u64,
+    /// Lists kept intact because they contain a split clamp.
+    pub split_lists: usize,
 }
 
 /// A clamp batch being filled by [`batch_clamps`].
@@ -374,6 +386,11 @@ pub fn batch_clamps(
     let scratches: HashSet<u32> = {
         let mut next = 0;
         let found = find_clamps(&cmds, psos, &mut next);
+        // The replay batch format has one output record per job.
+        if found.iter().any(|clamp| clamp.split) {
+            done.split_lists = 1;
+            return (cmds, done);
+        }
         found.iter().map(|c| c.scratch).collect()
     };
     if scratches.is_empty() {
@@ -843,6 +860,30 @@ mod tests {
             runs,
             [(RESULTS, 12), (RESULTS, 0), (6, 0), (RESULTS, 256 + 24)]
         );
+
+        // A split dispatch reads both records written by one clamp.
+        let mut wide = clamp(5, 12, 1);
+        let Cmd::Constants { values, .. } = &mut wide[2] else { unreachable!() };
+        values[0] = 2;
+        values[4] = crate::indirect::SPLIT_FLAG;
+        wide.extend([pso(1), run(5, 0), run(5, 12)]);
+        let psos = HashSet::from([9]);
+        let mut next = 0;
+        let found = find_clamps(&wide, &psos, &mut next);
+        assert!(found[0].split);
+        assert_eq!(found[0].bytes, 24);
+        let kept = keep_clamped(wide.clone(), &found);
+        assert!(kept.iter().any(|c| matches!(c, Cmd::CopyBuffer { len: 24, .. })));
+        let skipped = skip_clamps(wide.clone(), &found);
+        assert!(matches!(&skipped[skipped.len() - 2..], [
+            Cmd::Indirect { args: RESULTS, at: 0, .. },
+            Cmd::Indirect { args: RESULTS, at: 12, .. },
+        ]));
+        let mut jobs = Vec::new();
+        let (batched, status) = batch_clamps(wide.clone(), &psos, &HashSet::new(), 8, true, &mut jobs);
+        assert_eq!(batched, wide);
+        assert_eq!(status.split_lists, 1);
+        assert!(jobs.is_empty());
     }
 
     #[test]

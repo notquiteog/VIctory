@@ -1240,6 +1240,9 @@ impl State {
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
+        if kind == victory_shader::emit::USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -3845,8 +3848,16 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        // Splitting a single record with no count buffer preserves its
+        // place in the list and does not read a GPU-written count twice.
+        let group_base = if kind == DISPATCH && max == 1 && count.is_none() {
+            compute_word(p, victory_shader::emit::USER_GROUP_BASE)
+        } else {
+            None
+        };
+        let mut second = None;
+        // Other single records can still be clamped in a batch.
+        let batch = if group_base.is_none() && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -3914,6 +3925,11 @@ impl State {
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                } else if let Some(base) = group_base {
+                    // The groups past 65,535 in x run as second records,
+                    // `records` records on in the scratch buffer.
+                    second = Some((base, u64::from(step) * u64::from(records)));
+                    crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
@@ -3967,6 +3983,25 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        // The groups past 65,535 in x: the second records, with the first
+        // group in x at 65,535 (a dispatch runs at most 65,535 groups in
+        // each dimension). Records that asked for fewer run no groups here.
+        if let Some(((param, dword), offset)) = second {
+            // SAFETY: as above; the compute root signature bound has the
+            // user-data parameter `param` with dword `dword`.
+            unsafe {
+                list.list.SetComputeRoot32BitConstant(param, 65535, dword);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + offset,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            }
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
