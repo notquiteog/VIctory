@@ -6599,11 +6599,22 @@ impl HostList {
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        self.transition_copy(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// As [`HostList::transition`], for a host copy held by the caller (the
+    /// title's object may be gone; Belobug e48eb83eb): the state it leaves,
+    /// if that is a change.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 self.changed_something();
                 None
             }
@@ -6612,7 +6623,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }

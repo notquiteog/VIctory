@@ -68,6 +68,10 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::activates_rays`]).
     #[cfg(windows)]
     activates_rays: bool,
+    /// It draws the sky as the title reflects it
+    /// ([`crate::ambient::draws_sky`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -126,6 +130,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 activates_rays: stage == "compute" && crate::ambient::activates_rays(bytes),
+                #[cfg(windows)]
+                draws_sky: stage == "pixel" && crate::ambient::draws_sky(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]

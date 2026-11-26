@@ -45,6 +45,17 @@
 //! them to a part of its constant): `VICTORY_AMBIENT_REFLECT=<most>[,<least>]`,
 //! both as multiples of the light around; 0 leaves them.
 //!
+//! What is not on screen is the weak point: a surface that faces the eye
+//! (a hand held up, a face) has everything that lights it behind the eye,
+//! and got a fifth of the mean. The title draws its whole sky into a small
+//! image for its reflections (`ps_sky_paraboloid_reflection`, 128x128); the
+//! dome's mean gives a level and a hue, `gain * mean^power + least`
+//! (beloooo's find and numbers, Belobug 705a2d094, e48eb83eb, 4f62c2a5e,
+//! where it is the whole light). Here it is the least the estimate gives,
+//! shaded in creases like the rest: `VICTORY_AMBIENT_SKY=gain,least,power`
+//! sets it, `off` leaves the estimate without.
+//! shortcut: the sky's light is taken to reach everything, indoors too.
+//!
 //! `VICTORY_AMBIENT_MAGENTA=0` leaves magenta in what the resolve left to
 //! the bound alone (it is zeroed otherwise: the probes' memory, not light).
 
@@ -95,6 +106,94 @@ const ACTIVATES_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
 /// probes' rays, by its name.
 pub(crate) fn activates_rays(container: &[u8]) -> bool {
     container.windows(ACTIVATES_RAYS.len()).any(|w| w == ACTIVATES_RAYS)
+}
+
+/// The program that draws the sky as the title reflects it, by the start of
+/// its name: a small image of the whole sky, in the light's own units.
+const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
+
+/// Whether the program in `container` draws that image, by its name.
+pub(crate) fn draws_sky(container: &[u8]) -> bool {
+    container.windows(SKY.len()).any(|w| w == SKY)
+}
+
+/// The side of the sky dome, and the bytes of a row of it and of all of it
+/// (four 16-bit floats a texel).
+const SKY_SIDE: u32 = 128;
+const SKY_ROW: u32 = SKY_SIDE * 8;
+const SKY_BYTES: u64 = (SKY_SIDE * SKY_ROW) as u64;
+
+/// The sky dome that program last drew into: the host copy, held, since
+/// the title's object may go at any time.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky, three times
+/// brighter on average. Only the dome is followed (Belobug e48eb83eb:
+/// following whichever was recorded last made the light jump).
+static SKY_IMAGE: Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> = Mutex::new(None);
+
+/// At a draw of the sky's program into `image`.
+pub(crate) fn sky_drawn(image: crate::object::This) {
+    if !on() || sky().is_none() {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(image) else {
+        return;
+    };
+    {
+        let held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+            return;
+        }
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    let dome = d.Format.0 == 10
+        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && (d.Width, d.Height) == (u64::from(SKY_SIDE), SKY_SIDE)
+        && d.SampleDesc.Count == 1;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        tracing::info!(
+            format = d.Format.0,
+            width = d.Width,
+            height = d.Height,
+            slices = d.DepthOrArraySize,
+            levels = d.MipLevels,
+            dome,
+            "the sky's program draws into an image"
+        );
+    }
+    if dome {
+        *SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+    }
+}
+
+/// Gain, least level and power of the sky's part: its level is
+/// `gain * mean^power + least` (`VICTORY_AMBIENT_SKY=gain,least,power`;
+/// `off` or a gain and least of 0: none). The power is under one because
+/// the title's exposure follows the light (Belobug 705a2d094: the sky's mean
+/// goes from 0.001 at night to several units by day, the levels that look
+/// right only from 0.07 to 1.4).
+fn sky() -> Option<[f32; 3]> {
+    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SET.get_or_init(|| parse_sky(&std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default()))
+}
+
+/// What the sky gives unless something else is asked for.
+const SKY_SET: [f32; 3] = [0.36, 0.05, 0.4];
+
+fn parse_sky(set: &str) -> Option<[f32; 3]> {
+    if matches!(set.trim(), "off" | "0") {
+        return None;
+    }
+    let mut sky = SKY_SET;
+    for (to, v) in sky.iter_mut().zip(set.split(',')) {
+        if let Some(v) = v.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0) {
+            *to = v;
+        }
+    }
+    (sky[0] > 0.0 || sky[1] > 0.0).then_some(sky)
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -215,10 +314,10 @@ fn parse_reflect(set: &str) -> [f32; 2] {
 }
 
 /// The words of the passes' constants.
-const WORDS: usize = 15;
+const WORDS: usize = 18;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -229,11 +328,13 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float least;
     float magenta; float held; float held_least;
+    float sky_gain; float sky_least; float sky_power;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, and last what the sky gives.
 RWStructuredBuffer<float4> cells : register(u1);
+#define SKY (2 * CELLS + 1)
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
@@ -263,6 +364,9 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
+// The sky dome as the title drew it: 128 rows of 128 texels, four 16-bit
+// floats each.
+RWStructuredBuffer<uint2> dome : register(u3);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void mean() {
@@ -271,6 +375,30 @@ void mean() {
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // What the sky gives: level and hue from the dome's mean (as Belobug
+    // 705a2d094 has it).
+    if (sky_gain <= 0.0 && sky_least <= 0.0) {
+        cells[SKY] = 0.0;
+        return;
+    }
+    float3 all = 0;
+    const uint N = 16;
+    for (uint y = 0; y < N; y++) for (uint x = 0; x < N; x++) {
+        uint2 t = dome[((y * 2 + 1) * 128 / (N * 2)) * 128 + (x * 2 + 1) * 128 / (N * 2)];
+        float3 there = float3(f16tof32(t.x & 0xffff), f16tof32(t.x >> 16), f16tof32(t.y & 0xffff));
+        there = any(isnan(there)) || any(isinf(there)) ? 0.0 : there;
+        // The sun's own texels are held down: it lights by itself.
+        all += clamp(there, 0.0, 8.0);
+    }
+    all /= N * N;
+    float m = dot(all, LUMA);
+    // The sky's colour, half washed out (the ground lights too); a dark
+    // sky has none worth following.
+    const float3 NIGHT = float3(0.6, 0.75, 1.0);
+    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), all / max(m, 1e-6), 0.5), saturate(m / 0.05));
+    float3 gives = hue * (sky_gain * pow(max(m, 0.0), sky_power) + sky_least);
+    float4 gave = cells[SKY];
+    cells[SKY] = float4(gave.a > 0.0 ? lerp(gave.rgb, gives, 0.1) : gives, 1.0);
 }
 #endif
 
@@ -449,6 +577,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (least > 0.0) {
         found = max(found, float3(1.0, 0.98, 0.94) * least * open);
     }
+    // No less than what the sky gives: what lights a surface that faces the
+    // eye is not on screen.
+    found = max(found, cells[SKY].rgb * open);
     float3 was = unpack(light[p]);
     // Magenta (green far below red and blue) is what the probes' memory
     // held, not light (beloooo's find, Belobug 81ebb7bdc).
@@ -465,7 +596,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 2) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -479,6 +610,8 @@ struct Pass {
     hold: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    /// The sky dome's texels, copied out of the title's image.
+    dome: ID3D12Resource,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -527,6 +660,7 @@ fn make(
         hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
+        dome: made(SKY_BYTES)?,
     })
 }
 
@@ -606,6 +740,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
+    list.keep(&pass.dome);
+    // The sky dome, if the title has drawn it: its texels are copied out
+    // once a frame, before the mean that reads them.
+    let dome = (role == Role::Radiance && constant == 0.0)
+        .then(sky)
+        .flatten()
+        .and_then(|set| Some((set, SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()?)));
+    let [sky_gain, sky_least, sky_power] = dome.as_ref().map_or([0.0, 0.0, 1.0], |d| d.0);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; WORDS];
@@ -621,6 +763,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = f32::from(magenta_out()).to_bits();
     words[13] = held.to_bits();
     words[14] = held_least.to_bits();
+    words[15] = sky_gain.to_bits();
+    words[16] = sky_least.to_bits();
+    words[17] = sky_power.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -633,6 +778,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(5, pass.dome.GetGPUVirtualAddress());
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -641,7 +787,54 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         match role {
             Role::Radiance => {
                 run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                if let Some((set, copy)) = &dome {
+                    static FOLLOWS: std::sync::Once = std::sync::Once::new();
+                    FOLLOWS.call_once(|| {
+                        tracing::info!(gain = set[0], least = set[1], power = set[2], "the stand-in for the indirect light has the sky's as its least");
+                    });
+                    list.keep(&copy.texture);
+                    // (The list's first use of it: its prelude brings it there.)
+                    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    if let Some(before) = list.transition_copy(copy, source.0 as u32) {
+                        l.ResourceBarrier(&[crate::host::transition(
+                            &copy.texture,
+                            D3D12_RESOURCE_STATES(before as i32),
+                            source,
+                        )]);
+                    }
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&copy.texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&pass.dome),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 0,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                    Width: SKY_SIDE,
+                                    Height: SKY_SIDE,
+                                    Depth: 1,
+                                    RowPitch: SKY_ROW,
+                                },
+                            },
+                        },
+                    };
+                    // The buffer rests in the common state; a copy takes it
+                    // from there by itself, the rest is said.
+                    let (common, dest, written) =
+                        (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    l.ResourceBarrier(&[crate::host::transition(&pass.dome, common, dest)]);
+                    l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                    l.ResourceBarrier(&[crate::host::transition(&pass.dome, dest, written)]);
+                    run(&pass.mean, 1, 1, 1);
+                    l.ResourceBarrier(&[crate::host::transition(&pass.dome, written, common)]);
+                } else {
+                    run(&pass.mean, 1, 1, 1);
+                }
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(
@@ -702,6 +895,16 @@ mod tests {
         assert_eq!(parse_reflect("0"), [0.0, REFLECT[1]]);
         assert_eq!(parse_reflect("2,0.25"), [2.0, 0.25]);
         assert_eq!(parse_reflect("-1,nan"), REFLECT);
+    }
+
+    #[test]
+    fn the_sky() {
+        assert_eq!(parse_sky(""), Some(SKY_SET));
+        assert_eq!(parse_sky("off"), None);
+        assert_eq!(parse_sky("0,0"), None);
+        assert_eq!(parse_sky("0.5,,0.3"), Some([0.5, SKY_SET[1], 0.3]));
+        assert!(draws_sky(b"..ps_sky_paraboloid_reflection_1c.."));
+        assert!(!draws_sky(b"ps_sky"));
     }
 
     #[test]
