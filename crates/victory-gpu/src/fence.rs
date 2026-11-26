@@ -124,6 +124,38 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
             }
+            if block() {
+                // A queue that holds work for another fence may be what sets
+                // it: what it held is let go between waits.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+                loop {
+                    let current = fence.value.load(Ordering::Acquire);
+                    if current >= value {
+                        return S_OK;
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let ms = (deadline - now).as_millis().min(10) as u32;
+                    // SAFETY: the fence's value, compared as 8 bytes; [`set`]
+                    // wakes it.
+                    unsafe {
+                        windows_sys::Win32::System::Threading::WaitOnAddress(
+                            (&raw const fence.value).cast(),
+                            (&raw const current).cast(),
+                            size_of::<u64>(),
+                            ms.max(1),
+                        );
+                    }
+                    crate::queue::release_held(false);
+                }
+                if fence.value.load(Ordering::Acquire) >= value {
+                    return S_OK;
+                }
+                tracing::warn!(value, "blocking fence wait timed out");
+                return E_NOTIMPL;
+            }
             tracing::warn!(value, "blocking fence wait not implemented");
             return E_NOTIMPL;
         }
@@ -134,6 +166,14 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     waiters.push((value, event as usize));
     S_OK
+}
+/// Whether a wait with no event, behind submissions not waited for, waits up
+/// to 250 ms for the value (`VICTORY_FENCE_BLOCK=0`: fails at once, as before;
+/// codec_d, pareto-residency e05d4633a).
+#[cfg(windows)]
+fn block() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FENCE_BLOCK").map_or(true, |v| v.trim() != "0"))
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
@@ -151,6 +191,13 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+    drop(waiters);
+    // The title's threads may wait on the value's address (its GPU address).
+    #[cfg(windows)]
+    // SAFETY: any address may be woken.
+    unsafe {
+        windows_sys::Win32::System::Threading::WakeByAddressAll((&raw const fence.value).cast());
+    }
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let _called = crate::timeline::span("a fence set");

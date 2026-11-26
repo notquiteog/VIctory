@@ -848,6 +848,9 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+            // The title may wait on the address.
+            #[cfg(windows)]
+            windows_sys::Win32::System::Threading::WakeByAddressAll(at.cast());
         }
     }
 }
