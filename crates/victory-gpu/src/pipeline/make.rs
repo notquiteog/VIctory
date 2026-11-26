@@ -27,7 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -46,6 +46,11 @@ pub(crate) struct Pending {
     /// LOCAL: how long draws have waited for it so far, in microseconds
     /// ([`wait_once`]).
     waited_us: AtomicU64,
+    /// LOCAL (fxceless a35c557393): the formats its state declares (zeros
+    /// without a graphics state), and the same shaders and state for other
+    /// formats bound at a draw ([`for_formats`]): a chain, one link per set.
+    pub(crate) formats: TargetFormats,
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -71,6 +76,8 @@ impl Pending {
             let _ = made.set(None);
         }
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -183,6 +190,52 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]):
+/// `VICTORY_TARGET_VARIANTS=1`, off unless said.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_some_and(|v| v == "1"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats `bound`
+/// that `p` does not declare: that of the same shaders and state for those
+/// formats, queued and waited for like the title's own.
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and state `g` for the formats `bound`:
+/// found in the chain from `p`, or added to it (logged once per set).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = %hashes(p),
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=1)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);

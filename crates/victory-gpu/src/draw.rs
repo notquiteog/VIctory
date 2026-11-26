@@ -306,6 +306,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// LOCAL (fxceless a35c557393): the formats of the views
+    /// [`State::set_targets`] bound (eight targets, then depth), for the
+    /// draws' pipelines (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -1102,6 +1106,16 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        // The formats of the host views, for the draws' pipelines (before
+        // the bind cache below, which can return early).
+        let mut formats = [0u32; 9];
+        for (i, (texture, desc)) in views.iter().take(8).enumerate() {
+            formats[i] = bound_format(*texture, desc.as_ref().map(|d| d.Format));
+        }
+        if let Some((texture, record)) = dsv.as_ref() {
+            formats[8] = bound_format(Some(*texture), record.depth_desc().as_ref().map(|d| d.Format));
+        }
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1383,7 +1397,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -4165,6 +4179,18 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
+    }
+}
+
+/// LOCAL (fxceless a35c557393): the format of a host view of `texture`
+/// whose description names `described`: that one, else the texture's own
+/// (what the host gives a view without a format); 0 if neither is known.
+fn bound_format(texture: Option<&ID3D12Resource>, described: Option<DXGI_FORMAT>) -> u32 {
+    match (described, texture) {
+        (Some(format), _) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        (_, Some(texture)) => unsafe { texture.GetDesc() }.Format.0 as u32,
+        _ => 0,
     }
 }
 
