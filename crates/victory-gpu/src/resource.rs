@@ -2054,6 +2054,7 @@ pub(crate) fn let_go_idle() {
     // back goes, the longest idle first, whatever the card's rule keeps. (The
     // second is what protects a host texture handed out and not yet recorded:
     // see above.)
+    const COMMIT_IDLE_MS: u64 = 10_000;
     let for_commit = if by_clock {
         0
     } else {
@@ -2062,9 +2063,13 @@ pub(crate) fn let_go_idle() {
     let (idle_ms, most) = match for_commit {
         0 => (idle_ms, most),
         u64::MAX => (1_000, u64::MAX),
+        // Under a gibibyte of commit left, which is where a 32 GB PC stands for the whole of
+        // free roam: only what has been idle ten seconds. At one second (as it was) what the
+        // player looked away from went and was made again when looked at: 35,000 copies let
+        // go and 7,000 made again in four minutes, seen as textures and foliage popping.
         // (a limit of the card's with it: the larger of the two)
-        wanted if most != u64::MAX => (1_000, wanted.max(most)),
-        wanted => (1_000, wanted),
+        wanted if most != u64::MAX => (COMMIT_IDLE_MS, wanted.max(most)),
+        wanted => (COMMIT_IDLE_MS, wanted),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
