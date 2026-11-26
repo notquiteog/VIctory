@@ -954,11 +954,23 @@ fn constant_of(i: u32, generation: u32) -> View {
 
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    // Words 1 and 13 of the resource description are the filler of its
+    // layout, where the title leaves what its stack held (see
+    // `crate::resource::texture_at`, which keeps them out of its key for
+    // the same reason). Kept in the shape they made a new shape for most
+    // views: 1.5 million shapes by the end of play-g. Nothing that makes a
+    // view reads them. `VICTORY_PLACED_FILLER=1` keeps them, as before.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut resource = *resource;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1823,6 +1835,32 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// Views of one placed texture whose resource descriptions differ only
+    /// in the filler words keep one shape.
+    #[test]
+    fn placed_views_that_differ_in_filler_share_a_shape() {
+        if !inline() || std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1") {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ef0_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a80_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        let mut blank = resource;
+        (blank[1], blank[13]) = (0, 0);
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == blank).count();
+        for n in 0..100u32 {
+            let mut stack = resource;
+            (stack[1], stack[13]) = (n.wrapping_mul(0x9e37_79b9), !n);
+            create_placed_srv(null, &stack, &desc, at);
+            // The view comes back without its filler.
+            assert_eq!(view(at), Some(View::Placed(false, blank, desc)));
+        }
+        assert_eq!(shapes(), 1, "one shape for 100 fillers");
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -1834,8 +1872,9 @@ mod tests {
         let null = std::ptr::null();
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
-        // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // A resource description and a view no other test uses, with no
+        // filler (words 1 and 13 leave the shape: the test above).
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
