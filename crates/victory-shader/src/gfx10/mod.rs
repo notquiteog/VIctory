@@ -109,6 +109,9 @@ fn decode_aligned(code: &[u8]) -> Option<Result<Vec<Instruction>, ShaderError>> 
                 Ok(inst) => inst,
                 Err(e) => return Some(Err(e)),
             };
+            if let Err(e) = sgpr_destination(&inst) {
+                return Some(Err(e));
+            }
             let next = offset + 4 * inst.words.len();
             // The instruction found last below `end`, as the tree has it,
             // where it can end at `end` (all a far jump looks for): within
@@ -159,6 +162,7 @@ fn decode_any(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     while let Some(mut offset) = pending.pop() {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
+            sgpr_destination(&inst)?;
             let next = offset + 4 * inst.words.len();
             let flow = control(&inst, code.len(), |at| {
                 found.range(..at).next_back().map(|(_, i)| i)
@@ -374,6 +378,25 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
         words: (0..len).map(word).collect::<Result<_, _>>()?,
         name: name(encoding, opcode),
     })
+}
+
+/// VOP3 compares, `v_readlane_b32` and `v_readfirstlane_b32` name their SGPR
+/// in eight bits: codes from 128 up are no register ([`Operand::Scalar`]
+/// promises none; the IR takes them for parked scalars). `v_cmpx` writes
+/// EXEC whatever the field holds.
+fn sgpr_destination(inst: &Instruction) -> Result<(), ShaderError> {
+    if !matches!(inst.encoding, Encoding::Vop1 | Encoding::Vop3)
+        || inst.name().is_none_or(|n| n.starts_with("v_cmpx"))
+    {
+        return Ok(());
+    }
+    match inst.fields(false) {
+        Fields::Valu(Valu {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        }) if code >= 128 => Err(isa(inst.offset, "an SGPR destination past exec_hi")),
+        _ => Ok(()),
+    }
 }
 
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
@@ -656,5 +679,26 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn rejects_sgpr_destinations_past_exec_hi() {
+        // VOP3 compares and v_readlane name their SGPR in eight bits; the IR
+        // took codes from 128 up for parked scalars and indexed past its
+        // table of machine ones.
+        let ok = |words: &[u32]| decode(&bytes(words)).is_ok();
+        assert!(ok(&[0xD401_0006, 0x0001_E501, S_ENDPGM])); // v_cmp_lt_f32 s6, v1, 1.0
+        assert!(ok(&[0x7E04_0505, S_ENDPGM])); // v_readfirstlane_b32 s2, v5
+        assert!(ok(&[0xD760_0002, 0x0000_0101, S_ENDPGM])); // v_readlane_b32 s2, v1, s0
+        for code in [
+            [0xD401_009F, 0x0001_E501, S_ENDPGM],
+            [0x7F9E_0405, S_ENDPGM, S_ENDPGM],
+            [0xD760_0080, 0x0000_0101, S_ENDPGM],
+        ] {
+            assert!(crate::ir::build(&bytes(&code), false, 256).is_err());
+            assert!(!ok(&code), "{code:08X?}");
+        }
+        // v_cmpx writes EXEC whatever its destination field holds.
+        assert!(ok(&[0xD411_009F, 0x0001_E501, S_ENDPGM]));
     }
 }
