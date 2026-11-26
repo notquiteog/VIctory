@@ -2496,9 +2496,92 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// What `copies` refresh, per copy (in the order first refreshed), and
+    /// how many steps there were when that was found ([`spans_early`]).
+    spans: Option<(usize, Vec<RefreshSpan>)>,
+}
+
+/// A host copy and the span of it a list refreshes, `[from, to)`.
+type RefreshSpan = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Per copy, the span of what `steps` refresh, in the order first refreshed.
+fn refresh_spans(steps: &[Step]) -> Vec<RefreshSpan> {
+    let mut spans: Vec<RefreshSpan> = Vec::new();
+    let mut places: ByCopy<usize> = ByCopy::default();
+    for step in steps {
+        if let Step::Refresh(shadow, address, len) = step {
+            let end = *address + *len;
+            match places.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+                std::collections::hash_map::Entry::Occupied(at) => {
+                    let s = &mut spans[*at.get()];
+                    (s.1, s.2) = (s.1.min(*address), s.2.max(end));
+                }
+                std::collections::hash_map::Entry::Vacant(at) => {
+                    at.insert(spans.len());
+                    spans.push((shadow.clone(), *address, end));
+                }
+            }
+        }
+    }
+    spans
+}
+
+#[cfg(test)]
+mod spans_tests {
+    use super::{Step, refresh_spans};
+    use crate::shadow::Shadow;
+
+    /// Per copy one span, the union of its refreshes, in the order each copy
+    /// was first refreshed; what is not a refresh counts for nothing.
+    #[test]
+    fn spans_join_per_copy_in_order() {
+        let mut a_mem = vec![0u8; 1 << 16];
+        let mut b_mem = vec![0u8; 1 << 16];
+        let a = Shadow::unbacked(0x10_0000, a_mem.as_mut_ptr(), 1 << 16, false);
+        let b = Shadow::unbacked(0x20_0000, b_mem.as_mut_ptr(), 1 << 16, false);
+        let steps = vec![
+            Step::Refresh(b.clone(), 0x20_1000, 0x100),
+            Step::Refresh(a.clone(), 0x10_4000, 0x10),
+            Step::GpuWrite(a.clone(), 0x10_0000, 0x1_0000),
+            Step::Refresh(b.clone(), 0x20_0800, 0x10),
+            Step::Refresh(a.clone(), 0x10_5000, 0x200),
+        ];
+        let spans: Vec<(usize, usize, usize)> =
+            refresh_spans(&steps).iter().map(|(s, from, to)| (std::sync::Arc::as_ptr(s) as usize, *from, *to)).collect();
+        assert_eq!(
+            spans,
+            vec![
+                (std::sync::Arc::as_ptr(&b) as usize, 0x20_0800, 0x20_1100),
+                (std::sync::Arc::as_ptr(&a) as usize, 0x10_4000, 0x10_5200),
+            ]
+        );
+    }
+}
+
+/// Whether what a list refreshes, per copy, is found when it is closed, on
+/// the thread that translated it, and not by the submitting thread at each
+/// submission (`VICTORY_SPANS_EARLY=0`: there, as before). A list's steps
+/// do not change once it is closed; if they did, the count of steps tells,
+/// and the spans are found again.
+///
+/// Why: the submitting thread is the frame's bottleneck, and went over
+/// every step of every list (some 20,000 refreshes of 4,500 copies a frame)
+/// to find what lies under flights' writes: 1.8 of its 125 million samples
+/// in profile prof1 (2026-11-26).
+fn spans_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_EARLY").is_none_or(|v| v != "0"))
 }
 
 impl Deferred {
+    /// [`refresh_spans`] of the steps, found now if not known for them.
+    fn spans(&mut self) -> &[RefreshSpan] {
+        if self.spans.as_ref().is_none_or(|(n, _)| *n != self.copies.len()) {
+            self.spans = Some((self.copies.len(), refresh_spans(&self.copies)));
+        }
+        &self.spans.as_ref().expect("found above").1
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3295,7 +3378,24 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = ByCopy::default();
-    for list in runs {
+    if spans_early() {
+        for list in runs {
+            let mut deferred = list.deferred();
+            for (shadow, from, to) in deferred.spans() {
+                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                    shadow.writes_pending().then(|| {
+                        spans.push((shadow.clone(), *from, *to));
+                        spans.len() - 1
+                    })
+                });
+                if let Some(i) = *place {
+                    let s = &mut spans[i];
+                    (s.1, s.2) = (s.1.min(*from), s.2.max(*to));
+                }
+            }
+        }
+    }
+    for list in runs.iter().filter(|_| !spans_early()) {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
                 let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
@@ -6531,6 +6631,10 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+        if spans_early() {
+            let _spans = crate::timeline::span("what a list refreshes");
+            self.deferred().spans();
         }
     }
 
