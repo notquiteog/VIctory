@@ -80,6 +80,10 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             // (trustno1-coder/VIctory-NVIDIA) every node test a miss.
             "VICTORY_BVH_MISS",
+            // Which floats are guarded against NaN is part of the translation
+            // (`Lower::nan_guard`): `stores` and `0` were served the entries
+            // of a run without them.
+            "VICTORY_NAN_GUARD",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
