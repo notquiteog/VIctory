@@ -3060,17 +3060,20 @@ impl HostHeap {
             slot_stats::mirrored(index);
         }
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (heap cap): the title asks for more slots than a
+            // host heap holds, and it walks them in increasing order, so a
+            // line per new high-water mark is one line per slot - a quarter
+            // of a million in the world, ~8 000 of them a second, on the
+            // thread recording the frame. Once is enough to say it.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "title slot past the host heap: slots above the host heap's count are not mirrored"
                 );
-            }
+            });
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
