@@ -31,13 +31,26 @@ captures in `captures\rt-on1`, `rt-on2`, `rt-off1` (not in the repository):
   no "rests", no "stays off". Shaders still touch 100-500 pages a frame that
   have no copy (read as zero); most are refused (not committed title memory),
   as before.
-- Time (frame medians, the bench's `GPU` mean): off 67-70 ms (GPU 2-5 ms);
-  on 89-101 ms (GPU 7-22 ms). The card stays far from the bottleneck: the
-  frame is the CPU's. Of the CPU's part the submitting thread had 18 ms a
-  frame more busy (profiles rt-pon1 against rt-poff1), 7 ms of it in the
-  kernel's write watch for the copies of memory by address (the directory
-  and the arenas, refreshed whole for every list that reads them): now
-  pushed as they are written (`VICTORY_BVH_PUSH`, below).
+- Time (frame medians; `GPU` is the bench's mean of the card's time a
+  frame). Before the merge of main's two-stage line: off 67-70 ms (GPU 2-5),
+  on 89-101 ms (GPU 7-22). On main b9d436df2 with the push below (runs
+  rt-pon3, rt-poff3, rt-ppush03, one each, walking): on 86 ms (GPU 17), off
+  73 ms (GPU 5), on with `VICTORY_BVH_PUSH=0` 78 ms (GPU 33). Runs of the
+  walk differ by 10 ms and more from one to the next; the card is not what
+  holds the frame (5-30 ms of it busy).
+- The submitting thread (profiles, 120 s each): before the push, rays added
+  18 ms a frame of work to it, 7 ms of it in the kernel's write watch
+  (`GetWriteWatch`) for the copies of memory by address, the directory and
+  the arenas refreshed whole for every list that reads them. With the push
+  (`VICTORY_BVH_PUSH`, below) `GetWriteWatch` is 4.3 ms a frame against 8.6
+  without it and 2.9 with rays off, and the thread's work with rays is some
+  6 ms a frame above rays off (rt-pon3 against rt-poff3): 1.5-2 ms each in
+  copying the title buffers the rays read (`Shadow::take`, `copy_stale`), the
+  card's copies before a submission (`card_before`) and the write watch.
+  The push itself costs the recording threads 0.02 ms a frame.
+- Seen once (rt-pcap3 frame 2600, walking past the white house): a fan of
+  small dark squares over the sky and the house front, gone in the frames
+  around it; not explained yet.
 
 What the skip list should become: nothing for ray tracing. `rt_off_hashes.txt`
 is for `VICTORY_BVH_BUILDER=0` only (scripts\play-nvidia.ps1 `-NoRayTracing`
