@@ -270,9 +270,12 @@ impl Role {
     fn of_name(name: &str) -> Option<Role> {
         if name.starts_with("victory-pipelines-") {
             Some(Role::Pipelines)
-        } else if name.starts_with("victory-wide-") {
+        } else if name.starts_with("victory-wide-") || name.starts_with("victory-land") || name == "victory-aside" || name == "victory-heap-sync" {
             Some(Role::Wide)
-        } else if name == "victory-late-wait" {
+        } else if name == "victory-submit" {
+            // (This tree's submitting thread does not say so itself.)
+            Some(Role::Submit)
+        } else if name == "victory-late-wait" || name == "victory-relay" {
             Some(Role::Late)
         } else if name == "title-main" {
             Some(Role::TitleMain)
