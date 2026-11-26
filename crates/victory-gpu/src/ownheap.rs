@@ -1,6 +1,6 @@
 //! The process's allocator: Rust's blocks in heaps of our own, one per few
-//! threads (`VICTORY_OWN_HEAP=<n>`, 1 to 16 heaps; off by default: the
-//! process heap, as Rust's `System` allocator does).
+//! threads (`VICTORY_OWN_HEAP=<n>`, 1 to 16 heaps; 8 when unset;
+//! `VICTORY_OWN_HEAP=0`: the process heap, as Rust's `System` allocator does).
 //!
 //! Why: Rust's `System` allocator on Windows takes every block from the
 //! process heap, the one the graphics runtime, the driver and every other
@@ -64,7 +64,12 @@ fn asked() -> usize {
     let mut value = [0u16; 8];
     // SAFETY: a terminated name and a buffer of the length given.
     let len = unsafe { GetEnvironmentVariableW(name.as_ptr(), value.as_mut_ptr(), value.len() as u32) } as usize;
-    if len == 0 || len >= value.len() {
+    // unset: 8 heaps, the measured default (about 8 ms a frame less on the
+    // submitting thread, at the same list calls); `VICTORY_OWN_HEAP=0`: the process heap
+    if len == 0 {
+        return 8;
+    }
+    if len >= value.len() {
         return 0;
     }
     let mut n = 0usize;
