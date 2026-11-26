@@ -113,6 +113,20 @@ pub(crate) fn enabled() -> bool {
     RUNTIME.get().is_some_and(|rt| rt.generation.is_some())
 }
 
+/// The flags the presenter's swap chain is made (and made again) with.
+/// With frame generation: tearing allowed
+/// (`DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`) and a waitable one
+/// (`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`). The runtime
+/// presents frames it does not interpolate with the tearing flag and sets
+/// the swap chain's frame latency itself; on a plain swap chain every such
+/// present failed with `DXGI_ERROR_INVALID_CALL` ("PFunPresentBefore
+/// failed" in its log) and nothing was shown.
+pub(crate) fn swap_chain_flags() -> u32 {
+    const WAITABLE: u32 = 0x40;
+    const ALLOW_TEARING: u32 = 0x800;
+    if enabled() { WAITABLE | ALLOW_TEARING } else { 0 }
+}
+
 fn marker(g: &Functions, marker: u32, token: *mut FrameToken) {
     // SAFETY: the runtime's token for a frame of ours.
     unsafe { (g.set_marker)(marker, token) };

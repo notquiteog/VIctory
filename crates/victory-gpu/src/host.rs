@@ -9283,7 +9283,13 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(crate::streamline::generate::swap_chain_flags() as i32),
+                    )
             };
             match resized {
                 Ok(()) => {
@@ -9466,6 +9472,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: crate::streamline::generate::swap_chain_flags(),
                 ..Default::default()
             };
             // With DLSS the swap chain is the runtime's own: it must see
