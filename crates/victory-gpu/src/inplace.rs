@@ -652,7 +652,7 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// another in memory and in one section alike, if the range is one run of a
 /// section ([`Cover::Run`]): its first address, its bytes, the section and
 /// the offset of its first byte in it.
-pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+pub(crate) fn stretch_around(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
     let v = views();
     stretch_in(&v.views, at, len)
 }

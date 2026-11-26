@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::Memory as mem;
 
-use crate::inplace::{Placed, cover, stretch};
+use crate::inplace::{Placed, cover, stretch_around};
 
 const K64: u64 = 64 << 10;
 
@@ -170,7 +170,7 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
-    let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
+    let Some((first, bytes, section, offset)) = stretch_around(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
     // The whole stretch, kept to what may be ported: the next buffer in it
