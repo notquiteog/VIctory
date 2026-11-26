@@ -2552,9 +2552,6 @@ impl<'a> Lower<'a> {
         if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
             return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
         }
-        if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
-            return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
-        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
