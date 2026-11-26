@@ -3969,7 +3969,16 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            // (A dispatch's groups as title memory has them now, if the
+            // CPU wrote them: what the card runs is what is there then.)
+            let mut groups = [0u32; 3];
+            // SAFETY: twelve bytes of title memory, read through the copy
+            // that leaves by its failing exit, into a local.
+            let read = kind == DISPATCH
+                && crate::safecopy::on()
+                && unsafe { crate::safecopy::copy(groups.as_mut_ptr().cast(), arguments as *const u8, 12) };
+            let said = if read { format!(" groups now {groups:?}") } else { String::new() };
+            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}{said}"), kind == DISPATCH)
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);

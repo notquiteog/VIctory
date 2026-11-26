@@ -778,7 +778,15 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     unsafe { out.write(TIMESTAMP_FREQUENCY) };
     S_OK
 }
-const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+pub(crate) const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
+
+/// The GPU clock the title is given, now: [`TIMESTAMP_FREQUENCY`] ticks per
+/// second since the process started (since the first asking).
+pub(crate) fn gpu_clock_now() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+}
 
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
@@ -787,6 +795,10 @@ pub(crate) enum Written {
     /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
     /// process started (our GPU work is done on the CPU's timeline).
     GpuTimestamp,
+    /// The GPU clock as the card itself read it at the write's place in its
+    /// list (`crate::host::truestamp`): the place to read it from.
+    #[cfg(windows)]
+    CardTimestamp(u32),
     /// The CPU's performance counter.
     SystemTimestamp,
 }
@@ -796,10 +808,16 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
+            // (One the card did not write: the clock now, as without it.)
+            #[cfg(windows)]
+            Written::CardTimestamp(place) => {
+                let now = crate::host::truestamp::read(place).unwrap_or_else(gpu_clock_now);
+                #[cfg(feature = "diagnostics")]
+                crate::host::spans::stamped(at as usize, now);
+                now
+            }
             Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                let now = gpu_clock_now();
                 #[cfg(all(windows, feature = "diagnostics"))]
                 crate::host::spans::stamped(at as usize, now);
                 as_loaded(now, at as usize, gpu_load())
