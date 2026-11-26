@@ -104,6 +104,26 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
 }
 
+/// Times what it is made for on a big copy ([`crate::heapstat`]).
+#[cfg(feature = "diagnostics")]
+struct BigTimer(Option<(std::time::Instant, fn(u64))>);
+
+#[cfg(feature = "diagnostics")]
+impl BigTimer {
+    fn new(shadow: &Shadow, to: fn(u64)) -> BigTimer {
+        BigTimer((shadow.len as usize >= crate::heapstat::BIG && shadow.card.is_some()).then(|| (std::time::Instant::now(), to)))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for BigTimer {
+    fn drop(&mut self) {
+        if let Some((at, to)) = self.0 {
+            to(at.elapsed().as_nanos() as u64);
+        }
+    }
+}
+
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
@@ -3781,6 +3801,8 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let _timed = BigTimer::new(self, crate::heapstat::merged);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3970,6 +3992,8 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = BigTimer::new(self, crate::heapstat::refreshed);
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -5294,6 +5318,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
+                #[cfg(feature = "diagnostics")]
+                crate::heapstat::big(key.0 as usize, len as usize);
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),

@@ -279,6 +279,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         {
             tally(12, count as u64);
+            crate::heapstat::asked(first * PAGE, last * PAGE, &found[..count], started.elapsed().as_nanos() as u64);
             use crate::copystat::{C, add};
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);

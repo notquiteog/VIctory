@@ -30,6 +30,13 @@ pub mod console;
 mod compose;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod ownheap;
+/// The process's allocator outside diagnostics builds (which count blocks
+/// over the same one, `copystat`).
+#[cfg(all(windows, not(feature = "diagnostics")))]
+#[global_allocator]
+static OWN_HEAP: ownheap::OwnHeap = ownheap::OwnHeap;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -55,6 +62,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(feature = "diagnostics")]
+mod heapstat;
 #[cfg(windows)]
 mod land;
 pub mod list;
