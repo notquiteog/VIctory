@@ -3256,3 +3256,68 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+#[test]
+fn v_rndne_f32_ties_to_even_and_specials() {
+    // 1. Dynamic input v_rndne_f32 v0, v1 (VOP1 opcode 0x23)
+    let shader_dyn = build_valu_cs(&[vop1(0x023, 0, vgpr(1))]);
+    let f = f32::to_bits;
+    let cases: &[(u32, u32)] = &[
+        (f(-3.5), f(-4.0)),
+        (f(-2.5), f(-2.0)),
+        (f(-1.5), f(-2.0)),
+        (f(-0.5), f(-0.0)),
+        (f(-0.0), f(-0.0)),
+        (f(0.0), f(0.0)),
+        (f(0.5), f(0.0)),
+        (f(1.5), f(2.0)),
+        (f(2.5), f(2.0)),
+        (f(3.5), f(4.0)),
+        (f(4.5), f(4.0)),
+        (f(8388607.5), f(8388608.0)),
+        (f(8388608.0), f(8388608.0)),
+        (0x0000_0001, 0x0000_0000),
+        (0x8000_0001, 0x8000_0000),
+        (0x3EFF_FFFF, 0x0000_0000),
+        (0x3F00_0001, 0x3F80_0000),
+        (0x7F80_0000, 0x7F80_0000),
+        (0xFF80_0000, 0xFF80_0000),
+        (0x7FC0_0000, 0x7FC0_0000),
+        (0x7FC0_0001, 0x7FC0_0001),
+        (0xFFC0_0000, 0xFFC0_0000),
+        (0x7F80_0001, 0x7FC0_0001),
+        (0xFF80_0001, 0xFFC0_0001),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, _)| [a, 0, 0, 0]).collect();
+    run_cases(&shader_dyn, &inputs, |backend, i, _, got| {
+        let (a, want) = cases[i];
+        assert_eq!(got, want, "{backend}: v_rndne_f32({a:#010x}) = {got:#010x}, want {want:#010x}");
+    });
+
+    // 2. Constant literal half-way values into v_rndne_f32 after s_barrier (where NVIDIA
+    // 621.xx constant-folds DXIL Round_ne(2.5) to 3.0 instead of 2.0).
+    for (lit, want) in [(f(2.5), f(2.0)), (f(-2.5), f(-2.0)), (f(0.5), f(0.0)), (f(-0.5), f(-0.0))] {
+        let body = [
+            vop1(0x001, 2, 255),     // v_mov_b32 v2, literal
+            lit,
+            0xBF8A_0000,             // s_barrier
+            vop1(0x023, 0, vgpr(2)), // v_rndne_f32 v0, v2
+        ];
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: literal v_rndne_f32({lit:#010x}) = {got:#010x}, want {want:#010x}");
+        });
+    }
+
+    // 3. Literal 2.5 in v_cvt_pk_u8_f32 (2.5 -> 2).
+    let mut body_pk = vec![
+        vop1(0x001, 2, 255), // v_mov_b32 v2, 2.5f32
+        f(2.5),
+        0xBF8A_0000, // s_barrier
+    ];
+    body_pk.extend_from_slice(&vop3(0x15E, 0, vgpr(2), 0x80, 0x80)); // v_cvt_pk_u8_f32 v0, v2, 0, 0
+    let shader_pk = build_valu_cs(&body_pk);
+    run_cases(&shader_pk, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 2, "{backend}: literal v_cvt_pk_u8_f32(2.5) = {got:#x}, want 2");
+    });
+}
