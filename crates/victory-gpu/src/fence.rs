@@ -110,6 +110,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("an event asked for", this as usize, value);
+    #[cfg(all(windows, feature = "diagnostics"))]
     pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
         // With submissions sent to the card and not waited for
