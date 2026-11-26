@@ -36,6 +36,9 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! `VICTORY_AMBIENT_MAGENTA=0` leaves magenta in what the resolve left to
+//! the bound alone (it is zeroed otherwise: the probes' memory, not light).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -165,8 +168,20 @@ fn parse_min(set: &str) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// Whether magenta in what the resolve left is taken for the probes'
+/// memory, not light, and zeroed before the raise (beloooo's find, Belobug
+/// 81ebb7bdc: the bound alone keeps its hue, dimmed). On unless
+/// `VICTORY_AMBIENT_MAGENTA=0`.
+fn magenta_out() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_none_or(|v| v != "0"))
+}
+
+/// The words of the passes' constants.
+const WORDS: usize = 13;
+
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -176,6 +191,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float least;
+    float magenta;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -362,6 +378,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
         found = max(found, float3(1.0, 0.98, 0.94) * least * open);
     }
     float3 was = unpack(light[p]);
+    // Magenta (green far below red and blue) is what the probes' memory
+    // held, not light (beloooo's find, Belobug 81ebb7bdc).
+    if (magenta > 0.0 && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -502,7 +521,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; WORDS];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -512,6 +531,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = least().to_bits();
+    words[12] = f32::from(magenta_out()).to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -519,7 +539,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, WORDS as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());

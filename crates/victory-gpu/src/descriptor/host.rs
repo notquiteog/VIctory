@@ -2485,7 +2485,7 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                kin => room_to_keep() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3387,7 +3387,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = room_to_keep() && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -4652,6 +4652,17 @@ fn keep_shown() -> u8 {
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
+
+/// Whether the card has room for a slot to go on showing another texture
+/// ([`keep_shown`]): what a slot shows is not let go, so on a full card the
+/// kept textures are what the next ones find no room beside (beloooo's find,
+/// Belobug 81ebb7bdc). `VICTORY_KEEP_SHOWN_ROOM=0` keeps them whatever the
+/// room, as before.
+fn room_to_keep() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_KEEP_SHOWN_ROOM").is_none_or(|v| v != "0"))
+        || crate::resource::room_lately()
 }
 
 /// Slots that showed a texture and were written with a view of another,
