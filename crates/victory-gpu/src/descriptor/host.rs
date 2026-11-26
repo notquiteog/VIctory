@@ -1454,7 +1454,17 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
 fn dynamic_slots_of(count: u32, null: u32, set: Option<u32>) -> u32 {
     if null < PORTABLE_VIEWS {
         let most = null.saturating_sub(LEAST_TITLE).max(DYNAMIC);
-        return set.map_or(DYNAMIC, |n| n.clamp(DYNAMIC, most));
+        // Unset: what the cap leaves past the title's lower slots, where its
+        // long-lived views are. From slot 393,216 on the title's heap is a
+        // ring of the tables it writes for each draw (every page of it held
+        // views, rewritten all the time, in play of 2026-11-25), and those
+        // are made afresh in the dynamic slots anyway: host slots kept for
+        // the ring stood unused while 262,144 dynamic ones ran dry every
+        // frame. With 606,784: no table refused, no wait, 350,000 free at the
+        // fewest, and no view a shader picks by index left out.
+        const CAPPED_TITLE: u32 = 393_215;
+        let unset = null.saturating_sub(CAPPED_TITLE.min(count)).clamp(DYNAMIC, most);
+        return set.map_or(unset, |n| n.clamp(DYNAMIC, most));
     }
     null.saturating_sub(count).min(set.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
@@ -5967,7 +5977,7 @@ mod title_share_tests {
     #[test]
     fn a_capped_heap_shares_as_set() {
         let null = 999_999;
-        assert_eq!(dynamic_slots_of(1_245_184, null, None), DYNAMIC);
+        assert_eq!(dynamic_slots_of(1_245_184, null, None), null - 393_215);
         assert_eq!(dynamic_slots_of(1_245_184, null, Some(600_000)), 600_000);
         assert_eq!(dynamic_slots_of(1_245_184, null, Some(10)), DYNAMIC);
         assert_eq!(dynamic_slots_of(1_245_184, null, Some(u32::MAX)), null - LEAST_TITLE);
