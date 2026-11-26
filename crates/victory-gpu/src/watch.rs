@@ -2056,13 +2056,13 @@ pub fn writing(at: usize, len: usize) {
 
 /// The runtime has written title memory `[at, at + len)` itself and the bytes
 /// are there (a DirectStorage request into pages, or to an address, done):
-/// as [`writing`], and the placed textures there may be uploaded by the next
-/// texture pass, not a frame later (`crate::descriptor::host::landed`).
+/// as [`writing`], and the texture pass is told that they have landed
+/// (`crate::descriptor::host::landed`: it times its uploads from here, and
+/// with `VICTORY_LANDED_NOW=1` uploads the placed textures there at once,
+/// not a frame later).
 pub fn written(at: usize, len: usize) {
     writing(at, len);
-    if crate::descriptor::host::landed_now() {
-        crate::descriptor::host::landed(at, len);
-    }
+    crate::descriptor::host::landed(at, len);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
