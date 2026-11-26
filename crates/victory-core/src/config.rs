@@ -25,6 +25,10 @@ pub struct Config {
     /// The user's copy of AMD FidelityFX for PC (the folder with its
     /// upscaler DLL), which replaces a title's console build.
     pub fidelityfx_dir: Option<PathBuf>,
+    /// The user's copy of NVIDIA Streamline (the folder with
+    /// `sl.interposer.dll`, its plugins and the DLSS models), which serves
+    /// a title's upscaler with DLSS on an NVIDIA host. Unset: off.
+    pub dlss_dir: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -45,6 +49,7 @@ struct FilePaths {
     #[serde(default)]
     test_titles: Vec<PathBuf>,
     fidelityfx_dir: Option<PathBuf>,
+    dlss_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -101,6 +106,7 @@ impl Config {
             data_dir,
             test_titles,
             fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
+            dlss_dir: env_path("VICTORY_DLSS_DIR").or(file.dlss_dir),
             source,
         })
     }

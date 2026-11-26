@@ -9,6 +9,15 @@
 //!   FidelityFX forced on the title renders at full output size, more than
 //!   its memory plan allows.
 //!
+//! `VICTORY_UPSCALER` also takes words (`dlss`, `fsr`, `title`, `auto`:
+//! whose upscaler serves the title's FidelityFX interface on the host, see
+//! `victory_gpu::upscale`); only a number is a picker value. When the host
+//! serves that interface by one of those words and neither a picker value
+//! nor a scale is given, both patches are applied for it: FidelityFX picked
+//! on every console (`VICTORY_UPSCALER_PICK=0` leaves the title's choice:
+//! FidelityFX on Series S, its own upscaler on Series X) and the render
+//! scale of the quality mode (`VICTORY_UPSCALE_QUALITY`).
+//!
 //! No title address is kept here: each finds its code by a byte pattern
 //! (call and RIP-relative offsets left open) that must match exactly once in
 //! the title's executable sections. Another build of the title, where it does
@@ -34,6 +43,9 @@ const SCALE: &str = "41 56 56 57 53 48 83 EC 28 44 89 CB 4C 89 C6 48 89 D7 49 89
                      C5 FA 59 C2 C5 FA 2C C0 89 06 48 83 C4 28 5B 5F 5E 41 5E C3 \
                      CC CC CC CC CC CC";
 
+/// The picker's value for AMD FidelityFX.
+const FIDELITYFX: u32 = 7;
+
 /// The bytes of the scale method [`patch_scale`] reads and writes: all of
 /// [`SCALE`].
 const SCALE_SPAN: usize = 0x68;
@@ -43,14 +55,31 @@ const SCALE_SPAN: usize = 0x68;
 /// a write that went in but whose page protection or instruction cache could
 /// not be settled, or only the scale taking of the two.
 pub(crate) fn apply(image: &LoadedImage) -> Result<()> {
-    let kind = requested(
-        "VICTORY_UPSCALER",
-        "<kind> (decimal, 7 for FidelityFX)",
-        |s| s.parse::<u32>().ok(),
-    );
+    // A word there chooses the host's upscaler, not the picker's value.
+    let word = std::env::var("VICTORY_UPSCALER").is_ok_and(|v| !v.trim().is_empty() && v.trim().parse::<u32>().is_err());
+    let kind = if word {
+        None
+    } else {
+        requested(
+            "VICTORY_UPSCALER",
+            "<kind> (decimal, 7 for FidelityFX), or dlss, fsr, title, auto",
+            |s| s.parse::<u32>().ok(),
+        )
+    };
     let scale = requested("VICTORY_FFX_SCALE", "<scale in (0, 1]>", |s| {
         s.parse::<f32>().ok().filter(|s| *s > 0.0 && *s <= 1.0)
     });
+    // The host serving the FidelityFX interface in a quality mode: the
+    // title must pick that interface and render at the mode's scale.
+    let host = victory_hle::modules::fidelityfx::host_render_scale().filter(|_| word);
+    let (kind, scale) = match (kind, scale, host) {
+        (None, None, Some(host)) => {
+            let pick = std::env::var_os("VICTORY_UPSCALER_PICK").is_none_or(|v| v != "0");
+            eprintln!("VIctory: host upscaler: render scale {host}{}", if pick { ", FidelityFX interface picked" } else { "" });
+            (pick.then_some(Some(FIDELITYFX)), Some(Some(host)))
+        }
+        (kind, scale, _) => (kind, scale),
+    };
     // Everything asked for is found before anything is written.
     let picker = kind.map(|kind| kind.and_then(|kind| picker_patch(image, kind)));
     let scale = scale.map(|scale| scale.and_then(|scale| scale_patch(image, scale)));

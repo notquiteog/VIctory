@@ -17,6 +17,11 @@
 //! build generates frames itself from the upscale's depth and motion
 //! vectors with `VICTORY_FIDELITYFX_FRAMEGEN=1` (`victory_gpu::external::
 //! frame_generation_inputs`).
+//!
+//! This is also where another vendor's upscaler takes the title's place
+//! ([`backend`]): with `VICTORY_UPSCALER=dlss`, the user's NVIDIA Streamline
+//! folder (`VICTORY_DLSS_DIR`) and an NVIDIA host, DLSS answers the same
+//! five functions, with no FidelityFX DLL at all. [`use_dirs`] chooses.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -32,8 +37,12 @@ use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
 
-/// The PC build's upscaler, which has the five functions itself.
-const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
+/// The PC build's upscaler, which has the five functions itself: the
+/// upscaler's own DLL of FidelityFX SDK 2, or the one DLL of SDK 1.1 (FSR
+/// 3.1), which has every effect. On Radeon cards whose driver has it, the
+/// signed DLL's upscaler is FSR 4; the provider it reports is logged.
+const DLLS: [&str; 2] = ["amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_dx12.dll"];
+const DLL: &str = DLLS[0];
 
 // Return codes.
 const OK: u32 = 0;
@@ -141,6 +150,8 @@ struct Host {
     query: Call,
     dispatch: Call,
     device: ID3D12Device,
+    /// The checked file, held open.
+    _signed: victory_gpu::trust::Signed,
 }
 
 // SAFETY: D3D12 devices are free-threaded; the rest is code.
@@ -155,6 +166,52 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::$level!($($arg)*));
     }};
+}
+
+mod backend;
+
+/// Chooses what serves the title's FidelityFX upscaler, as
+/// `VICTORY_UPSCALER` asks (`victory_gpu::upscale`): NVIDIA DLSS from the
+/// user's Streamline folder `dlss`, AMD's PC build from `fidelityfx`, or
+/// the title's own console DLLs. Call once, before the import registry is
+/// first used: it holds this module only when the host serves.
+pub fn use_dirs(dlss: Option<&Path>, fidelityfx: Option<&Path>) {
+    use victory_gpu::upscale::Choice;
+    let needs = |what: &str, variable: &str| {
+        tracing::warn!("VICTORY_UPSCALER asks for {what}, which needs {variable}; the title's own upscaler runs");
+    };
+    match victory_gpu::upscale::asked() {
+        Choice::Title => tracing::info!("VICTORY_UPSCALER=title: the title's own FidelityFX DLLs run"),
+        Choice::Dlss => match dlss {
+            Some(dir) => {
+                backend::use_dlss(dir);
+            }
+            None => needs("DLSS", "VICTORY_DLSS_DIR"),
+        },
+        Choice::Fsr => match fidelityfx {
+            Some(dir) => use_host_dir(Some(dir)),
+            None => needs("FidelityFX", "VICTORY_FIDELITYFX_DIR"),
+        },
+        Choice::Auto => {
+            if !dlss.is_some_and(backend::use_dlss) {
+                use_host_dir(fidelityfx);
+            }
+        }
+        // As before the variable existed.
+        Choice::Unset => use_host_dir(fidelityfx),
+    }
+}
+
+/// The render scale of the quality mode asked for, if the host serves the
+/// title's upscaler and the mode decides the scale: always with DLSS (whose
+/// modes are render scales), with FidelityFX only when a mode is named
+/// (`VICTORY_UPSCALE_QUALITY`). What the title's render-scale patch is
+/// given when the user names no scale.
+pub fn host_render_scale() -> Option<f32> {
+    backend::render_scale().or_else(|| {
+        HOST.get()?;
+        victory_gpu::upscale::asked_quality().map(|q| q.fsr_scale())
+    })
 }
 
 /// Serves the title's FidelityFX calls with the PC upscaler in `dir`
@@ -173,8 +230,14 @@ pub fn use_host_dir(dir: Option<&Path>) {
             tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
             let _ = HOST.set(host);
             #[cfg(feature = "diagnostics")]
-            if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
-                && matches!(mode.as_str(), "1" | "4")
+            if let Some(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+                .ok()
+                .filter(|mode| matches!(mode.as_str(), "1" | "4"))
+                // `VICTORY_FRAMEGEN=fsr`: the same as its mode 1.
+                .or_else(|| {
+                    (victory_gpu::upscale::asked_frame_generation() == victory_gpu::upscale::FrameGeneration::Fsr)
+                        .then(|| "1".to_owned())
+                })
             {
                 match victory_gpu::external::use_frame_generation(dir, mode == "4") {
                     Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
@@ -191,7 +254,7 @@ pub fn use_host_dir(dir: Option<&Path>) {
 
 /// Whether the host's FidelityFX serves the title's.
 pub(crate) fn serving() -> bool {
-    HOST.get().is_some()
+    HOST.get().is_some() || backend::serving()
 }
 
 fn load(dir: &Path) -> Result<(Host, String), String> {
@@ -201,10 +264,12 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
         LoadLibraryExW,
     };
     // The search flags below want a full path.
-    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
-    if !path.is_file() {
-        return Err(format!("no {DLL} there"));
-    }
+    let Some(path) = DLLS.iter().map(|dll| dir.join(dll)).find(|p| p.is_file()) else {
+        return Err(format!("no {DLL} (or {}) there", DLLS[1]));
+    };
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    // Only AMD's own build: a valid signature of Advanced Micro Devices.
+    let signed = victory_gpu::trust::signed_by(&path, victory_gpu::trust::AMD)?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // Its own folder and System32 only, never the current folder.
     let search = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
@@ -232,6 +297,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             query: std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?),
             dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
             device,
+            _signed: signed,
         }
     };
     let versions = versions(&host)?;
@@ -311,6 +377,12 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
+    if backend::serving() {
+        if context.is_null() || desc.is_null() {
+            return PARAMETER;
+        }
+        return backend::create(context, desc);
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -379,6 +451,9 @@ fn context_flags<R>(f: impl FnOnce(&mut std::collections::HashMap<usize, u32>) -
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if backend::serving() {
+        return backend::destroy(context);
+    }
     #[cfg(feature = "diagnostics")]
     if !context.is_null() {
         // SAFETY: the title passes its context slot.
@@ -391,12 +466,18 @@ extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if backend::serving() {
+        return backend::configure(context, desc);
+    }
     // SAFETY: the title passes its context and descriptions.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if backend::serving() {
+        return if desc.is_null() { PARAMETER } else { backend::query(context, desc) };
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -419,6 +500,9 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if backend::serving() {
+        return if desc.is_null() { PARAMETER } else { backend::dispatch(context, desc) };
+    }
     let Some(host) = HOST.get() else {
         return NO_PROVIDER;
     };
@@ -436,8 +520,40 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         return UNKNOWN_TYPE;
     }
     // SAFETY: an upscaling, by its type.
-    let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
+    let dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    if context.is_null() {
+        return PARAMETER;
+    }
+    // SAFETY: the title passes its context slot.
+    let context = unsafe { *context };
+    if victory_gpu::external::recorded_as_called(list) {
+        return dispatch_into(host, context, dispatch, list);
+    }
+    // A list whose calls are only written down (`VICTORY_THIN=1`): the
+    // upscaling is recorded when the list is translated, from this copy of
+    // its description (what the title chained behind it is gone by then),
+    // and the title is told it went well.
+    struct Job(*mut c_void, DispatchUpscale);
+    // SAFETY: the host's context and the title's objects, which live until
+    // the list has run and are used in the list's order.
+    unsafe impl Send for Job {}
+    let mut job = Job(context, dispatch);
+    if !job.1.header.next.is_null() {
+        once!(warn, "FidelityFX: what the title chains behind an upscaling is left out when its list is only written down");
+        job.1.header.next = null_mut();
+    }
+    let placed = victory_gpu::external::in_order(list, move |list| {
+        let job = job;
+        dispatch_into(host, job.0, job.1, list);
+    });
+    if placed { OK } else { PARAMETER }
+}
+
+/// Records the title's upscaling `dispatch` for the host context `context`
+/// into `list` (the title's list, or the list of ours its calls go to).
+fn dispatch_into(host: &Host, mut context: *mut c_void, mut dispatch: DispatchUpscale, list: *const Object) -> u32 {
+    let context = &raw mut context;
     // Depth and motion as the title names them, for frame generation.
     #[cfg(feature = "diagnostics")]
     let title = dispatch;

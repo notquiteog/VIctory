@@ -2633,7 +2633,7 @@ mod tests {
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
         add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0, enqueued: 0 }));
         l.submit_as(0, true, true);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();

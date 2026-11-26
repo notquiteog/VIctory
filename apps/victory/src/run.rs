@@ -59,8 +59,8 @@ pub fn run(
     }
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    // when the host's FidelityFX serves, or NVIDIA DLSS in its place.
+    victory_hle::modules::fidelityfx::use_dirs(cfg.dlss_dir.as_deref(), cfg.fidelityfx_dir.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
