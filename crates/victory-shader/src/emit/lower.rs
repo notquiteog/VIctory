@@ -7279,7 +7279,12 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            // LOCAL (fxceless #1216): only a slot marked as a constant
+            // buffer is read as one; any other non-buffer gives zeros.
+            let other = match self.slot_is_constant(src)? {
+                Some(is_constant) => is_constant,
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -8572,8 +8577,31 @@ impl<'a> Lower<'a> {
         let word = self.slot_word(src)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
-            self.s.m.bin(self.cur, Bin::And, word, bits)
+            let stride = self.s.m.bin(self.cur, Bin::And, word, bits);
+            if super::shader::constant_marks() {
+                // LOCAL (fxceless #1216): the mark of a constant buffer
+                // slot is no stride.
+                let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+                let is_constant = self.s.m.cmp(self.cur, pred::EQ, word, mark);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, is_constant, zero, stride)
+            } else {
+                stride
+            }
         }))
+    }
+
+    /// LOCAL (fxceless #1216): with [`super::shader::constant_marks`],
+    /// whether the slot `src` names holds a constant buffer view.
+    fn slot_is_constant(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constant_marks() {
+            return Ok(None);
+        }
+        let Some(word) = self.slot_word(src)? else {
+            return Ok(None);
+        };
+        let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+        Ok(Some(self.s.m.cmp(self.cur, pred::EQ, word, mark)))
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
