@@ -338,6 +338,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Whether the host list has heaps set (a fallback one among them).
+    host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1201,6 +1203,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1518,19 +1521,29 @@ impl State {
             self.heaps[0] = heap;
         }
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
+        // set after them, and needs a view heap and a sampler heap both: one
+        // the title set none of is one of ours of a single descriptor
+        // (codec_d, pareto-residency e05d4633a).
+        if !self.host_heaps_set || self.host_heaps != self.heaps {
+            let mut views = None;
+            let mut samplers = None;
+            for &h in self.heaps.iter().filter(|&&h| h != 0) {
+                let heap = crate::descriptor::heap(h as This);
+                if let Some(host) = heap.host() {
+                    *(if heap.samplers() { &mut samplers } else { &mut views }) = Some(host.heap.clone());
+                }
+            }
+            let host = crate::host::host();
+            let views = views.or_else(|| host.and_then(|h| h.fallback_view_heap().cloned()));
+            let samplers = samplers.or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = [views, samplers].into_iter().filter(Option::is_some).collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            if !heaps.is_empty() {
+                // SAFETY: an open list and shader-visible heaps.
+                unsafe { l.SetDescriptorHeaps(&heaps) };
+            }
             self.host_heaps = self.heaps;
+            self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
