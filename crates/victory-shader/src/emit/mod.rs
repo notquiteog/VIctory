@@ -122,7 +122,7 @@ pub use lower::{host_max_wave, host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -789,17 +789,10 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs)
-            if {
-                let g = cs.threads.iter().product::<u32>();
-                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
-            } => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
+        // Any group of console waves: a wave-wide decision covers the whole group now
+        // (`Lower::wave_wide` ORs every console wave's exchange pair), so the branches taken
+        // this way are entered by every thread and the barriers inside them are reached.
+        crate::native::StageIo::Cs(_) => {}
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
@@ -814,23 +807,39 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || r.is_ok() && !needs.is_empty();
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| !wide.contains(b))
-            .collect();
+        let Some((around, unsafe_loop)) = lower::branches_around(&st, &needs) else {
+            // Not followed (an indirect exit): emitting the program as it stands could put a
+            // barrier where one of the two host waves never comes.
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        };
+        if unsafe_loop {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        }
+        let more: Vec<usize> = around.into_iter().filter(|b| !wide.contains(b)).collect();
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
-            return r;
+            // Nothing is left to widen and a barrier still stands where not every lane runs:
+            // the program is refused rather than emitted, because such a barrier hangs the
+            // group (0x887A0006, measured 2026-11-26).
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier where not every lane runs, and no branch left to widen",
+            });
         }
         wide.extend(more);
     }
@@ -2656,6 +2665,158 @@ mod tests {
                 got[6],
                 out[0][6]
             );
+        }
+    }
+
+    #[test]
+    fn dispatch_split_changes_cache_settings_only_on_wave32() {
+        use super::lower::{TEST_GROUP_BASE, TEST_HOST_WAVE};
+
+        let old_wave = TEST_HOST_WAVE.replace(Some(32));
+        let old_split = TEST_GROUP_BASE.replace(Some(false));
+        let wave32_off = super::host_settings();
+        TEST_GROUP_BASE.set(Some(true));
+        let wave32_on = super::host_settings();
+        TEST_HOST_WAVE.set(Some(64));
+        let wave64_on = super::host_settings();
+        TEST_GROUP_BASE.set(Some(false));
+        let wave64_off = super::host_settings();
+        TEST_HOST_WAVE.set(old_wave);
+        TEST_GROUP_BASE.set(old_split);
+
+        assert_ne!(wave32_off, wave32_on);
+        assert_eq!(wave64_off, wave64_on);
+    }
+
+    /// A program that reads its thread-group id in x takes the dispatch's
+    /// first group from a user-data dword the host sets (`USER_GROUP_BASE`)
+    /// and adds the host's group id to it: the host runs the groups past
+    /// 65,535 of an indirect record as a second execution with it at 65,535.
+    #[test]
+    fn the_group_id_in_x_starts_at_the_host_base() {
+        use super::lower::{TEST_GROUP_BASE, TEST_HOST_WAVE};
+        let words: &[u32] = &[
+            0x7E02_0205, // v_mov_b32 v1, s5 (the group id in x)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0x0
+            0x3610_028F, // v_and_b32 v8, 15, v1
+            0x340E_1082, // v_lshlrev_b32 v7, 2, v8
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![crate::UsedResource {
+                kind: crate::ResourceType::Uav,
+                root: crate::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            // Five user SGPRs, then the group id in x (s5).
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1 | 1 << 7,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let old_wave = TEST_HOST_WAVE.replace(Some(32));
+        let old_split = TEST_GROUP_BASE.replace(Some(true));
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let parts = super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        };
+        let l = super::lower::lower(&parts).unwrap();
+        TEST_HOST_WAVE.set(Some(64));
+        let native_wide = super::lower::lower(&parts).unwrap();
+        TEST_HOST_WAVE.set(old_wave);
+        TEST_GROUP_BASE.set(old_split);
+        let base = l
+            .user_data
+            .iter()
+            .find(|u| u.root == crate::RootType::Other(super::USER_GROUP_BASE))
+            .expect("no user-data dword for the first group");
+        assert_eq!(base.dword, 0);
+        assert!(native_wide.user_data.iter().all(|u| u.root != base.root));
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(true) {
+            let base = base.index as usize;
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Three groups, with the first at 0 and at 65,535: each stores
+            // the id it read at slot (id & 15).
+            for (first, slots) in [(0u32, [0usize, 1, 2]), (65535, [15, 0, 1])] {
+                let mut constants = vec![0u32; cs.user_data_dwords() as usize];
+                constants[base] = first;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &super::host::Dispatch {
+                            roots: vec![(0, super::host::Root::Constants(constants))],
+                            views: &[super::host::View::RawUav(64)],
+                            samplers: &[],
+                            groups: [3, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                for (k, slot) in slots.into_iter().enumerate() {
+                    assert_eq!(out[0][slot], first + k as u32, "group {k} with the first at {first}: {:?}", &out[0][..16]);
+                }
+            }
+            eprintln!("checked translated group IDs at bases 0 and 65,535 on WARP");
         }
     }
 }

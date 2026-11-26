@@ -2069,6 +2069,7 @@ impl Player {
                     batched.clamps += done.clamps;
                     batched.batches += done.batches;
                     batched.jobs += done.jobs;
+                    batched.split_lists += done.split_lists;
                     if done.scratch > 0 {
                         scratches.push((scratch, done.scratch));
                     }
@@ -2099,6 +2100,12 @@ impl Player {
                 "--batch-clamps: {} clamp passes became {}, of {} records",
                 batched.clamps, batched.batches, batched.jobs
             ));
+            if batched.split_lists > 0 {
+                report.notes.push(format!(
+                    "--batch-clamps kept {} lists with split dispatches",
+                    batched.split_lists
+                ));
+            }
             if let Err(e) = self.make_batches(&jobs, &scratches) {
                 report.notes.push(format!("--batch-clamps failed: {e:#}"));
             }
