@@ -2234,6 +2234,8 @@ fn v_pk_int16_clamp_saturates_as_rdna2() {
             assert_eq!(got, want, "{backend}: v_pk_mad_i16 clamp case {i}");
         },
     );
+}
+
 /// RDNA2 ignores VOP3 `op_sel` on 16-bit compares (reading the low halves
 /// regardless), while non-compare 16-bit ops such as `v_add_nc_u16` honour it.
 #[test]
@@ -2346,6 +2348,8 @@ fn cmp16_sdwa_preserves_word_selects() {
             });
         }
     }
+}
+
 /// `v_mad_legacy_f32` as RDNA 2 runs it: fused (`v_fma_legacy_f32`), with
 /// flushed subnormal sources and the legacy zero-factor rule.
 #[test]
@@ -2376,6 +2380,8 @@ fn legacy_mad_fuses_its_product_and_flushes_its_sources() {
         }
         assert_eq!(got, want[i], "{backend}: case {i}");
     });
+}
+
 #[test]
 fn typed_float_loads_preserve_nan_bits() {
     // The low channel is a signed half, an unsigned 11-bit float, or an
@@ -2414,11 +2420,6 @@ fn typed_float_loads_preserve_nan_bits() {
             );
         });
     }
-}
-
-/// VOP2 `op vdst, src0, vsrc1`.
-const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
-    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
 #[test]
