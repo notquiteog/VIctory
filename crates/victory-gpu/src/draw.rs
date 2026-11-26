@@ -2770,6 +2770,12 @@ impl State {
             Role::Reflections => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
+        if role == Role::Reflections {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| {
+                tracing::info!(found = image.is_some(), "the program that writes the reflections last is dispatched");
+            });
+        }
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
             Role::Radiance | Role::Air | Role::Reflections => image,
@@ -4052,6 +4058,15 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            // As after a dispatch whose counts the title gives itself: the
+            // title runs its last reflection pass this way.
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
         }

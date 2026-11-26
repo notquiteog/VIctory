@@ -122,6 +122,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            if let Some(role) = (stage == "compute").then(|| crate::ambient::role(bytes)).flatten() {
+                tracing::info!(?role, hash = &full.to_hex()[..16], "a program the stand-in for the indirect light follows");
+            }
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),

@@ -57,7 +57,7 @@
 //! shortcut: the sky's light is taken to reach everything, indoors too.
 //!
 //! `VICTORY_AMBIENT_HUE=<multiple>` bounds how far what the resolve left
-//! may be from the estimate's hue (1.5; 0: any hue).
+//! may be from the estimate's hue (1.25; 0: any hue).
 //!
 //! `VICTORY_AMBIENT_MAGENTA=0` leaves magenta in what the resolve left to
 //! the bound alone (it is zeroed otherwise: the probes' memory, not light).
@@ -316,9 +316,24 @@ fn parse_reflect(set: &str) -> [f32; 2] {
     reflect
 }
 
-/// How far from the estimate's hue what the resolve left may be: the most a
-/// channel holds, as a multiple of what the estimate's hue has at the same
-/// brightness (`VICTORY_AMBIENT_HUE=<multiple>`, 0: any hue).
+/// The most of what the resolve left that counts, as a multiple of the
+/// estimate's brightness (`VICTORY_AMBIENT_MOST=<multiple>`).
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
+            .unwrap_or(MOST)
+    })
+}
+
+const MOST: f32 = 4.0;
+
+/// How far from the estimate's hue what the resolve left may be: the factor
+/// each channel stays within of what the estimate's hue has at the same
+/// brightness (`VICTORY_AMBIENT_HUE=<factor>`, 1 or more; 0: any hue).
 ///
 /// Without rays the resolve goes on blending its own history where it has
 /// no new samples, and that history is the probes' memory: on blinds behind
@@ -332,8 +347,8 @@ fn hue() -> f32 {
         std::env::var("VICTORY_AMBIENT_HUE")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
-            .unwrap_or(1.5)
+            .filter(|v: &f32| v.is_finite() && (*v >= 1.0 || *v == 0.0))
+            .unwrap_or(1.25)
     })
 }
 
@@ -622,6 +637,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (least > 0.0) {
         found = max(found, float3(1.0, 0.98, 0.94) * least * open);
     }
+    // What bounds what the program left: the estimate without the sky's
+    // part, which is no measure of what the probes' memory may hold.
+    float bound = dot(found, LUMA);
     // No less than what the sky gives: what lights a surface that faces the
     // eye is not on screen.
     found = max(found, cells[SKY].rgb * open);
@@ -631,16 +649,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (magenta > 0.0 && was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    float top = max(bound * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     // Nor the hue of other memory: the bound above is on brightness alone,
     // and a blue or purple far below it in brightness still has dozens of
-    // times the estimate's blue. No channel holds more than a multiple of
+    // times the estimate's blue. Every channel stays within a factor of
     // what the estimate's own hue has at that brightness.
     if (hue > 0.0) {
         float3 like = found * (dot(was, LUMA) / max(dot(found, LUMA), 1e-6));
-        was = min(was, hue * like);
+        was = clamp(was, like / hue, like * hue);
     }
     light[p] = pack(max(was, found) * paint);
 }
@@ -813,7 +831,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = least().to_bits();
     words[12] = f32::from(magenta_out()).to_bits();
