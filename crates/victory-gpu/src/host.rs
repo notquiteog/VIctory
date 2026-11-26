@@ -9468,8 +9468,9 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            // DLSS frame generation's swap chain is the runtime's own.
-            let dlss_chain = crate::streamline::generate::swap_chain(&factory, &self.queue, hwnd, &desc);
+            // With DLSS the swap chain is the runtime's own: it must see
+            // every present (and frame generation presents through it).
+            let dlss_chain = crate::streamline::swap_chain(&factory, &self.queue, hwnd, &desc);
             let plain = |made: Option<IDXGISwapChain3>| match made {
                 Some(chain) => Ok(chain),
                 None => factory

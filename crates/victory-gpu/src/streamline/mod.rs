@@ -11,14 +11,15 @@
 //! SDK's public headers ([`ffi`]).
 //!
 //! The runtime is used the way its guide calls manual hooking: it gets our
-//! host device (`slSetD3DDevice`) and no object of ours is replaced by one
-//! of its proxies. What it records into a command list is recorded where
+//! host device (`slSetD3DDevice`), and the one object of ours that is one
+//! of its proxies is the presenter's swap chain ([`swap_chain`]): the
+//! runtime must see every present to do its bookkeeping (it says so in its
+//! log otherwise). What it records into a command list is recorded where
 //! the title's upscaler would have been (`external::record`), on resources
 //! whose states we name; the list's bindings are ours to put back after it.
 //!
-//! Frame generation ([`generate`], `VICTORY_FRAMEGEN=dlss`) is the one
-//! exception to "no proxies": the presenter's swap chain is then made by a
-//! proxy factory of the runtime's, as `sl.dlss_g` requires.
+//! Frame generation ([`generate`], `VICTORY_FRAMEGEN=dlss`) works on that
+//! swap chain.
 //!
 //! Ray reconstruction and DLSS NR are only looked at ([`neural`],
 //! `VICTORY_DLSS_NR=1`).
@@ -84,6 +85,7 @@ struct Api {
     get_new_frame_token: ffi::GetNewFrameToken,
     set_constants: ffi::SetConstants,
     evaluate_feature: ffi::EvaluateFeature,
+    upgrade_interface: ffi::UpgradeInterface,
 }
 
 struct DlssFunctions {
@@ -118,6 +120,52 @@ unsafe impl Send for Runtime {}
 unsafe impl Sync for Runtime {}
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// Whether the presenter's swap chain is the runtime's.
+static PROXY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The presenter's swap chain made by a proxy DXGI factory of the
+/// runtime's (`slUpgradeInterface`), in place of a plain one, so that the
+/// runtime sees every present. `None` when the runtime is not loaded or
+/// refuses: the presenter makes a plain one (super resolution still runs;
+/// frame generation does not). `VICTORY_DLSS_PLAIN_SWAPCHAIN=1` keeps the
+/// plain one (a testing lever).
+pub(crate) fn swap_chain(
+    factory: &windows::Win32::Graphics::Dxgi::IDXGIFactory2,
+    queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+    hwnd: windows::Win32::Foundation::HWND,
+    desc: &windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
+) -> Option<windows::Win32::Graphics::Dxgi::IDXGISwapChain3> {
+    use windows::Win32::Graphics::Dxgi::{IDXGIFactory2, IDXGISwapChain3};
+    let rt = RUNTIME.get()?;
+    if std::env::var_os("VICTORY_DLSS_PLAIN_SWAPCHAIN").is_some_and(|v| v == "1") {
+        return None;
+    }
+    let _calls = rt.calls.lock().unwrap_or_else(|e| e.into_inner());
+    // A reference of its own for the proxy to hold.
+    let mut raw = factory.clone().into_raw();
+    // SAFETY: a live factory; the runtime puts its proxy in the slot.
+    let code = unsafe { (rt.api.upgrade_interface)(&mut raw) };
+    // SAFETY: the factory itself or the proxy in its place, one reference.
+    let proxy = unsafe { IDXGIFactory2::from_raw(raw) };
+    if let Err(why) = check("slUpgradeInterface", code) {
+        tracing::warn!("DLSS: no proxy DXGI factory ({why}); the swap chain is a plain one");
+        return None;
+    }
+    // SAFETY: plain creation, through the proxy, for our window and queue.
+    let made = unsafe { proxy.CreateSwapChainForHwnd(queue, hwnd, desc, None, None) }.and_then(|chain| chain.cast::<IDXGISwapChain3>());
+    match made {
+        Ok(chain) => {
+            tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, "DLSS: the swap chain is the runtime's (it sees every present)");
+            PROXY.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some(chain)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DLSS: the runtime's factory made no swap chain; a plain one");
+            None
+        }
+    }
+}
 
 /// Whether DLSS super resolution is ready on the host device.
 pub fn serving() -> bool {
@@ -232,6 +280,7 @@ pub fn load(dir: &Path) -> Result<String, String> {
                 get_new_frame_token: transmute::<*const c_void, ffi::GetNewFrameToken>(find(c"slGetNewFrameToken")?),
                 set_constants: transmute::<*const c_void, ffi::SetConstants>(find(c"slSetConstants")?),
                 evaluate_feature: transmute::<*const c_void, ffi::EvaluateFeature>(find(c"slEvaluateFeature")?),
+                upgrade_interface: transmute::<*const c_void, ffi::UpgradeInterface>(find(c"slUpgradeInterface")?),
             },
         )
     };
@@ -258,12 +307,14 @@ pub fn load(dir: &Path) -> Result<String, String> {
         allocate_callback: null(),
         release_callback: null(),
         log_message_callback: Some(log_message),
-        // We put the list's state back ourselves; no proxies; tags belong
-        // to a frame. No updates over the network.
+        // No updates over the network (neither OTA flag). We put the
+        // list's state back ourselves; manual hooking; tags belong
+        // to a frame; the factory we upgrade becomes a proxy object, not a
+        // rewritten table.
         flags: ffi::DISABLE_CL_STATE_TRACKING
             | ffi::USE_MANUAL_HOOKING
             | ffi::USE_FRAME_BASED_RESOURCE_TAGGING
-            | if generate { ffi::USE_DXGI_FACTORY_PROXY } else { 0 },
+            | ffi::USE_DXGI_FACTORY_PROXY,
         features_to_load: features.as_ptr(),
         num_features_to_load: features.len() as u32,
         application_id: 0,

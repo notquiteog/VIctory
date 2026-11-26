@@ -4,12 +4,11 @@
 //! presented pictures, and paces both to the display itself.
 //!
 //! What it needs of us, and what it gets:
-//! - The swap chain made through the runtime ([`swap_chain`]): a proxy
-//!   DXGI factory (`slUpgradeInterface`; a proxy object, not a patched
-//!   table: `eUseDXGIFactoryProxy`) makes it on our queue, and every
-//!   present, back-buffer query and resize of ours goes through it. With
-//!   frame generation on, its `Present` returns at once and the runtime
-//!   presents both frames from a thread of its own.
+//! - The swap chain made through the runtime (`super::swap_chain`, as
+//!   for super resolution alone): every present, back-buffer query and
+//!   resize of ours goes through it. With frame generation on, its
+//!   `Present` returns at once and the runtime presents both frames from a
+//!   thread of its own.
 //! - Depth and motion vectors of each presented frame: tagged at the
 //!   upscale ([`after_upscale`]) as valid only then, so the runtime copies
 //!   them in the title's list; the title reuses both textures before the
@@ -31,15 +30,13 @@
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_void};
 use std::ptr::null;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12GraphicsCommandList};
-use windows::Win32::Graphics::Dxgi::{DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain3};
+use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
 use windows::core::Interface;
 
 use super::ffi::{self, Base, FrameToken, Resource};
-use super::{Calls, RUNTIME, Runtime, VIEWPORT, check, tag};
+use super::{Calls, PROXY, RUNTIME, Runtime, VIEWPORT, check, tag};
 
 /// What frame generation needs in the folder beside super resolution.
 pub(super) const FILES: [&str; 4] = ["sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll"];
@@ -50,7 +47,6 @@ pub(super) struct Functions {
     get_state: ffi::DlssgGetState,
     reflex_sleep: ffi::ReflexSleep,
     set_marker: ffi::PclSetMarker,
-    upgrade_interface: ffi::UpgradeInterface,
     set_tag_for_frame: ffi::SetTagForFrame,
 }
 
@@ -73,9 +69,6 @@ pub(super) struct State {
     failed: bool,
 }
 
-/// Whether the presenter's swap chain is the runtime's.
-static PROXY: AtomicBool = AtomicBool::new(false);
-
 /// Readies frame generation: supported on the adapter, its functions
 /// found, Reflex on. `find` gives an interposer export, `function` a
 /// feature's function.
@@ -97,7 +90,6 @@ pub(super) fn load(
                 get_state: transmute::<*const c_void, ffi::DlssgGetState>(function(ffi::FEATURE_DLSS_G, c"slDLSSGGetState")?),
                 reflex_sleep: transmute::<*const c_void, ffi::ReflexSleep>(function(ffi::FEATURE_REFLEX, c"slReflexSleep")?),
                 set_marker: transmute::<*const c_void, ffi::PclSetMarker>(function(ffi::FEATURE_PCL, c"slPCLSetMarker")?),
-                upgrade_interface: transmute::<*const c_void, ffi::UpgradeInterface>(find(c"slUpgradeInterface")?),
                 set_tag_for_frame: transmute::<*const c_void, ffi::SetTagForFrame>(find(c"slSetTagForFrame")?),
             },
             transmute::<*const c_void, ffi::ReflexSetOptions>(function(ffi::FEATURE_REFLEX, c"slReflexSetOptions")?),
@@ -119,43 +111,6 @@ pub(super) fn load(
 /// Whether frame generation is loaded.
 pub(crate) fn enabled() -> bool {
     RUNTIME.get().is_some_and(|rt| rt.generation.is_some())
-}
-
-/// The presenter's swap chain made by the runtime's proxy factory, in
-/// place of a plain one; `None` when frame generation is off or the runtime
-/// refuses (the presenter makes a plain one, and nothing is generated).
-pub(crate) fn swap_chain(
-    factory: &IDXGIFactory2,
-    queue: &ID3D12CommandQueue,
-    hwnd: HWND,
-    desc: &DXGI_SWAP_CHAIN_DESC1,
-) -> Option<IDXGISwapChain3> {
-    let rt = RUNTIME.get()?;
-    let g = rt.generation.as_ref()?;
-    let _calls = rt.calls.lock().unwrap_or_else(|e| e.into_inner());
-    // A reference of its own for the proxy to hold.
-    let mut raw = factory.clone().into_raw();
-    // SAFETY: a live factory; the runtime puts its proxy in the slot.
-    let code = unsafe { (g.upgrade_interface)(&mut raw) };
-    // SAFETY: the factory itself or the proxy in its place, one reference.
-    let proxy = unsafe { IDXGIFactory2::from_raw(raw) };
-    if let Err(why) = check("slUpgradeInterface", code) {
-        tracing::warn!("DLSS frame generation: no proxy DXGI factory ({why}); presenting without it");
-        return None;
-    }
-    // SAFETY: plain creation, through the proxy, for our window and queue.
-    let made = unsafe { proxy.CreateSwapChainForHwnd(queue, hwnd, desc, None, None) }.and_then(|chain| chain.cast::<IDXGISwapChain3>());
-    match made {
-        Ok(chain) => {
-            tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, "DLSS frame generation: the swap chain is the runtime's");
-            PROXY.store(true, Ordering::Relaxed);
-            Some(chain)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "DLSS frame generation: the runtime's factory made no swap chain; presenting without it");
-            None
-        }
-    }
 }
 
 fn marker(g: &Functions, marker: u32, token: *mut FrameToken) {
