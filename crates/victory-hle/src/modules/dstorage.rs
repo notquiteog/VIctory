@@ -756,6 +756,50 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     );
 }
 
+/// Diagnostics (`VICTORY_STREAM_WATCH=<offset in its file>`): a line each time
+/// the request at that file offset is done, with where it was read to, and
+/// then one when the title first unmaps or frees memory there
+/// (`xmem::watched`): what becomes of a resource the title reads again and
+/// again.
+fn stream_watch(request: &Request) {
+    static OFFSET: OnceLock<Option<u64>> = OnceLock::new();
+    let watch = *OFFSET
+        .get_or_init(|| std::env::var("VICTORY_STREAM_WATCH").ok().and_then(|v| v.trim().parse().ok()));
+    use super::xmem::WATCHED;
+    if watch.is_none() || request.options & (PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
+        return;
+    }
+    if watch != Some(request.offset) {
+        // Another request read to the same place: said a few times.
+        let (start, bytes) = (WATCHED[0].load(Ordering::Relaxed), WATCHED[1].load(Ordering::Relaxed));
+        let at = request.destination as usize;
+        static OTHERS: AtomicU32 = AtomicU32::new(0);
+        if bytes != 0
+            && at < start + bytes
+            && at + request.destination_size as usize > start
+            && OTHERS.fetch_add(1, Ordering::Relaxed) < 40
+        {
+            tracing::info!(
+                offset = request.offset,
+                destination = format_args!("{at:#x}"),
+                size = request.destination_size,
+                "stream watch: another request was read into the watched request's destination"
+            );
+        }
+        return;
+    }
+    WATCHED[0].store(request.destination as usize, Ordering::Relaxed);
+    WATCHED[1].store(request.destination_size as usize, Ordering::Relaxed);
+    let n = WATCHED[2].fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        read = n,
+        destination = format_args!("{:p}", request.destination),
+        size = request.destination_size,
+        thread = ?std::thread::current().id(),
+        "stream watch: the watched request is done"
+    );
+}
+
 /// The streaming log (`VICTORY_DSTORAGE_LOG=<file>`): a line for every
 /// request (`R`: queue, number, file, offset, source bytes, destination
 /// bytes, options, when enqueued, submitted, started, done, result), every
@@ -781,6 +825,10 @@ pub(crate) mod stream_log {
                     if let Some(costs) = super::super::xmem::map_costs() {
                         line(format_args!("M\t{}\t{costs}", now()));
                     }
+                    // `G`: the title's physical pages (64 KiB each), its views of
+                    // them and their bytes.
+                    let (pages, views, bytes) = super::super::xmem::pages_census();
+                    line(format_args!("G\t{}\t{pages}\t{views}\t{bytes}", now()));
                     if let Some(log) = log() {
                         let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
                     }
@@ -858,6 +906,7 @@ fn work(scheduler: &'static Scheduler) {
         let result = execute(&job.request);
         reading.end();
         walls_request(&job.request, &result, started);
+        stream_watch(&job.request);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
             traced.end(&job, &result);
