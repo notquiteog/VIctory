@@ -2147,6 +2147,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {

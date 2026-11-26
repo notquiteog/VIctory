@@ -158,6 +158,8 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+    #[cfg(feature = "diagnostics")]
+    crate::profile::seen(crate::profile::Seen::Record);
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -264,6 +266,11 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
+// (512 since run 221: with submissions prepared by a thread of ours the
+// title has its lists back at once and resets them while the flights of
+// the frame before are still in the air, so more than 128 are out at a
+// time: 80 host lists were made and as many thrown away every frame,
+// 8 ms to make and more to free, on the thread that submits.)
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;

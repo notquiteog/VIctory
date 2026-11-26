@@ -566,6 +566,18 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(windows)]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -674,6 +686,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's queue Signal");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence::pace::signal_called(fence as usize, value);
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         behind::signal(this, fence, value);
@@ -860,10 +874,30 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
+    let hr = present_now(this, planes, plane_parameters);
+    // The frame log and the fence pace of fxceless/victory-fork (a2537066):
+    // the time inside the title's call, and the frame's end.
+    #[cfg(windows)]
+    {
+        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::frame();
+        #[cfg(feature = "diagnostics")]
+        crate::fence::pace::frame();
+    }
+    hr
+}
+
+fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
     #[cfg(not(windows))]
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::profile::frame();
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -887,6 +921,8 @@ extern "system" fn present(
     if !behind::on() {
         release_held(forces());
     }
+    #[cfg(windows)]
+    crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -919,6 +955,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::renderdoc::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             before_sync();
             crate::capture::dump_targets(frame);

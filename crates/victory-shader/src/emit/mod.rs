@@ -557,6 +557,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE=last` (fxceless/victory-fork, fork PR #1141): the same form, but
+        // only for programs that every other form below leaves at 64 lanes. That is what the
+        // last-resort block below does whenever the switch is not `1` or `0`, so `last` needs
+        // no reading of its own here.
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

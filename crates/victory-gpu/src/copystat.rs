@@ -1029,6 +1029,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::timeline::called(took);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1042,6 +1045,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
