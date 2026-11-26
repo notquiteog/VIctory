@@ -616,6 +616,9 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    /// With [`super::stages`]: the descriptors of the steps, written by the
+    /// line's second stage ahead of the submission's lists.
+    pub(super) slots: Option<super::stages::Job>,
 }
 
 impl Taken {
@@ -831,17 +834,32 @@ impl Host {
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
         // order.)
-        let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+        let slots: Vec<(usize, u32, u64, u32)> = ops
+            .iter()
+            .filter_map(|op| match &op.to {
+                To::Slot(heap, index) => Some((*heap, *index, gpu + op.at, op.len as u32)),
+                _ => None,
+            })
+            .collect();
+        let between = own.between.clone();
+        let write = move || {
+            let _slots = crate::timeline::span("steps on the card: the slots");
+            let parts = if slots.len() < 256 { 1 } else { 8 };
+            crate::land::each_under(parts, &|part| {
+                for &(heap, index, at, len) in &slots {
+                    if index as usize / 4 % parts == part {
+                        // (A heap that is gone: nothing can read the slot.)
+                        crate::descriptor::constant_slot(heap, index, &between, at, len);
+                    }
                 }
-            }
-        });
+            });
+        };
+        let slots: Option<super::stages::Job> = if super::stages::on() {
+            Some(Box::new(write))
+        } else {
+            write();
+            None
+        };
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -853,6 +871,7 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            slots,
         }))
     }
 

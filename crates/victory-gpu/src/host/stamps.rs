@@ -166,6 +166,7 @@ mod tests {
         let sent = crate::timeline::ticks();
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            super::stages::drain();
             *submitted += 1;
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
