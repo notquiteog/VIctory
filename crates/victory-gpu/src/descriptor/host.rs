@@ -1422,24 +1422,41 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The fewest title slots a capped host heap keeps, however many dynamic
+/// slots `VICTORY_DYNAMIC_SLOTS` asks for ([`dynamic_slots_of`]).
+const LEAST_TITLE: u32 = 1 << 16;
+
+/// `VICTORY_DYNAMIC_SLOTS`, if it is set to a number.
+fn dynamic_slots_set() -> Option<u32> {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
 /// sets the most). 2^18 ran out in the title's bigger places (session
 /// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
 /// refused, with 2,639 indirect draws and dispatches).
+///
+/// On a host that caps its heap (NVIDIA) the dynamic slots come out of the
+/// title's: [`DYNAMIC`] unless `VICTORY_DYNAMIC_SLOTS` says how many (at
+/// least [`DYNAMIC`], and leaving the title [`LEAST_TITLE`] slots). The
+/// title's slots past the ones left have no host slot: a table reaching
+/// there is made afresh for its draw (`draw.rs`, `tables`), and a view
+/// there that a shader picks by an index it computes is not there to read
+/// ([`slot_stats`] counts those).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+    dynamic_slots_of(count, null, dynamic_slots_set())
+}
+
+/// [`dynamic_slots`] with `VICTORY_DYNAMIC_SLOTS` at `set`.
+fn dynamic_slots_of(count: u32, null: u32, set: Option<u32>) -> u32 {
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        let most = null.saturating_sub(LEAST_TITLE).max(DYNAMIC);
+        return set.map_or(DYNAMIC, |n| n.clamp(DYNAMIC, most));
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    null.saturating_sub(count).min(set.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -1491,6 +1508,14 @@ impl HostHeap {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
                 tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                tracing::info!(
+                    title = null - extra,
+                    of = count,
+                    dynamic = extra,
+                    set = dynamic_slots_set().is_some(),
+                    "capped host view heap: the title's first {} slots of {count} have host slots, {extra} are dynamic (VICTORY_DYNAMIC_SLOTS)",
+                    null - extra
+                );
                 null - extra
             };
             match make(size) {
@@ -1695,8 +1720,147 @@ pub(crate) mod slot_stats {
     static TITLE: AtomicU32 = AtomicU32::new(0);
     static SAID: AtomicU64 = AtomicU64::new(0);
 
-    pub(crate) fn mirrored(index: u32) {
+    /// Title slot `index` is mirrored; `view`: the title's record there
+    /// holds a view.
+    pub(crate) fn mirrored(index: u32, view: bool) {
         HIGHEST.fetch_max(index, Relaxed);
+        if view {
+            mark(&EVER, index);
+            mark(&LATELY, index);
+        }
+    }
+
+    /// A bit per view heap index shaders take (2^21).
+    const WORDS: usize = (super::UNCAPPED_VIEWS / 64) as usize;
+    type Bits = [AtomicU64; WORDS];
+    /// The title slots seen holding a view (mirrored, or found in the
+    /// title's heap past the host's title slots): ever, and since the last
+    /// line. Whether paging the title's slots (Marvisak/VIctory#2121) or a
+    /// smaller share of a capped heap for them (`VICTORY_DYNAMIC_SLOTS`)
+    /// would do is in how many there are and where they lie.
+    static EVER: Bits = [const { AtomicU64::new(0) }; WORDS];
+    static LATELY: Bits = [const { AtomicU64::new(0) }; WORDS];
+    /// The title slots past the host's that a table made afresh for a draw
+    /// covered: a view past them in no such table is read, if at all, by a
+    /// shader that picks it by an index it computes.
+    static TABLED: Bits = [const { AtomicU64::new(0) }; WORDS];
+
+    fn mark(bits: &[AtomicU64], index: u32) {
+        if let Some(word) = bits.get((index / 64) as usize) {
+            let bit = 1u64 << (index % 64);
+            // Most are set already: a load, not a write.
+            if word.load(Relaxed) & bit == 0 {
+                word.fetch_or(bit, Relaxed);
+            }
+        }
+    }
+
+    /// The title holds a view at slot `index`, past the host heap's title
+    /// slots (found in its heap's memory; such a slot is not mirrored).
+    pub(crate) fn held_past(index: u32) {
+        mark(&EVER, index);
+        mark(&LATELY, index);
+    }
+
+    /// A table of `n` slots from title slot `first` is made afresh for a
+    /// draw because it reaches past the host heap's `title` title slots.
+    pub(crate) fn tabled_past(first: u32, n: u32, title: u32) {
+        for index in first.max(title)..first.saturating_add(n) {
+            mark(&TABLED, index);
+        }
+    }
+
+    /// Slots per page, as #2121 pages them, and pages per band of the line.
+    const PAGE: u32 = 256;
+    const BAND: u32 = 512;
+
+    /// What [`EVER`], [`LATELY`] and [`TABLED`] say of a heap with `title`
+    /// title slots.
+    #[derive(Debug, Default, PartialEq)]
+    pub(super) struct Census {
+        /// Slots, pages, the lowest and the highest page: ever, and lately.
+        pub(super) seen: [(u64, u32, u32, u32); 2],
+        /// Pages by band of [`BAND`] pages: ever, and lately.
+        pub(super) bands: Vec<(u32, u32)>,
+        /// Slots past the title's: ever, lately, and of those lately the
+        /// ones in no table made afresh for a draw.
+        pub(super) past: [u64; 3],
+    }
+
+    /// Counts; `lately` is cleared.
+    pub(super) fn census(ever: &[AtomicU64], lately: &[AtomicU64], tabled: &[AtomicU64], title: u32) -> Census {
+        let mut c = Census { seen: [(0, 0, u32::MAX, 0); 2], ..Default::default() };
+        let words = (PAGE / 64) as usize;
+        for (page, (e, l)) in ever.chunks(words).zip(lately.chunks(words)).enumerate() {
+            let mut slots = [0u64; 2];
+            for (k, (e, l)) in e.iter().zip(l).enumerate() {
+                let (e, l) = (e.load(Relaxed), l.swap(0, Relaxed));
+                slots[0] += u64::from(e.count_ones());
+                slots[1] += u64::from(l.count_ones());
+                // The bits of this word at or past `title`.
+                let word = page * words + k;
+                let past = match u64::from(title).saturating_sub(word as u64 * 64) {
+                    0 => u64::MAX,
+                    64.. => 0,
+                    n => u64::MAX << n,
+                };
+                if past != 0 {
+                    let t = tabled.get(word).map_or(0, |t| t.load(Relaxed));
+                    c.past[0] += u64::from((e & past).count_ones());
+                    c.past[1] += u64::from((l & past).count_ones());
+                    c.past[2] += u64::from((l & past & !t).count_ones());
+                }
+            }
+            let page = page as u32;
+            let band = (page / BAND) as usize;
+            for (which, &n) in slots.iter().enumerate() {
+                if n == 0 {
+                    continue;
+                }
+                let s = &mut c.seen[which];
+                *s = (s.0 + n, s.1 + 1, s.2.min(page), s.3.max(page));
+                if c.bands.len() <= band {
+                    c.bands.resize(band + 1, (0, 0));
+                }
+                if which == 0 {
+                    c.bands[band].0 += 1;
+                } else {
+                    c.bands[band].1 += 1;
+                }
+            }
+        }
+        for s in &mut c.seen {
+            s.2 = s.2.min(s.3);
+        }
+        c
+    }
+
+    /// Said with the line of [`asked`].
+    fn say_pages(title: u32) {
+        let c = census(&EVER, &LATELY, &TABLED, title);
+        let [e, l] = &c.seen;
+        let bands: Vec<String> = c.bands.iter().map(|(e, l)| format!("{e}/{l}")).collect();
+        tracing::info!(
+            "the title's view slots seen holding a view, by page of {PAGE}: ever {} slots in {} pages ({:.0} a page, pages {} to {}); the last 5 s {} \
+             slots in {} pages ({:.0} a page, pages {} to {}); pages by band of {} slots from slot 0, ever/the last 5 s: {}; past the heap's {title} \
+             title slots: {} slots ever, {} the last 5 s, {} of those in no table made afresh for a draw (read only by a shader that picks them by \
+             index, which finds no view there)",
+            e.0,
+            e.1,
+            e.0 as f64 / f64::from(e.1.max(1)),
+            e.2,
+            e.3,
+            l.0,
+            l.1,
+            l.0 as f64 / f64::from(l.1.max(1)),
+            l.2,
+            l.3,
+            BAND * PAGE,
+            bands.join(" "),
+            c.past[0],
+            c.past[1],
+            c.past[2],
+        );
     }
 
     /// Waits for slots to be given back: those that found a run, and those that did not.
@@ -1776,6 +1940,7 @@ pub(crate) mod slot_stats {
             return;
         }
         say_fresh();
+        say_pages(title);
         let waits = [WAITS[0].swap(0, Relaxed), WAITS[1].swap(0, Relaxed)];
         if waits != [0, 0] {
             tracing::info!(
@@ -3122,7 +3287,9 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if !self.sampler {
-            slot_stats::mirrored(index);
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let tag = unsafe { (handle as *const u32).read_unaligned() };
+            slot_stats::mirrored(index, tag == VIEW_TAG);
         }
         if index >= self.count {
             // Diagnostic (heap cap): the title asks for more slots than a
@@ -5786,4 +5953,54 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod title_share_tests {
+    use super::slot_stats::{Census, census};
+    use super::{DYNAMIC, LEAST_TITLE, dynamic_slots_of};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// A capped heap (NVIDIA: the null slot at 999,999) has [`DYNAMIC`]
+    /// dynamic slots unless `VICTORY_DYNAMIC_SLOTS` says more, up to all but
+    /// [`LEAST_TITLE`] title slots; a host that does not cap is as before.
+    #[test]
+    fn a_capped_heap_shares_as_set() {
+        let null = 999_999;
+        assert_eq!(dynamic_slots_of(1_245_184, null, None), DYNAMIC);
+        assert_eq!(dynamic_slots_of(1_245_184, null, Some(600_000)), 600_000);
+        assert_eq!(dynamic_slots_of(1_245_184, null, Some(10)), DYNAMIC);
+        assert_eq!(dynamic_slots_of(1_245_184, null, Some(u32::MAX)), null - LEAST_TITLE);
+        let null = (1 << 21) - 1;
+        assert_eq!(dynamic_slots_of(1_245_184, null, None), null - 1_245_184);
+        assert_eq!(dynamic_slots_of(4_096, null, None), DYNAMIC << 2);
+        assert_eq!(dynamic_slots_of(1_245_184, null, Some(300_000)), 300_000);
+        assert_eq!(dynamic_slots_of(1_245_184, null, Some(10)), DYNAMIC);
+    }
+
+    /// The slots seen holding a view are counted by page, ever and lately
+    /// (which is cleared), and past the title's slots, with those of them
+    /// no table covered.
+    #[test]
+    fn slots_seen_are_counted_by_page_and_past_the_title_slots() {
+        let bits = |set: &[u32]| {
+            let words: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
+            for &i in set {
+                words[(i / 64) as usize].fetch_or(1 << (i % 64), Relaxed);
+            }
+            words
+        };
+        let (ever, lately, tabled) = (bits(&[5, 70, 130, 300]), bits(&[70, 130, 300]), bits(&[130]));
+        let c = census(&ever, &lately, &tabled, 100);
+        assert_eq!(
+            c,
+            Census { seen: [(4, 2, 0, 1), (3, 2, 0, 1)], bands: vec![(2, 2)], past: [2, 2, 1] }
+        );
+        let c = census(&ever, &lately, &tabled, 100);
+        assert_eq!(c.seen, [(4, 2, 0, 1), (0, 0, 0, 0)]);
+        assert_eq!((c.bands, c.past), (vec![(2, 0)], [2, 0, 0]));
+        // A title share ending inside a word, and one past everything seen.
+        assert_eq!(census(&ever, &bits(&[]), &tabled, 131).past, [1, 0, 0]);
+        assert_eq!(census(&ever, &bits(&[]), &tabled, 512).past, [0, 0, 0]);
+    }
 }

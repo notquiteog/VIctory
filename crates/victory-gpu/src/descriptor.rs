@@ -320,6 +320,7 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let title_count = heap.desc.count;
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
@@ -373,6 +374,19 @@ pub(crate) fn sync_heaps() {
                 out.views += u64::from(crate::watch::guarded(from, to));
                 out.bytes += (to - from) as u64;
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                // The views the title holds past the host heap's title slots
+                // (a capped heap: NVIDIA) have no host slot; they are counted
+                // (`host::slot_stats`).
+                if !samplers && mirrored_count < title_count {
+                    let all = changed_slots(from, to, start as usize, step, title_count);
+                    let first = ((from - start as usize) as u64).div_ceil(step).max(u64::from(mirrored_count));
+                    for index in first..all.end {
+                        let at = (start + index * step) as usize - from;
+                        if page_bytes.get(at..at + 4).is_some_and(|b| b == VIEW_TAG.to_le_bytes()) {
+                            host::slot_stats::held_past(index as u32);
+                        }
+                    }
+                }
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);

@@ -3343,6 +3343,11 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            if title_first.is_none()
+                && let Some(first) = heap.index(table)
+            {
+                crate::descriptor::host::slot_stats::tabled_past(first, n, host.count());
+            }
             // They are such a table's, whatever they hold. (Of a big one,
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
