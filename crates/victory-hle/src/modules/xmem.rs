@@ -667,11 +667,18 @@ pub(crate) fn watched(at: usize, len: usize, what: &str) {
 
 /// For the streaming log: the title's physical pages now (allocated and not
 /// freed), the views of them it has mapped, and those views' bytes (a page
-/// shown at two addresses counts twice).
-pub(crate) fn pages_census() -> (usize, usize, usize) {
+/// shown at two addresses counts twice), and how many different pages the
+/// views of less than 256 MiB show (what the title has mapped for something,
+/// beside the views it keeps of whole allocations).
+pub(crate) fn pages_census() -> (usize, usize, usize, usize) {
     let pages = page_table().pages.len();
     let physical = physical();
-    (pages, physical.views.len(), physical.views.values().map(|v| v.0).sum())
+    let mut used = std::collections::HashSet::new();
+    for (size, slice) in physical.views.values().filter(|v| v.0 < 256 << 20) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        used.extend((0..size / PAGE).map(|k| (section, slice.index + k)));
+    }
+    (pages, physical.views.len(), physical.views.values().map(|v| v.0).sum(), used.len())
 }
 
 /// See [`pages_written`].

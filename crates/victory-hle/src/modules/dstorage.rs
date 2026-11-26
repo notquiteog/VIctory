@@ -826,9 +826,10 @@ pub(crate) mod stream_log {
                         line(format_args!("M\t{}\t{costs}", now()));
                     }
                     // `G`: the title's physical pages (64 KiB each), its views of
-                    // them and their bytes.
-                    let (pages, views, bytes) = super::super::xmem::pages_census();
-                    line(format_args!("G\t{}\t{pages}\t{views}\t{bytes}", now()));
+                    // them and their bytes, and the pages in views of less than
+                    // 256 MiB.
+                    let (pages, views, bytes, used) = super::super::xmem::pages_census();
+                    line(format_args!("G\t{}\t{pages}\t{views}\t{bytes}\t{used}", now()));
                     if let Some(log) = log() {
                         let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
                     }
