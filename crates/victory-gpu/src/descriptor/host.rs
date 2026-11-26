@@ -802,6 +802,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = NOTED_MS[0].compare_exchange(0, crate::host::now_ms().max(1), Relaxed, Relaxed);
     STALE[1].fetch_add(1, Relaxed);
     // Pages are mapped one after the other.
     if let Some(last) = ranges.last_mut()
@@ -814,6 +815,62 @@ pub(crate) fn remapped(at: usize, len: usize) {
         // No pass runs (no shader that picks textures by index is bound):
         // the slots there are looked at when they are due, as before.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
+}
+
+/// For the log: when the oldest range now kept in [`REMAPPED`] and in
+/// [`LANDED`] was noted (`crate::host::now_ms`; 0: none is kept).
+static NOTED_MS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the start: slots made due at once by memory the runtime had written
+/// ([`landed`]).
+pub(crate) static LANDED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Title memory whose bytes the runtime has put there since a texture pass
+/// last took the ranges ([`landed`]).
+static LANDED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Whether the slots over memory the runtime has written are due at the
+/// pass that learns of it ([`landed`]), `VICTORY_LANDED_NOW=1`, and not a
+/// frame later, as those over memory about to be written. Off: it was on,
+/// by figures that counted the time from the mapping of the memory with
+/// it. From the landing itself to the upload recorded (runs stream-RL0
+/// without and stream-RL1 with, one after the other): standing still 152
+/// ms at 159 ms a frame and 134 ms at 168, 0.96 and 0.80 of a frame; with
+/// the camera turning 301 ms at 279 and 348 ms at 366; in the world's first
+/// minute 97 and 692 ms, where the pass is at its budget and the queue
+/// decides. A sixth of a frame in the quiet case and nothing in the
+/// others is not worth an order of uploads of its own.
+pub(crate) fn landed_now() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_NOW").is_some_and(|v| v == "1"))
+}
+
+/// The runtime has written title memory `[at, at + len)`, and the bytes are
+/// there (a DirectStorage request done): unlike [`remapped`], which is told
+/// before a write and so makes the slots there due a frame later, the placed
+/// textures there could be uploaded by the next pass ([`landed_now`]). Kept
+/// for it ([`HostHeap::texture_slots_remapped`]), which times their uploads
+/// from here either way. Locks one mutex of its own and calls nothing.
+pub(crate) fn landed(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: usize = 1 << 15;
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = NOTED_MS[1].compare_exchange(0, crate::host::now_ms().max(1), Relaxed, Relaxed);
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return;
+    }
+    // (No pass runs: [`REMAPPED`] holds them too, and counts what it drops.)
+    if ranges.len() >= MOST {
         ranges.clear();
     }
     ranges.push((start, end));
@@ -890,6 +947,11 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// For the log: when it came here (`crate::host::now_ms`; 0: not to be
+    /// timed any more), and what brought it: 0, a write of the view; 1,
+    /// memory mapped, unmapped or about to be written under its view
+    /// ([`remapped`]); 2, memory the runtime had written ([`landed`]).
+    since: (u64, u8),
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -916,7 +978,27 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        let since = (crate::host::now_ms().max(1), 0);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since });
+    }
+
+    /// The memory under slot `index` was noted at `ms` (0: not known) by
+    /// `origin` ([`Waiting::since`]): its clock starts there, not at the pass
+    /// that took the note. Only a slot the queue holds and still times.
+    fn since_noted(&mut self, index: u32, ms: u64, origin: u8) {
+        if let Some(w) = self.slots.get_mut(&index).filter(|w| ms != 0 && w.since.0 != 0) {
+            // What has landed is timed from its landing, whatever was noted
+            // of the memory before (its mapping, the write to come).
+            w.since = (if origin == 2 { ms } else { ms.min(w.since.0) }, origin);
+        }
+    }
+
+    /// When slot `index` came into the queue and by what ([`Waiting::since`]),
+    /// once: for the time until its upload is recorded.
+    fn since(&mut self, index: u32, write: u64) -> Option<(u64, u8)> {
+        let w = self.same(index, write)?;
+        let since = std::mem::take(&mut w.since);
+        (since.0 != 0).then_some(since)
     }
 
     fn remove(&mut self, index: u32) {
@@ -1044,7 +1126,8 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        let since = (crate::host::now_ms().max(1), 1);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1055,12 +1138,17 @@ impl TextureQueue {
 
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+    /// part; the frames the oldest due one has waited since its write; and
+    /// those uploaded whole that wait for another look at their memory
+    /// ([`TextureQueue::recheck`]: they counted as waiting for their memory,
+    /// and were most of that count).
+    fn census(&self, frame: u64) -> [u64; 6] {
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
+            } else if w.checked.2 != 0 {
+                c[5] += 1;
             } else if w.looks > 0 {
                 c[2] += 1;
             }
@@ -2070,7 +2158,7 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
@@ -2080,7 +2168,7 @@ impl HostHeap {
     pub(crate) fn texture_news(&self) -> (u64, bool) {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&LANDED))
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -2125,6 +2213,11 @@ impl HostHeap {
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
+    /// See [`TextureQueue::since`].
+    pub(crate) fn texture_slot_since(&self, index: u32, write: u64) -> Option<(u64, u8)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).since(index, write)
+    }
+
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
@@ -2167,24 +2260,49 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
-            return 0;
+        // Mapped, unmapped or about to be written: due from the next frame.
+        // Written, the bytes there ([`landed`]): due now, with
+        // `VICTORY_LANDED_NOW=1`; else only timed from then.
+        let mut made = 0;
+        for (noted, after) in [(&REMAPPED, 1), (&LANDED, 0)] {
+            // (Under the lock: a range noted now starts the clock anew.)
+            let (mut ranges, since) = {
+                let mut noted_ranges = noted.lock().unwrap_or_else(|e| e.into_inner());
+                (std::mem::take(&mut *noted_ranges), NOTED_MS[1 - after as usize].swap(0, Relaxed))
+            };
+            if ranges.is_empty() {
+                continue;
+            }
+            join(&mut ranges);
+            let mut slots: Vec<u32> = {
+                let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            };
+            slots.sort_unstable();
+            slots.dedup();
+            slots.retain(|&slot| !self.tabled_lately(slot, frame));
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            // (Without `VICTORY_LANDED_NOW=1` what has landed only starts
+            // the clock of the slots the note before the write made due.)
+            let due_by_this = after != 0 || landed_now();
+            for &slot in &slots {
+                if due_by_this {
+                    textures.changed(slot, frame, frame + after);
+                }
+                // Timed from the oldest of the ranges taken.
+                textures.since_noted(slot, since, 2 - after as u8);
+            }
+            if !due_by_this {
+                continue;
+            }
+            if after == 0 {
+                LANDED_SLOTS.fetch_add(slots.len() as u64, Relaxed);
+            } else {
+                STALE[3].fetch_add(slots.len() as u64, Relaxed);
+            }
+            made += slots.len();
         }
-        join(&mut ranges);
-        let mut slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
-        };
-        slots.sort_unstable();
-        slots.dedup();
-        slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
-        }
-        STALE[3].fetch_add(slots.len() as u64, Relaxed);
-        slots.len()
+        made
     }
 
     /// Makes the slots of the textures filled with less than was mapped
@@ -5502,7 +5620,7 @@ mod tests {
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8, 0]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);

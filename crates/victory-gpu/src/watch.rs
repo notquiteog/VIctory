@@ -2054,6 +2054,17 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The runtime has written title memory `[at, at + len)` itself and the bytes
+/// are there (a DirectStorage request into pages, or to an address, done):
+/// as [`writing`], and the texture pass is told that they have landed
+/// (`crate::descriptor::host::landed`: it times its uploads from here, and
+/// with `VICTORY_LANDED_NOW=1` uploads the placed textures there at once,
+/// not a frame later).
+pub fn written(at: usize, len: usize) {
+    writing(at, len);
+    crate::descriptor::host::landed(at, len);
+}
+
 /// The kernel writes title memory `[at, at + len)` until what this returns
 /// is dropped ([`kernel_writing`]).
 pub struct KernelWrite(usize, usize);

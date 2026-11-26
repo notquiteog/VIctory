@@ -679,7 +679,28 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
-pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Whether the slots waiting for their texture's upload
+/// (`HostHeap::texture_slots_flip`) are looked at where every list first uses
+/// the view heap, not only in the pass over the heap's textures, which runs
+/// once a frame, early: an upload recorded there has run by the time later
+/// lists of the same frame are recorded, and the slot showed the neutral
+/// texture (or the texture's other level) until the next frame's pass all the
+/// same: 1.36 frames after it was asked for on average over 85,000 slots (run
+/// stream-RB-old; 1.30 to 1.45 in four other runs), 1.05 over 70,000 with this
+/// (stream-RA-new). `VICTORY_FLIP_EACH_LIST=0`: in the pass alone, as before.
+fn flip_each_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIP_EACH_LIST").is_none_or(|v| v != "0"))
+}
+
+pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Since the last line of the log: uploads recorded by the pass for a slot
+/// whose view was written, the milliseconds from that write to the upload in
+/// all, and the longest; the same three for slots that memory mapped,
+/// unmapped or about to be written under their view made due (from when the
+/// runtime told of it); and for slots over memory the runtime had written
+/// (from when it said the bytes were there).
+pub(crate) static HEAP_TEXTURES_WAITED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1932,6 +1953,11 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
+        // Slots whose texture's upload has run meanwhile show it from this
+        // list on, not from the next frame's pass (`flip_each_list`).
+        if flip_each_list() {
+            host.texture_slots_flip();
+        }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
@@ -2579,6 +2605,13 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            if let Some((since, origin)) = host.texture_slot_since(index, write) {
+                let waited = crate::host::now_ms().saturating_sub(since);
+                let at = usize::from(origin.min(2)) * 3;
+                HEAP_TEXTURES_WAITED[at].fetch_add(1, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 1].fetch_add(waited, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 2].fetch_max(waited, Ordering::Relaxed);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {

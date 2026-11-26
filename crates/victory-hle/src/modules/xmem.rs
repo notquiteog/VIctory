@@ -632,6 +632,75 @@ impl Shown {
     }
 }
 
+/// Diagnostics (`VICTORY_STREAM_WATCH=<offset in its file>`): the memory the
+/// DirectStorage request at that file offset was last read into (address,
+/// bytes; `dstorage` sets it), and how often.
+pub(crate) static WATCHED: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+/// With a watched request: a line when the title unmaps or frees memory of
+/// its destination, with who asked (the title's return addresses).
+pub(crate) fn watched(at: usize, len: usize, what: &str) {
+    let (start, bytes) = (WATCHED[0].load(Ordering::Relaxed), WATCHED[1].load(Ordering::Relaxed));
+    if bytes == 0 || at >= start + bytes || at + len <= start {
+        return;
+    }
+    // One line for each time it was read: the first piece to go.
+    static TOLD: AtomicUsize = AtomicUsize::new(0);
+    let n = WATCHED[2].load(Ordering::Relaxed);
+    if TOLD.swap(n, Ordering::Relaxed) == n {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let from = super::kernel::callers();
+    #[cfg(not(feature = "diagnostics"))]
+    let from = "";
+    tracing::info!(
+        read = n,
+        at = format_args!("{at:#x}"),
+        len,
+        of = format_args!("{start:#x}+{bytes:#x}"),
+        thread = ?std::thread::current().id(),
+        from,
+        "stream watch: the title {what} memory of the watched request's destination"
+    );
+}
+
+/// For the streaming log: the title's physical pages now (allocated and not
+/// freed), the views of them it has mapped, and those views' bytes (a page
+/// shown at two addresses counts twice), and how many different pages the
+/// views of less than 256 MiB show (what the title has mapped for something,
+/// beside the views it keeps of whole allocations).
+pub(crate) fn pages_census() -> (usize, usize, usize, usize) {
+    let pages = page_table().pages.len();
+    let physical = physical();
+    let mut used = std::collections::HashSet::new();
+    for (size, slice) in physical.views.values().filter(|v| v.0 < 256 << 20) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        used.extend((0..size / PAGE).map(|k| (section, slice.index + k)));
+    }
+    (pages, physical.views.len(), physical.views.values().map(|v| v.0).sum(), used.len())
+}
+
+/// With a watched request: a line (a few) when the GPU's page mapping shows
+/// pages of its destination at another address, which is where draws name
+/// them.
+fn watched_alias(to: usize, from: usize, len: usize) {
+    let (start, bytes) = (WATCHED[0].load(Ordering::Relaxed), WATCHED[1].load(Ordering::Relaxed));
+    if bytes == 0 || from == 0 || from >= start + bytes || from + len <= start {
+        return;
+    }
+    static SAID: AtomicUsize = AtomicUsize::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 60 {
+        tracing::info!(
+            read = WATCHED[2].load(Ordering::Relaxed),
+            to = format_args!("{to:#x}"),
+            from = format_args!("{from:#x}"),
+            len,
+            "stream watch: pages of the watched request's destination are shown at another address (a GPU page mapping)"
+        );
+    }
+}
+
 /// See [`pages_written`].
 pub(crate) fn stream_notice() -> bool {
     static ON: LazyLock<bool> =
@@ -991,7 +1060,7 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     }
     for (at, bytes) in shown_at(pages, offset, len) {
         if stream_notice() {
-            victory_gpu::kernel_will_write(at, bytes);
+            victory_gpu::title_memory_landed(at, bytes);
         } else {
             victory_gpu::title_memory_written(at, bytes, true);
         }
@@ -1217,6 +1286,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
+    watched_alias(to, from, len);
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
@@ -1243,6 +1313,9 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     lift_thread();
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+    }
+    for &(to, from, len) in ranges {
+        watched_alias(to as usize, from as usize, len as usize);
     }
     // By the page: the address, and the one whose page it is to show.
     let pages: Vec<(usize, Option<usize>)> = ranges
@@ -1469,6 +1542,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
                 }
+                watched(op.at, PAGE, "unmaps (a scattered mapping)");
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
@@ -1795,6 +1869,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             // Parts of it stay, and are mapped again below.
             victory_gpu::title_memory_splitting(at, size);
         }
+        watched(at, size, "unmaps");
         victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
@@ -1911,6 +1986,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        watched(address as usize, size.max(1), "frees (VirtualFree)");
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
