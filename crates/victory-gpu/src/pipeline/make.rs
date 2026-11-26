@@ -151,6 +151,23 @@ fn screen_budget() -> Duration {
     })
 }
 
+/// The age of a frame, since the title's last `Present` returned, past which
+/// nothing waits for a pipeline any more: the title's watchdog ends a run
+/// whose frame takes 30 s, and a frame that old (the world's first, with
+/// its buffers and textures to make) has the rest of its work still to do.
+/// A budget set above it (`VICTORY_PIPELINE_WAIT_MS`, `VICTORY_SCREEN_WAIT_MS`)
+/// is the ceiling for its kind instead. From DexNom/VIctory#7.
+const WATCHDOG_WAIT_CEILING: Duration = Duration::from_secs(10);
+
+/// `budget`, and no more than what is left of `ceiling` in a frame that is
+/// `since_present` old (`None`: nothing presented yet, no bound).
+fn watchdog_cap(budget: Duration, since_present: Option<Duration>, ceiling: Duration) -> Duration {
+    match since_present {
+        Some(elapsed) => budget.min(ceiling.saturating_sub(elapsed)),
+        None => budget,
+    }
+}
+
 /// Whether passes over the screen go before the others.
 fn screens_first() -> bool {
     !screen_budget().is_zero()
@@ -217,6 +234,7 @@ fn shared_budget() -> bool {
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
+    let budget = watchdog_cap(budget, crate::queue::since_last_present(), WATCHDOG_WAIT_CEILING.max(budget));
     if budget.is_zero() {
         return;
     }

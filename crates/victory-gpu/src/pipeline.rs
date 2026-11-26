@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// It tells the screen probes which rays to trace
+    /// ([`crate::ambient::activates_rays`]).
+    #[cfg(windows)]
+    activates_rays: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -120,6 +124,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                activates_rays: stage == "compute" && crate::ambient::activates_rays(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
@@ -409,12 +415,47 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`):
+/// without it the title's rays have nothing to trace.
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dispatch of the title's pipeline `this` is left out because it
+/// only serves rays that do not run: the program that tells the screen
+/// probes which rays to trace ([`crate::ambient::activates_rays`]), in a run
+/// whose rays cannot trace (no `VICTORY_BVH_BUILDER=1`).
+/// `VICTORY_ACTIVATE_RAYS=1` has it run.
+/// shortcut: left out. After Belobug 6986a57: once that program ran with no
+/// rays behind it, the whole picture lost light, shadows and reflections
+/// (its runs opt31b against sans39, on an RX 9070 XT); not seen on a card of
+/// ours.
+#[cfg(windows)]
+pub(crate) fn idle_without_rays(this: This) -> bool {
+    // (Every dispatch asks: one flag of the pipeline for all but this one.)
+    if this.is_null() || !pipeline(this).activates_rays {
+        return false;
+    }
+    static LEFT_OUT: OnceLock<bool> = OnceLock::new();
+    *LEFT_OUT.get_or_init(|| {
+        let out = !builder_allowed() && !std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "1");
+        if out {
+            tracing::info!(
+                shaders = ?pipeline(this).shaders,
+                "the program that activates the screen probes' rays is left out: no rays run (VICTORY_ACTIVATE_RAYS=1 has it run)"
+            );
+        }
+        out
+    })
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -505,6 +546,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// It only serves rays ([`idle_without_rays`]).
+    #[cfg(windows)]
+    activates_rays: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -679,6 +723,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        activates_rays: shaders.iter().any(|s| s.activates_rays),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

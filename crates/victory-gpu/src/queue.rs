@@ -859,6 +859,26 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// When the title's last `Present` returned, in `crate::host::now_ms` (at
+/// least 1; 0: none yet).
+#[cfg(windows)]
+static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The time since the title's last `Present` returned; `None` before the
+/// first. The title's watchdog ends a run whose frame takes 30 s: what may
+/// wait inside a frame asks here how old the frame is
+/// (`pipeline::make`; DexNom/VIctory#7).
+#[cfg(windows)]
+pub(crate) fn since_last_present() -> Option<std::time::Duration> {
+    let last = LAST_PRESENT_MS.load(Ordering::Relaxed);
+    (last != 0).then(|| std::time::Duration::from_millis(crate::host::now_ms().saturating_sub(last)))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn since_last_present() -> Option<std::time::Duration> {
+    None
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -987,6 +1007,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
         behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        LAST_PRESENT_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -1012,6 +1033,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    LAST_PRESENT_MS.store(crate::host::now_ms().max(1), Ordering::Relaxed);
     called.end();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();

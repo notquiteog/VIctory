@@ -213,6 +213,16 @@ pub(super) enum Effect {
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
+        // On a host of AMD's RDNA hardware, handles from the descriptor heap
+        // and their annotations are not reused across blocks: its compiler
+        // crashes on one shared so (`heap_handles_local`). As `Lanes` they
+        // are still one for one block, and dropped when nothing reads them.
+        Some(Attr::ReadNone)
+            if (name == "createHandleFromHeap" || name == "annotateHandle")
+                && crate::emit::lower::heap_handles_local() =>
+        {
+            Effect::Lanes
+        }
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)

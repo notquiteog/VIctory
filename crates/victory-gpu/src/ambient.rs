@@ -70,6 +70,17 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
     }
 }
 
+/// The program that tells the screen probes which rays to trace, by the
+/// start of its name: left out while no rays run
+/// (`crate::pipeline::idle_without_rays`; Belobug 6986a57).
+const ACTIVATES_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
+
+/// Whether the program in `container` is the one that activates the screen
+/// probes' rays, by its name.
+pub(crate) fn activates_rays(container: &[u8]) -> bool {
+    container.windows(ACTIVATES_RAYS.len()).any(|w| w == ACTIVATES_RAYS)
+}
+
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
 /// and reads the scene's depth, and where the other writes the light of
 /// visible surfaces: root parameter and place in its table, in dwords.
