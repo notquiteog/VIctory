@@ -483,8 +483,10 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut heap_flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            heap_flags |= direct_heap_flags(&t.dxil);
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -600,10 +602,16 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, root_blob) = match root_signature(
+            &host.device,
+            &params,
+            &samplers,
+            compute.is_some(),
+            heap_flags,
+        ) {
             Ok(root) => root,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                tracing::warn!(error = %e, ?shaders, ?heap_flags, "host root signature refused");
                 return None;
             }
         };
@@ -1025,11 +1033,54 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// Use the final bytecode, including on a translation-cache hit. If feature
+/// metadata is unavailable, retain the previous conservative requirements.
+fn direct_heap_flags(dxil: &[u8]) -> D3D12_ROOT_SIGNATURE_FLAGS {
+    let resource = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    let sampler = D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    let Ok(container) = victory_shader::Container::parse(dxil) else {
+        return resource | sampler;
+    };
+    if container.version != (1, 0) {
+        return resource | sampler;
+    }
+    // Both the translator and DXC emit parts in file order. Decline to
+    // narrow the signature for overlapping chunks or an unfamiliar layout.
+    let mut end = 32 + 4 * container.parts.len();
+    let mut features = None;
+    for part in container.parts {
+        if part.offset < end {
+            return resource | sampler;
+        }
+        end = part.offset + 8 + part.data.len();
+        if part.fourcc == victory_shader::FourCC::SFI0 {
+            let Ok(bytes) = part.data.try_into() else {
+                return resource | sampler;
+            };
+            if features.replace(u64::from_le_bytes(bytes)).is_some() {
+                return resource | sampler;
+            }
+        }
+    }
+    let Some(bits) = features else {
+        return resource | sampler;
+    };
+    let mut flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    if bits & u64::from(D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING) != 0 {
+        flags |= resource;
+    }
+    if bits & u64::from(D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING) != 0 {
+        flags |= sampler;
+    }
+    flags
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    heap_flags: D3D12_ROOT_SIGNATURE_FLAGS,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
@@ -1044,9 +1095,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: input | heap_flags,
             },
         },
     };
@@ -1078,6 +1127,49 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn direct_heap_flags_follow_final_features() {
+        // DXBC v1, one eight-byte SFI0 chunk after the offset table.
+        let mut shader = [0_u8; 52];
+        shader[..4].copy_from_slice(b"DXBC");
+        shader[20] = 1; // Version 1.0.
+        shader[24] = 52; // Container length.
+        shader[28] = 1; // Chunk count.
+        shader[32] = 36; // First chunk offset.
+        shader[36..40].copy_from_slice(b"SFI0");
+        shader[40] = 8; // Feature mask length.
+        let resource = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        let sampler = D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        let both = resource | sampler;
+        for (bits, expected) in [
+            (0x200_u64, D3D12_ROOT_SIGNATURE_FLAG_NONE),
+            (0x0200_0000, resource),
+            (0x0400_0000, sampler),
+            (0x0600_0000, both),
+        ] {
+            shader[44..].copy_from_slice(&bits.to_le_bytes());
+            assert_eq!(direct_heap_flags(&shader), expected);
+        }
+
+        shader[44..].fill(0);
+        assert_eq!(direct_heap_flags(&shader[..51]), both);
+        for (offset, value) in [(20, 2), (32, 4), (32, 255), (36, 0), (40, 4), (40, 255)] {
+            let mut invalid = shader;
+            invalid[offset] = value;
+            assert_eq!(direct_heap_flags(&invalid), both);
+        }
+        let mut duplicate = shader.to_vec();
+        duplicate.splice(36..36, 56_u32.to_le_bytes());
+        duplicate.extend_from_slice(&shader[36..]);
+        duplicate[24] = 72;
+        duplicate[28] = 2;
+        duplicate[32] = 40;
+        duplicate[64..].copy_from_slice(&0x0600_0000_u64.to_le_bytes());
+        assert_eq!(direct_heap_flags(&duplicate), both);
+        duplicate[36] = 40; // Both directory entries point at the same chunk.
+        assert_eq!(direct_heap_flags(&duplicate), both);
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -1142,7 +1234,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(
+            &host.device,
+            &[],
+            &[],
+            false,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        )
+        .unwrap();
         let mut g = GraphicsState::default();
         // This pipeline has only a color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
@@ -1238,7 +1337,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(
+            &host.device,
+            &[],
+            &[],
+            false,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        )
+        .unwrap();
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
