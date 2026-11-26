@@ -160,6 +160,30 @@ dispatches, faults and what came.
 
 ## Known gaps
 
+- Sparse tree canopy on the walk (2026-11-26, runs rt-pcap3, rt-aon2,
+  rt-apush02 against rt-aon3, rt-askip1, rt-off1, rt-aoff3, rt-aoffns1; world
+  captures every 20 frames, `VICTORY_CAPTURE_WORLD_EVERY=20`). Where the walk
+  passes the side of the blue house, the tree in front of the white house is
+  drawn as a fan of small dark squares over the sky and the house instead of a
+  full canopy, for some 150 frames. It is not the push: rt-apush02
+  (`VICTORY_BVH_PUSH=0`) has it too. It came only with the builder on and
+  rays traced (3 of the 4 such runs that reached the spot; rt-aon3 drew the
+  tree whole). None of the 4 runs without traced rays had it: builder off with
+  the skip list, builder off without it (rays find nothing), and builder on
+  with the ray passes skipped. So it is likely tied to ray tracing, but it
+  does not come every time. The other half of the tree draws whole in the same
+  frame, so it looks like one instance's level of detail or fade-in stuck
+  partway. Not mended yet.
+- Grey tiles on the player and the rail just after the cutscene cuts to play
+  (rt-on2 `frame-1300.png`: flat grey and dark squares of 16 rendered pixels
+  on the shirt, legs and rail, and lighter rectangles on the water). Seen once
+  in 6 builder-on runs. rt-aon3 captured every 2 frames from the world's first
+  frame and every 5 frames from 180 to 440 after it, and its first frames of
+  play are clean, apart from the rectangles on the water, which all the runs
+  show. Faults right after the world appears are bounded per frame
+  (`FAULTS`=128). The 900-odd pages of the first burst take two frames, so
+  that burst comes and goes some 250 frames before the cut. Not reproduced, so
+  not mended.
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
   structure's compacted size, reads it one or two frames later without looking
