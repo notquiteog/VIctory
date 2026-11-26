@@ -801,6 +801,10 @@ pub(crate) enum Written {
     CardTimestamp(u32),
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// Nothing is stored: the asking (its number) of a structure's compacted
+    /// size into this slot has landed (`crate::bvhsize::landed`).
+    #[cfg(windows)]
+    SizeLanded(u32),
 }
 
 impl Written {
@@ -823,6 +827,11 @@ impl Written {
                 as_loaded(now, at as usize, gpu_load())
             }
             Written::SystemTimestamp => system_timestamp(),
+            #[cfg(windows)]
+            Written::SizeLanded(asking) => {
+                crate::bvhsize::landed(at as u64, asking);
+                return;
+            }
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);
@@ -1424,8 +1433,8 @@ mod tests {
     fn newer_queues_have_their_methods_two_slots_later() {
         let (old, new) = (queue_table(false), queue_table(true));
         assert_eq!(old[10], new[10]); // submission stays at 0x50
-        assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
-        assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
+        assert_eq!(old[14], new[16]); // signal 0x70 Ã¢â€ â€™ 0x80
+        assert_eq!(old[30], new[32]); // present 0xf0 Ã¢â€ â€™ 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
     }
 

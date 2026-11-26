@@ -814,6 +814,10 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// wrote over its neighbours: of 230 such copies of run light-11, 99 were
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
+///
+/// With `VICTORY_THIN=1` this wait is done by the thread of ours that sends
+/// submissions, not by the title's: the title goes on and reads the slot all
+/// the same. What mends it is a bound given at once (`crate::bvhsize`).
 fn sizes_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
@@ -925,6 +929,16 @@ pub(crate) fn ready(
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
+    }
+    // A compacted size asked for: the slot takes a bound at once
+    // (`crate::bvhsize`).
+    if builds
+        && asks_size(written, constants, threads)
+        && let [lo, hi, 1, ..] = *constants
+    {
+        let _bound = crate::bvhsize::asked(list, u64::from(lo) | u64::from(hi) << 32, written[0]);
+        #[cfg(feature = "diagnostics")]
+        m.trace.bound(frame, written[0], _bound);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -1116,7 +1130,9 @@ mod trace {
                 if now != was {
                     self.sizes.insert(structure, (now, frame));
                     gone.push(i);
-                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: {was:#x} -> {now:#x}"));
+                    // (A later asking's bound, put there by us.)
+                    let ours = if crate::bvhsize::bound_at(at) == Some(now) { " (a bound of ours)" } else { "" };
+                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: {was:#x} -> {now:#x}{ours}"));
                 } else if frame > then + 60 {
                     gone.push(i);
                     self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: still {was:#x}"));
@@ -1125,6 +1141,22 @@ mod trace {
             for i in gone.into_iter().rev() {
                 self.asked.swap_remove(i);
             }
+        }
+
+        /// The slot of the asking just traced was given `bound` in title
+        /// memory (`crate::bvhsize`): a change from it is what lands.
+        pub(super) fn bound(&mut self, frame: u64, at: u64, bound: Option<u64>) {
+            if !on() {
+                return;
+            }
+            let Some(bound) = bound else {
+                self.say(format!("frame {frame}: size at {at:#x}: no bound known"));
+                return;
+            };
+            if let Some(asked) = self.asked.iter_mut().rev().find(|a| a.1 == at) {
+                asked.3 = bound;
+            }
+            self.say(format!("frame {frame}: size at {at:#x}: given the bound {bound:#x}"));
         }
 
         pub(super) fn dispatch(

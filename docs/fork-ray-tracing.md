@@ -94,6 +94,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_SIZES_BOUND=0` | a structure's compacted size is not given a bound before the card's lands (on with the builder; Known gaps) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
@@ -114,7 +115,34 @@ dispatches, faults and what came.
   slot held before, another structure's size, and the copy wrote over the
   neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
   did not mend it and costs some 20 ms a frame (light-15): the title asks in
-  every frame, and what it read was as old as before. Open.
+  every frame, and what it read was as old as before.
+
+  Why the wait could not help (2026-11-26, from the code): the asking is the
+  builder's one-thread program `GetBVHCompactedSize`, recorded by
+  `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X` (the only
+  build call the title imports). With `VICTORY_THIN=1` the list is translated
+  by threads of ours and sent by our line's thread (`queue/behind.rs`), and
+  the wait (`memory::asked_sizes`, `Host::send_late`) blocks that thread, not
+  the title's: the title goes on and reads the slot all the same. Nor can the
+  CPU know the size from the structure's header (dword 1): the builder writes
+  it on the card, in an arena, and it never comes to title memory.
+
+  Mended, untested in a run: **`VICTORY_BVH_SIZES_BOUND`** (on with the
+  builder; `0`: off), `crates/victory-gpu/src/bvhsize.rs`. The main image's
+  imports of the builder's `GetRaytracingAccelerationStructurePrebuildInfo`
+  and of the batched build go through `victory-hle`'s `modules/bvh.rs`
+  first. A prebuild answer (`ResultDataMaxSizeInBytes`, at least the
+  compacted size) is kept by what it depends on (kind, flags, counts and
+  formats of the inputs); a batched build's descriptions are looked through
+  for build descriptions (destination, then inputs) whose inputs were
+  answered (the batch's own description is not public: in place or pointed
+  at). When the size program is translated, its slot is given that bound in
+  title memory at once, so a read before the card's size lands takes memory
+  enough (more than it needs, until then). A bottom-of-pipe look on the
+  asking list (`Written::SizeLanded`) puts the latest bound back where an
+  earlier asking of the same slot landed after it. What is not found is left
+  as before. Every ten seconds the log says how many answers, structures
+  found, sizes asked with a bound and without, bounds put back.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame

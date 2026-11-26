@@ -11,6 +11,8 @@
 #[cfg(windows)]
 pub mod apu;
 pub mod audio;
+#[cfg(windows)]
+pub mod bvh;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
