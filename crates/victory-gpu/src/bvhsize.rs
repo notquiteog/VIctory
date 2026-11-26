@@ -300,12 +300,12 @@ fn with<T>(f: impl FnOnce(&mut State) -> T) -> T {
     f(guard.get_or_insert_with(State::default))
 }
 
-/// Whether bounds are given: with the structure builder
-/// (`VICTORY_BVH_BUILDER=1`), unless `VICTORY_BVH_SIZES_BOUND=0`.
+/// Whether bounds are given: with the structure builder (on unless
+/// `VICTORY_BVH_BUILDER=0`), unless `VICTORY_BVH_SIZES_BOUND=0`.
 pub fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+        victory_shader::bvh_builder_on()
             && std::env::var_os("VICTORY_BVH_SIZES_BOUND").is_none_or(|v| v != "0")
     })
 }

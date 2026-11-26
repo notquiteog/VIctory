@@ -273,10 +273,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
 /// rest of the run at first.
 ///
-/// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
-/// the whole builder and the host side of title memory by address
-/// (`memory.rs`) working on a card; nothing reads the structures before
-/// the programs that walk them translate.
+/// It runs unless `VICTORY_BVH_BUILDER=0` (on by default since 2026-11-26,
+/// after runs rt-on1 and rt-on2 showed the whole builder and title memory by
+/// address working on an NVIDIA card; it was opt-in before).
 #[cfg(windows)]
 struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
@@ -363,9 +362,9 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// because its program walks ray-tracing structures nothing has built
 /// (`VICTORY_BVH_HOLD=1`; off by default).
 ///
-/// The structure builder does not run (see [`Builder`]: only with
-/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
-/// waves does not manage yet). The title's ray-traced passes run all the
+/// When the structure builder does not run (see [`Builder`]: with
+/// `VICTORY_BVH_BUILDER=0`, or not whole yet: its pipelines not all made)
+/// the title's ray-traced passes run all the
 /// same: 64 programs of its shader pack test rays against structure nodes
 /// (ray-traced shadows, screen probes, reflections, the irradiance cache;
 /// one of them, `CS_IrradianceCache_ShadowTrace_WithFar` f607780aa8e502d0,
@@ -439,18 +438,33 @@ fn builder_early() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER_EARLY").is_none_or(|v| v != "0"))
 }
 
-/// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`):
-/// without it the title's rays have nothing to trace.
+/// Whether the structure builder may run at all: without it the title's rays
+/// have nothing to trace. On by default since 2026-11-26 (bench rt-on,
+/// docs/fork-ray-tracing.md); `VICTORY_BVH_BUILDER=0` turns it off (and
+/// then the ray-tracing passes are best skipped, `scripts\rt_off_hashes.txt`).
 #[cfg(windows)]
 fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    *ALLOWED.get_or_init(|| victory_shader::bvh_builder_on())
+}
+
+/// Whether the builder has run whole (every one of its pipelines made), as
+/// far as is known now: asks for nothing to be made, so a caller on a
+/// recording thread never waits for the builder's pipelines (unlike
+/// [`builder_runs`], which makes them at the builder's first dispatch).
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    if !builder_allowed() {
+        return false;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole && b.off < b.pipelines.len() && crate::frame::current() >= b.rests
 }
 
 /// Whether a dispatch of the title's pipeline `this` is left out because it
 /// only serves rays that do not run: the program that tells the screen
 /// probes which rays to trace ([`crate::ambient::activates_rays`]), in a run
-/// whose rays cannot trace (no `VICTORY_BVH_BUILDER=1`).
+/// whose rays cannot trace (`VICTORY_BVH_BUILDER=0`).
 /// `VICTORY_ACTIVATE_RAYS=1` has it run.
 /// shortcut: left out. After Belobug 6986a57: once that program ran with no
 /// rays behind it, the whole picture lost light, shadows and reflections

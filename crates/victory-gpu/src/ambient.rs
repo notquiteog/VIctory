@@ -1,6 +1,6 @@
 //! A stand-in for the indirect light the title traces rays for.
 //!
-//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
+//! With the ray-tracing structure builder off (`crate::pipeline::builder_whole`)
 //! the title's rays find nothing. Its program that resolves the diffuse light
 //! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
 //! sky's light outdoors, nothing indoors (walls are black where no lamp or
@@ -236,9 +236,13 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether the stand-in is on: set, and the title's rays find nothing (the
+/// structure builder has not run whole: off, or its pipelines not all made
+/// yet). Asked at the dispatch of the probes' resolve: makes nothing there
+/// (`builder_whole`, not `builder_runs`), so a recording thread does not wait
+/// for the builder's pipelines.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && !crate::pipeline::builder_whole()
 }
 
 /// The most the air scatters, as a multiple of the light around

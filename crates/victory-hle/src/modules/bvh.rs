@@ -2,7 +2,7 @@
 //! (`XboxBvhBuilder.dll`, the title's own DLL, which still serves them): two
 //! are seen on the way, for `victory_gpu::bvhsize` (structures' compacted
 //! sizes given a bound before the card has them). With the structure builder
-//! on (`VICTORY_BVH_BUILDER=1`) and unless `VICTORY_BVH_SIZES_BOUND=0`, the
+//! on (unless `VICTORY_BVH_BUILDER=0`) and unless `VICTORY_BVH_SIZES_BOUND=0`, the
 //! main image's import slots of them are pointed here ([`wrap_imports`]).
 
 use std::ffi::c_void;

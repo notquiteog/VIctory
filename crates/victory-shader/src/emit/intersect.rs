@@ -44,7 +44,7 @@ thread_local! {
 
 /// Whether a node test answers "no hit" and reads nothing
 /// (`VICTORY_BVH_NO_HIT=1`; off by default; never with
-/// `VICTORY_BVH_BUILDER=1`, which has the structures built).
+/// the structure builder on, which has the structures built).
 ///
 /// The title's structure builder does not run in the layer unless asked
 /// for, and the title's ray-traced passes run all the same: each node test
@@ -63,7 +63,7 @@ fn no_hit() -> bool {
         return true;
     }
     std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
-        && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+        && !crate::bvh_builder_on()
 }
 
 /// Where the instruction's node is.
