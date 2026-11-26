@@ -831,6 +831,10 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// Nothing is stored: the asking (its number) of a structure's compacted
+    /// size into this slot has landed (`crate::bvhsize::landed`).
+    #[cfg(windows)]
+    SizeLanded(u32),
 }
 
 impl Written {
@@ -847,6 +851,11 @@ impl Written {
                 as_loaded(now, at as usize, gpu_load())
             }
             Written::SystemTimestamp => system_timestamp(),
+            #[cfg(windows)]
+            Written::SizeLanded(asking) => {
+                crate::bvhsize::landed(at as u64, asking);
+                return;
+            }
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);

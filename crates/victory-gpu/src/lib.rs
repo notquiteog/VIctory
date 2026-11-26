@@ -23,6 +23,8 @@ mod lightprobe;
 mod texlate;
 #[cfg(windows)]
 mod texstore;
+#[cfg(windows)]
+pub mod bvhsize;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
