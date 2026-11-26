@@ -1,7 +1,8 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -NoRayTracing without the title's own ray-traced light (on by default since 2026-11-26): the ambient stand-in instead
+# -RayTracing   (the default now; kept so older command lines still work)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -9,6 +10,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$NoRayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -23,7 +25,7 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($NoRayTracing) { $settings.VICTORY_BVH_BUILDER = '0' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

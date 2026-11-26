@@ -1,10 +1,48 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
-indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
-card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
-default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
-for next to nothing (below).
+Status, 2026-11-26: **the title's own ray tracing is on by default** (the
+structure builder runs unless `VICTORY_BVH_BUILDER=0`). See "On by default"
+below for what the picture shows and what it costs. Without it,
+**`VICTORY_AMBIENT=<share>`** puts an estimate of that light in its place for
+next to nothing (below); the stand-in is off by itself while the builder has
+run whole.
+
+Before (2026-11-25): with `VICTORY_BVH_BUILDER=1` rooms got their indirect
+light (runs light-10, light-11, n19), for some 40 ms more of the card's time a
+frame on the RX 7900 XTX (the dorm: 75 of 90 ms busy against 34 of 64).
+
+## On by default (2026-11-26, RTX card, Series S, render scale 0.5, walking)
+
+Runs rt-on1/on2 (builder on, nothing skipped) against rt-off1 (builder off,
+the 1034 pipelines of `rt_off_hashes.txt` skipped, `VICTORY_AMBIENT=0.8`),
+captures in `captures\rt-on1`, `rt-on2`, `rt-off1` (not in the repository):
+
+- The porch the opening stands on: off, under its roof everything is near
+  black (wall, blinds, rail, the ladder); on, the wall, the blinds and the rail
+  have their bounced light, the ladder is lit, and the sky has its clouds
+  (their passes are in the skip list). The street at the end of the walk:
+  the house front in shadow is dark in both, lighter with rays.
+- No black, NaN or pink pixels, no light leaking or over-bright reflections
+  seen. Blocks of grey tiles on the player and the rail in the first 100
+  frames after the world appears (rt-on2 frame 1300), gone after: the probes
+  settling while the first structures come. Rectangles in the water's
+  reflections are there in both runs (not the rays').
+- The log: the builder runs whole (53 pipelines) a few seconds after load,
+  no "rests", no "stays off". Shaders still touch 100-500 pages a frame that
+  have no copy (read as zero); most are refused (not committed title memory),
+  as before.
+- Time (frame medians, the bench's `GPU` mean): off 67-70 ms (GPU 2-5 ms);
+  on 89-101 ms (GPU 7-22 ms). The card stays far from the bottleneck: the
+  frame is the CPU's. Of the CPU's part the submitting thread had 18 ms a
+  frame more busy (profiles rt-pon1 against rt-poff1), 7 ms of it in the
+  kernel's write watch for the copies of memory by address (the directory
+  and the arenas, refreshed whole for every list that reads them): now
+  pushed as they are written (`VICTORY_BVH_PUSH`, below).
+
+What the skip list should become: nothing for ray tracing. `rt_off_hashes.txt`
+is for `VICTORY_BVH_BUILDER=0` only (scripts\play-nvidia.ps1 `-NoRayTracing`
+gives both); with the builder on it would drop the passes that use the
+structures it builds.
 
 ## What the title does
 
@@ -91,7 +129,8 @@ after it was given them as an unordered access view.
 
 | variable | does |
 |---|---|
-| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_BUILDER=0` | the builder's stages do not run (on by default since 2026-11-26); skip `rt_off_hashes.txt` with it |
+| `VICTORY_BVH_PUSH=0` | the directory and the arenas are refreshed whole, through the write watch, for every list that reads memory by address, as before (on: what this module writes there is pushed at once, the dwords that changed) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
@@ -208,7 +247,7 @@ fork's constant.
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 
-It is off while the builder runs.
+It is off while the builder has run whole (`builder_whole`: asked without making the builder's pipelines), so with the default it covers only the seconds before the builder's pipelines are all made; with `VICTORY_BVH_BUILDER=0` it is the light.
 
 ## Where to look
 

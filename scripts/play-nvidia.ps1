@@ -6,8 +6,10 @@
 # -Resolution    the height the world is drawn at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                Default: half the output (540 on Series S, 1080 on Series X). Series S at its full 1080 does not
 #                start (the title stops at a breakpoint of its own), so the most there is 720.
-# -RayTracing    keep the passes that turn ray misses into light (skipped by default: scripts\rt_off_hashes.txt;
-#                the skip list needs the diag build)
+# -NoRayTracing  without the title's own ray tracing (on by default since 2026-11-26, docs\fork-ray-tracing.md):
+#                the structure builder off (VICTORY_BVH_BUILDER=0), the passes that would trace skipped
+#                (scripts\rt_off_hashes.txt; the skip list needs the diag build), the ambient stand-in in their place
+# -RayTracing    (the default now; kept so older command lines still work)
 # -SmoothMotion  start a copy of the build named victory_sm.exe, so that a Smooth Motion profile you set for that
 #                name in the NVIDIA App applies (the driver's frame generation; nothing is downloaded)
 # -Adapter       on a PC with more than one card: part of its name or its index (VICTORY_D3D12_ADAPTER)
@@ -19,6 +21,7 @@ param(
     [switch]$SeriesX,
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [switch]$RayTracing,
+    [switch]$NoRayTracing,
     [switch]$SmoothMotion,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -37,10 +40,11 @@ $settings = @{
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }
-# The passes that turn the misses of rays into light, skipped: the structure builder is off, so every ray misses.
+# Without ray tracing: the structure builder off, so every ray would miss; the passes that trace are skipped.
 $rtList = Join-Path $PSScriptRoot 'rt_off_hashes.txt'
-if (-not $RayTracing -and $Build -eq 'diag' -and (Test-Path $rtList)) {
-    $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim()
+if ($NoRayTracing) {
+    $settings.VICTORY_BVH_BUILDER = '0'
+    if ($Build -eq 'diag' -and (Test-Path $rtList)) { $settings.VICTORY_SKIP_PIPELINES = (Get-Content $rtList -Raw).Trim() }
 }
 $outHeight = if ($SeriesX) { 2160 } else { 1080 }
 $console = if ($SeriesX) { 'X' } else { 'S' }
