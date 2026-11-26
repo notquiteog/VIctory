@@ -1653,11 +1653,11 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 /// How long a recording thread waits for dynamic slots to be given back before its table is
-/// refused (`VICTORY_SLOT_WAIT_US`, 2000 unless said; 0: not at all, as before).
+/// refused (`VICTORY_SLOT_WAIT_US`, 100000 unless said; 0: not at all, as before). A frame of the open world asks for some 200,000 of the 262,144 slots NVIDIA's million views leave, and they are held until its submission has run: the next frame's recording must go at the card's pace, or its draws go without tables (flicker).
 fn slot_wait() -> std::time::Duration {
     static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *WAIT.get_or_init(|| {
-        let us = std::env::var("VICTORY_SLOT_WAIT_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2000);
+        let us = std::env::var("VICTORY_SLOT_WAIT_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(100_000);
         std::time::Duration::from_micros(us)
     })
 }
@@ -1668,7 +1668,7 @@ thread_local! {
 }
 
 fn gave_up_lately() -> bool {
-    GAVE_UP.with(|g| g.get().is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(50)))
+    GAVE_UP.with(|g| g.get().is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(100)))
 }
 
 fn gave_up_now() {
