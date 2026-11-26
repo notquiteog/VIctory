@@ -458,14 +458,167 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
-/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
-/// of them is a branch whose wave-wide meaning is not known ([`Structured::wave_any`]).
-pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+/// ([`crate::structure::structure_wide`]) so that every lane runs those blocks; and the
+/// branches that leave the loops holding one, because two host waves keep a barrier only if
+/// they leave those loops together. None if one of them is a branch whose wave-wide meaning
+/// is not known ([`Structured::wave_any`]).
+pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<(Vec<usize>, bool)> {
     let mut out = Vec::new();
     for (d, region) in lane_regions(st)? {
         if needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)) {
             st.wave_any.get(d).copied().flatten()?;
             out.push(d);
+        }
+    }
+    // A branch that leaves a loop holding a need: where its test is scalar (`wave_any`
+    // None) both host waves already take it the same way, so nothing is needed; where it is
+    // a lane's own bits (`Some`), the wave-wide form is what keeps the halves leaving
+    // together, and it is added to be widened.
+    let mut unsafe_loop = false;
+    for d in loop_exits_around(st, needs)? {
+        match st.wave_any.get(d).copied().flatten() {
+            None => {}
+            Some(_) => {
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    Some((out, unsafe_loop))
+}
+
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether a block lies in a loop, whether every branch
+/// that leaves that loop is taken wave-wide, and whether their wave-wide meaning is known.
+fn barrier_loop_state(st: &Structured, b: usize) -> (bool, bool, bool) {
+    let n = st.exits.len();
+    if b >= n {
+        return (false, true, true);
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    let (mut in_loop, mut exits_wide, mut exits_known) = (false, true, true);
+    for t in 0..n {
+        if t == b || !same(t) {
+            continue;
+        }
+        in_loop = true;
+        let leaves = succ(t).into_iter().any(|u| u < n && !same(u));
+        if leaves {
+            if !st.wide.contains(&t) {
+                exits_wide = false;
+            }
+            if st.wave_any.get(t).copied().flatten().is_none() {
+                exits_known = false;
+            }
+        }
+    }
+    (in_loop, exits_wide, exits_known)
+}
+
+/// Diagnostics (`VICTORY_WAVE_WHY`): whether the loop holding `b` is entered under a branch
+/// that is taken wave-wide (every block outside it that jumps into it).
+fn loop_entry_wide(st: &Structured, b: usize) -> bool {
+    let n = st.exits.len();
+    if b >= n {
+        return true;
+    }
+    let succ = |x: usize| -> Vec<usize> {
+        match st.exits[x] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for x in 0..n {
+        let mut stack = succ(x);
+        reach[x][x] = true;
+        while let Some(t) = stack.pop() {
+            if t >= n || reach[x][t] {
+                continue;
+            }
+            reach[x][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let same = |t: usize| t < n && reach[t][b] && reach[b][t];
+    for from in 0..n {
+        for to in succ(from) {
+            if to < n && same(to) && !same(from) && !st.wide.contains(&from) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The branches (by block) that leave the loops holding a block of `needs`, in the order
+/// found: the blocks that are in the same cycle as one of them and have an edge out of it.
+///
+/// A console wave runs its lanes in step, so a loop's lanes leave it together however their
+/// tests differ. Two host waves keep that only where the test that leaves the loop is the
+/// wave's own ([`crate::structure::structure_wide`]); a barrier inside a loop whose halves
+/// leave on different iterations waits for threads that are not there, which is what lost
+/// the card when `VICTORY_WAVE_WIDE=1` was turned on (`devices removed` after 21-253 frames,
+/// measured 2026-11-26). None with an indirect exit (not followed).
+fn loop_exits_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    let n = st.exits.len();
+    if needs.iter().all(|&b| b >= n) {
+        return Some(Vec::new());
+    }
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End => Vec::new(),
+            LaneExit::Indirect => Vec::new(),
+        }
+    };
+    if st.exits.iter().any(|e| matches!(e, LaneExit::Indirect)) {
+        return None;
+    }
+    // Who reaches whom: a block is in the same cycle as another when each reaches the other.
+    let mut reach: Vec<Vec<bool>> = vec![vec![false; n]; n];
+    for b in 0..n {
+        let mut stack = succ(b);
+        reach[b][b] = true;
+        while let Some(t) = stack.pop() {
+            if reach[b][t] {
+                continue;
+            }
+            reach[b][t] = true;
+            stack.extend(succ(t));
+        }
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for &need in needs.iter().filter(|&&b| b < n) {
+        for b in 0..n {
+            if b == need || !reach[b][need] || !reach[need][b] {
+                continue;
+            }
+            let leaves = succ(b).into_iter().any(|t| t < n && !(reach[t][need] && reach[need][t]));
+            if leaves && !out.contains(&b) {
+                out.push(b);
+            }
         }
     }
     Some(out)
@@ -4564,6 +4717,23 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        if !self.all_lanes(block) {
+            // A group barrier is run by every thread of the group or the group hangs. Where
+            // the block holding this one is a block not every lane runs, the widening has to
+            // take the branches around it wave-wide (`need`), and the program is refused if
+            // that cannot be done - which is what `widen` decides from these needs.
+            need(block);
+        }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let st = self.x.st;
+            let (in_loop, exits_wide, exits_known) = barrier_loop_state(st, block);
+            let entries = loop_entry_wide(st, block);
+            eprintln!(
+                "BARRIER block={block} all_lanes={} in_loop={in_loop} exits_wide={exits_wide} exits_known={exits_known} entry_wide={entries} wide_block={}",
+                self.all_lanes(block),
+                st.wide.contains(&block)
+            );
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4764,14 +4934,45 @@ impl<'a> Lower<'a> {
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(c, some);
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+        let mut both = self.s.m.bin(c, Bin::Or, lo, hi);
+        // A thread group of several console waves: each of them wrote its own pair of dwords
+        // into this program's exchange slots (`exchange_pair`: `slot + 2 * (thread >> 6)`), and
+        // the barrier at the end of `exchange_halves` has every one of them in place. ORing the
+        // other waves' pairs in makes the decision the whole group's, so the branch is taken by
+        // every thread and the barriers inside it are reached by all of them - which is what a
+        // group of several console waves needs to be widened at all (`widen`).
+        let slot = self.exchange.as_ref().map(|(s, _, _)| *s);
+        if let Some(slot) = slot {
+            let waves = match &self.x.native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>().div_ceil(64),
+                _ => 1,
+            };
+            if waves > 1 {
+                let lds = self.s.lds();
+                for w in 0..waves {
+                    let a = self.s.m.i32(slot + 2 * w);
+                    let b = self.s.m.i32(slot + 2 * w + 1);
+                    let pa = self.s.m.element(c, lds, a);
+                    let pb = self.s.m.element(c, lds, b);
+                    let va = self.s.m.load(c, pa);
+                    let vb = self.s.m.load(c, pb);
+                    let pair = self.s.m.bin(c, Bin::Or, va, vb);
+                    both = self.s.m.bin(c, Bin::Or, both, pair);
+                }
+            }
+        }
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
     fn all_lanes(&self, b: usize) -> bool {
-        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+        // A block index the structure does not know is not a block some lanes leave out:
+        // `false` here said "not every lane runs it" about blocks the analysis never saw, and
+        // the widening was then asked for branches around a block no region holds
+        // ("WAVE64-WIDE stopped ... a branch around it cannot be", measured on
+        // water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly 2026-11-26).
+        self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(true))
     }
 
     /// Whether every wave in the threadgroup runs IR block `b` (always true without `group_wide`).

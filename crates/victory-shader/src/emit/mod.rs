@@ -789,17 +789,10 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs)
-            if {
-                let g = cs.threads.iter().product::<u32>();
-                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
-            } => {}
-        crate::native::StageIo::Cs(cs) => {
-            if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
-            }
-            return Err(NOT);
-        }
+        // Any group of console waves: a wave-wide decision covers the whole group now
+        // (`Lower::wave_wide` ORs every console wave's exchange pair), so the branches taken
+        // this way are entered by every thread and the barriers inside them are reached.
+        crate::native::StageIo::Cs(_) => {}
         _ => return Err(NOT),
     }
     let mut wide = std::collections::HashSet::new();
@@ -814,23 +807,39 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || r.is_ok() && !needs.is_empty();
         if !stuck {
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| !wide.contains(b))
-            .collect();
+        let Some((around, unsafe_loop)) = lower::branches_around(&st, &needs) else {
+            // Not followed (an indirect exit): emitting the program as it stands could put a
+            // barrier where one of the two host waves never comes.
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        };
+        if unsafe_loop {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier in a loop the two host waves cannot leave together",
+            });
+        }
+        let more: Vec<usize> = around.into_iter().filter(|b| !wide.contains(b)).collect();
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
-            return r;
+            // Nothing is left to widen and a barrier still stands where not every lane runs:
+            // the program is refused rather than emitted, because such a barrier hangs the
+            // group (0x887A0006, measured 2026-11-26).
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a barrier where not every lane runs, and no branch left to widen",
+            });
         }
         wide.extend(more);
     }
