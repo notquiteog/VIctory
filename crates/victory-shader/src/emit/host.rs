@@ -1144,6 +1144,11 @@ fn transition(
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
 pub enum View<'a> {
+    /// A slot nothing is written to (a sparse heap).
+    Unused,
+    /// The null 2-D texture view the runtime keeps at the end of its view
+    /// heaps (`victory-gpu`'s `null_view`).
+    NullTexture2D,
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
@@ -1321,6 +1326,18 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
+                    View::Unused => {}
+                    View::NullTexture2D => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+                    }
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),

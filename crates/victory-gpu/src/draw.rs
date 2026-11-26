@@ -1264,6 +1264,15 @@ impl State {
         if kind == victory_shader::emit::USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_TITLE_VIEW_COUNT {
+            // The title slots the bound view heap has host slots for: the
+            // host's own start there (`HostHeap::count`). Every index where
+            // that cannot be told, as before the bound.
+            return (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                .flatten()
+                .map_or(u32::MAX, crate::descriptor::host::HostHeap::count);
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,

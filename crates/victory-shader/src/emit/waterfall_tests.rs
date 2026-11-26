@@ -436,3 +436,123 @@ fn immediate_sampler_chosen_by_control_flow() {
         }
     }
 }
+
+/// The bound of views picked by a title index (`VICTORY_TITLE_VIEW_BOUND`,
+/// `Shader::title_view_index`), on a heap laid out as a capped host's: the
+/// title's last slot and the host's first dynamic slot next to it hold
+/// different textures (red 1 and red 2), the null slot at the end a null
+/// 2-D view. The index of the title's last slot reads its texture; the
+/// next index reads null (0) while the title keeps 393,215 slots, and the
+/// texture there once the title's count reaches past it (737,855, the
+/// split before); unbounded it reads the dynamic slot's texture whatever
+/// the count. (After Artking175's test in notquiteog/victory-nvidia#1.)
+#[test]
+fn a_title_index_past_the_titles_slots_reads_the_null_slot() {
+    use super::{
+        UserData,
+        bitcode::{Attr, Cast, Term},
+        shader::{Shader, USER_TITLE_VIEW_COUNT},
+    };
+    const FIRST_DYNAMIC: u32 = 393_215;
+    const OLD_TITLE_COUNT: u32 = 737_855;
+    const NULL: u32 = 999_999;
+    let mut s = Shader::new(false);
+    s.threads = Some([1, 1, 1]);
+    s.user_data = 3;
+    let b = s.entry;
+    let constants = s.user_data_handle();
+    let zero = s.m.i32(0);
+    let row = s.op(b, "cbufferLoadLegacy.i32", Attr::ReadOnly, s.t.cbuf_ret, 59, &[constants, zero]);
+    let last_title = s.m.extract(b, row, 0);
+    let first_dynamic = s.m.extract(b, row, 1);
+    let title_count = s.m.extract(b, row, 2);
+    let last_title = s.title_view_index(b, last_title, title_count, NULL);
+    let beyond_title = s.title_view_index(b, first_dynamic, title_count, NULL);
+    // The raw buffer in slot 0 takes the three reds.
+    let output = s.heap_handle(b, zero, false, false, (0x100b, 0));
+    let undef = s.m.undef(s.t.i32);
+    let align = s.m.i32(4);
+    let mask = s.m.i8(1);
+    for (i, index) in [last_title, beyond_title, first_dynamic].into_iter().enumerate() {
+        let texture = s.heap_handle(b, index, false, false, (2, 0x409));
+        let texel = s.op(
+            b,
+            "textureLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            66,
+            &[texture, zero, zero, zero, undef, undef, undef, undef],
+        );
+        let red = s.m.extract(b, texel, 0);
+        let byte = s.m.i32(4 * i as u32);
+        let value = s.m.cast(b, Cast::Bitcast, red, s.t.i32);
+        s.op(
+            b,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[output, byte, undef, value, undef, undef, undef, mask, align],
+        );
+    }
+    s.m.terminate(b, Term::Ret);
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: s.finish(),
+        user_data: (0..3)
+            .map(|index| UserData {
+                index,
+                slot: 0,
+                dword: index,
+                root: if index == 2 { RootType::Other(USER_TITLE_VIEW_COUNT) } else { RootType::Constants },
+            })
+            .collect(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let last = [[1.0, 0.0, 0.0, 1.0]];
+    let first = [[2.0, 0.0, 0.0, 1.0]];
+    let mut views: Vec<_> = (0..=NULL).map(|_| View::Unused).collect();
+    views[0] = View::RawUav(3);
+    views[(FIRST_DYNAMIC - 1) as usize] = View::Texture(1, 1, &last);
+    views[FIRST_DYNAMIC as usize] = View::Texture(1, 1, &first);
+    views[NULL as usize] = View::NullTexture2D;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("boundary pipeline");
+        for (count, red) in [(FIRST_DYNAMIC, 0.0f32), (OLD_TITLE_COUNT, 2.0)] {
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![FIRST_DYNAMIC - 1, FIRST_DYNAMIC, count, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("boundary dispatch");
+            assert_eq!(
+                words[0],
+                [1.0f32.to_bits(), red.to_bits(), 2.0f32.to_bits()],
+                "{label}: the title keeps {count} slots"
+            );
+        }
+        eprintln!("{label}: the bound holds for both counts");
+    }
+}

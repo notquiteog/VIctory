@@ -1620,6 +1620,53 @@ thread_local! {
     pub(super) static TEST_TICKET: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
+/// Which views a program picks by a title index it computes (a view heap
+/// among its root parameters) are kept to the title slots the host heap
+/// has: an index at or past them reads the null slot at the heap's end, not
+/// one of the host's own slots that follow the title's (tables made afresh
+/// for draws; on a host that caps its heap they stand where the title's
+/// upper slots would). `VICTORY_TITLE_VIEW_BOUND`:
+/// - unset or `1`: every view (the null slot holds a null 2-D texture view,
+///   which is what a view index past the heap reads through a view of any
+///   kind already, `Shader::heap_handle`);
+/// - `2`: views read as 2-D textures of floats only, the kind the null
+///   slot's descriptor is (notquiteog/victory-nvidia#1's choice);
+/// - `0`: none, as before.
+///
+/// Part of the translation (the fingerprint and `victory-gpu`'s cache key
+/// read the switch).
+pub(super) fn title_view_bound() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_TITLE_BOUND.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_TITLE_VIEW_BOUND").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("2") => 2,
+        _ => 1,
+    })
+}
+
+/// [`title_view_bound`] for a view read with these DXIL resource
+/// properties (`sampler`: a sampler, which the bound is not for).
+fn title_view_bound_of(sampler: bool, props: (u32, u32)) -> bool {
+    // A 2-D texture of four floats.
+    const FLOAT_2D: (u32, u32) = (2, 0x409);
+    !sampler
+        && match title_view_bound() {
+            0 => false,
+            2 => props == FLOAT_2D,
+            _ => true,
+        }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`title_view_bound`], for its thread only.
+    pub(super) static TEST_TITLE_BOUND: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
 /// What [`set_host_max_wave`] was told (0: nothing).
 pub fn host_max_wave() -> u32 {
     #[cfg(test)]
@@ -8271,7 +8318,8 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let protect = title_view_bound_of(sampler, props);
+                let index = self.heap_index(*load, *first, sampler, protect)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
@@ -8324,7 +8372,8 @@ impl<'a> Lower<'a> {
             }
             Source::Phi { block, args } => {
                 let _ = site;
-                let phi = self.descriptor_phi(*block, args, sampler, 8)?;
+                let protect = title_view_bound_of(sampler, props);
+                let phi = self.descriptor_phi(*block, args, sampler, protect, 8)?;
                 let (index, bounded) = self.raw_twin(src, phi, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
@@ -8341,8 +8390,9 @@ impl<'a> Lower<'a> {
                     Val::Bit(x) => x,
                     _ => return Err("SCC without a value"),
                 };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
+                let protect = title_view_bound_of(sampler, props);
+                let set = self.heap_index(a, fa, sampler, protect)?;
+                let clear = self.heap_index(b, fb, sampler, protect)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
@@ -8351,7 +8401,8 @@ impl<'a> Lower<'a> {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
-                let index = self.lane_heap_index(src, sampler)?;
+                let protect = title_view_bound_of(sampler, props);
+                let index = self.lane_heap_index(src, sampler, protect)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
             }
@@ -8408,6 +8459,7 @@ impl<'a> Lower<'a> {
         block: usize,
         args: &[Source],
         sampler: bool,
+        protect: bool,
         depth: u32,
     ) -> Result<V, Why> {
         const WHY: Why = "a descriptor chosen by control flow";
@@ -8422,12 +8474,12 @@ impl<'a> Lower<'a> {
             let index = match arg {
                 Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
+                    let index = self.heap_index(*load, *first, sampler, protect);
                     self.cur = here;
                     index?
                 }
                 Source::Phi { block: inner, args: inner_args } if depth > 0 => {
-                    self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
+                    self.descriptor_phi(*inner, inner_args, sampler, protect, depth - 1)?
                 }
                 _ => return Err(WHY),
             };
@@ -8612,7 +8664,7 @@ impl<'a> Lower<'a> {
             return Ok(Some(v));
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let slot = self.heap_index(*load, *first, false, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -8642,10 +8694,10 @@ impl<'a> Lower<'a> {
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
-    fn lane_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+    fn lane_heap_index(&mut self, src: &Source, sampler: bool, protect: bool) -> Result<V, Why> {
         match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler, protect),
+            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler, protect),
             Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
                 let [a, b] = &args[..] else {
                     return Err("a descriptor chosen per lane");
@@ -8664,8 +8716,8 @@ impl<'a> Lower<'a> {
                         _ => return Err("SCC without a value"),
                     }
                 };
-                let set = self.lane_heap_index(a, sampler)?;
-                let clear = self.lane_heap_index(b, sampler)?;
+                let set = self.lane_heap_index(a, sampler, protect)?;
+                let clear = self.lane_heap_index(b, sampler, protect)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
             Source::LanePhi { block, args } => {
@@ -8686,7 +8738,7 @@ impl<'a> Lower<'a> {
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
-                            let index = self.lane_heap_index(arg, sampler);
+                            let index = self.lane_heap_index(arg, sampler, protect);
                             self.cur = here;
                             index?
                         }
@@ -8705,16 +8757,16 @@ impl<'a> Lower<'a> {
     /// The heap index of the descriptor at dword `first` of what the global
     /// load at `load` reads, in each lane: its address (base plus offsets)
     /// over the descriptor size.
-    fn fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+    fn fetched_index(&mut self, load: Site, first: u8, sampler: bool, protect: bool) -> Result<V, Why> {
         const WHY: Why = "a per-lane descriptor load";
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(root @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => root,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -8741,20 +8793,21 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.bound_title_view(root, index, protect))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
     /// load at `load` reads, computed in the current block.
-    fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+    fn heap_index(&mut self, load: Site, first: u8, sampler: bool, protect: bool) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
-            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+        let root = match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(root @ (RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap)) => root,
             _ => return Err("a descriptor outside the heaps"),
-        }
+        };
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
             base,
@@ -8781,7 +8834,23 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.bound_title_view(root, index, protect))
+    }
+
+    /// `index`, a view index made from the view heap's own base (root type
+    /// `ResourceHeap`: the title's slot number, which its program computed),
+    /// kept to the title slots the bound heap has host slots for
+    /// ([`super::shader::Shader::title_view_index`]) where `protect` asks.
+    /// A table's index (root type `Table`) is the host's: where the host
+    /// made the table, among its own slots or the title's.
+    fn bound_title_view(&mut self, root: RootType, index: V, protect: bool) -> V {
+        let null = super::shader::view_heap_limit();
+        if root != RootType::ResourceHeap || !protect || null == 0 {
+            return index;
+        }
+        let count = self.host_word(RootType::Other(super::shader::USER_TITLE_VIEW_COUNT), 0, 0);
+        self.s.title_view_index(self.cur, index, count, null)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
