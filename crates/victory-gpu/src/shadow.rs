@@ -5339,6 +5339,16 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
+/// The count of copies in [`EXACT`] at which the idle ones are next looked for.
+static EXACT_SWEEP_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Buffers of copies let go ([`exact`]), for the next of the same width:
+/// width, buffer, and where it is mapped. Locked inside [`EXACT`]'s lock.
+static EXACT_SPARE: Mutex<Vec<(u64, ID3D12Resource, usize)>> = Mutex::new(Vec::new());
+
+/// The most spare buffers kept (64 KiB each, mostly).
+const SPARE_MOST: usize = 2048;
+
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -5378,14 +5388,38 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    // The idle ones are looked for once the map has grown by a quarter since
+    // the last look, not at every copy made: on a heap without raw twins
+    // (NVIDIA's million views) thousands of copies are held by lists and
+    // slots at once and a thousand are made a frame, and a walk of all of
+    // them at each one was most of a frame's recording (5 to 45 us a list
+    // call).
+    if map.len() >= EXACT_SWEEP_AT.load(Ordering::Relaxed).max(MANY) {
+        let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
         // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
+        // slot shows it), and not asked for lately. Its buffer is kept for
+        // the next copy of that size: making one is a committed resource.
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            let stays =
+                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+            if !stays && spare.len() < SPARE_MOST && shadow.card.is_none() && shadow.place.is_none() && !shadow.mapped {
+                spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
+            }
+            stays
         });
+        EXACT_SWEEP_AT.store(map.len() + map.len() / 4 + MANY, Ordering::Relaxed);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // A buffer takes 64 KiB of memory at the least: asked for whole, so that
+    // the spare ones fit most askings.
+    let width = len.next_multiple_of(64 << 10);
+    let taken = {
+        let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.iter().rposition(|(w, ..)| *w == width).map(|i| spare.swap_remove(i))
+    };
+    let (buffer, data) = match taken {
+        Some((_, buffer, data)) => (buffer, data as *mut u8),
+        None => host()?.shared_buffer(width)?,
+    };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
