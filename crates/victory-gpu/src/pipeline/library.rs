@@ -788,10 +788,22 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // The library is about 1.7 GB on NVIDIA (each pipeline's machine code):
+    // an allocation of that size that cannot fail aborted the whole process
+    // ("memory allocation of 2650101862 bytes failed", RTX 4050 Laptop).
+    // Refused, the save waits for a later one and the pipelines stay added.
+    let mut bytes = zeroed(size).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
+}
+
+/// `n` zero bytes, or `None` when the host has no memory for them.
+fn zeroed(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
 }
 
 /// Renames the written library `tmp` over the library's file in `dir`. This
@@ -908,6 +920,13 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A size the host cannot give is refused, not fatal; others are zeros.
+    #[test]
+    fn a_save_buffer_the_host_cannot_give_is_refused() {
+        assert!(zeroed(usize::MAX / 2).is_none());
+        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
