@@ -305,7 +305,7 @@ fn with<T>(f: impl FnOnce(&mut State) -> T) -> T {
 pub fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+        victory_shader::bvh_builder_on()
             && std::env::var_os("VICTORY_BVH_SIZES_BOUND").is_none_or(|v| v != "0")
     })
 }

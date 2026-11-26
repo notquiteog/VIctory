@@ -352,7 +352,20 @@ fn builder_early() -> bool {
 #[cfg(windows)]
 fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+    *ALLOWED.get_or_init(victory_shader::bvh_builder_on)
+}
+
+/// Whether the builder has run whole (every one of its pipelines made), as
+/// far as is known now: asks for nothing to be made, so a caller on a
+/// recording thread never waits for the builder's pipelines (unlike
+/// [`builder_runs`], which makes them at the builder's first dispatch).
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    if !builder_allowed() {
+        return false;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    b.whole && b.off < b.pipelines.len() && crate::frame::current() >= b.rests
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see

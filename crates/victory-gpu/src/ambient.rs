@@ -1,6 +1,6 @@
 //! A stand-in for the indirect light the title traces rays for.
 //!
-//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
+//! With the ray-tracing structure builder off (`crate::pipeline::builder_whole`)
 //! the title's rays find nothing. Its program that resolves the diffuse light
 //! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
 //! sky's light outdoors, nothing indoors (walls are black where no lamp or
@@ -132,10 +132,14 @@ fn parse_band(set: &str) -> Option<Band> {
     Some(Band { least, most, level })
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing (or
-/// the band is asked for with them).
+/// Whether the stand-in is on: set, and the title's rays find nothing (the
+/// structure builder has not run whole: off, or its pipelines not all made
+/// yet), or the band is asked for with them. Asked at the dispatch of the
+/// probes' resolve: makes nothing there (`builder_whole`, not
+/// `builder_runs`), so a recording thread does not wait for the builder's
+/// pipelines.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_whole())
 }
 
 /// The title's leftover light is kept between these multiples of the
@@ -143,7 +147,7 @@ pub(crate) fn on() -> bool {
 /// most four times it.
 fn bounds() -> (f32, f32) {
     match rt_band() {
-        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        Some(b) if crate::pipeline::builder_whole() => (b.least, b.most),
         _ => (1.0, 4.0),
     }
 }

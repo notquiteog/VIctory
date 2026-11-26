@@ -34,6 +34,33 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// Whether the title's ray-tracing structure builder runs, so that its rays
+/// have structures to trace: only with `VICTORY_BVH_BUILDER=1` (off by
+/// default). Read once; every crate that asks goes through here, so they
+/// cannot disagree.
+pub fn bvh_builder_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| builder_setting(std::env::var_os("VICTORY_BVH_BUILDER").as_deref()))
+}
+
+/// [`bvh_builder_on`] for a value of the setting.
+fn builder_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+mod builder_setting_tests {
+    use super::builder_setting;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_builder_is_off_unless_asked_for() {
+        assert!(!builder_setting(None));
+        assert!(builder_setting(Some(OsStr::new("1"))));
+        assert!(!builder_setting(Some(OsStr::new("0"))));
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]
