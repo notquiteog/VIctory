@@ -9358,7 +9358,19 @@ impl<'a> Lower<'a> {
                 };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
-                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    // The console reads f32 denormals as zeros of their
+                    // sign. DXIL floor/ceil/fract need not do that: vkd3d on
+                    // NVIDIA keeps them (no FP32 denorm flush capability),
+                    // so flush on the bits first, as for max/min and the
+                    // floor conversions.
+                    22 => {
+                        let flushed = self.ftz(a);
+                        self.fract(flushed, 1.0, f32::from_bits(0x3F7F_FFFF))
+                    }
+                    27 | 28 => {
+                        let flushed = self.ftz(a);
+                        self.unary(op, flushed)
+                    }
                     _ => self.unary(op, a),
                 };
                 float(self, r)
