@@ -1037,6 +1037,10 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // NVIDIA's compiler refuses an atomic subtraction on group memory
+        // (`victory_shader`'s `VICTORY_ATOMIC_SUB_LOOP`): told here, with the
+        // other host facts, before anything is translated or a cache keyed.
+        victory_shader::emit::set_host_nvidia(crate::indirect::nvidia(&device));
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_7,
         };
@@ -1066,6 +1070,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            VENDOR.store(desc.VendorId, Ordering::Relaxed);
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
                 adapter = name.trim_end_matches('\0'),
@@ -1950,6 +1955,15 @@ static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 fn card_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
+}
+
+/// The host adapter's vendor as PCI numbers it (0x10de NVIDIA, 0x1002 AMD,
+/// 0x8086 Intel); 0 until the device is made, or if it could not be asked.
+static VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// [`VENDOR`].
+pub(crate) fn vendor() -> u32 {
+    VENDOR.load(Ordering::Relaxed)
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -3937,6 +3951,7 @@ mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
+pub(crate) mod truestamp;
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
@@ -4549,6 +4564,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let began = truestamp::mark(list);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4622,6 +4638,7 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    truestamp::marked(0, began, truestamp::mark(list));
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4704,6 +4721,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let began = truestamp::mark(list);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4728,6 +4746,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    truestamp::marked(1, began, truestamp::mark(list));
                     list.Close()?;
                     list.cast()
                 })()
@@ -6477,7 +6496,9 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                // (All of a slow command's note: what it binds is at its end.)
+                let ms = ticks as f64 * 1e3 / frequency.max(1) as f64;
+                (ms, notes[i].0.chars().take(if ms >= 5.0 { 6000 } else { 300 }).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -8992,6 +9013,7 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
+        truestamp::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
@@ -9062,13 +9084,13 @@ impl Meter {
             );
             crate::tiles::status();
             {
-                let [queued, due, away, partly, oldest] =
-                    [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                let [queued, due, away, partly, oldest, looked_again] =
+                    [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
-                     {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
+                     {away} waiting for their memory, {looked_again} uploaded whole and to be looked at again, {partly} uploaded in part; since the start: {} slots found uploaded already by \
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
@@ -9083,6 +9105,23 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                let w = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| crate::draw::HEAP_TEXTURES_WAITED[i].swap(0, Ordering::Relaxed));
+                if w[0] + w[3] + w[6] > 0 {
+                    tracing::info!(
+                        "textures picked by index, since the line before: {} uploads recorded {:.0} ms after their view was written \
+                         (the longest {} ms), {} uploads {:.0} ms after memory was mapped or written under their view (the longest {} ms), \
+                         {} uploads {:.0} ms after the runtime had written their memory (the longest {} ms)",
+                        w[0],
+                        w[1] as f64 / w[0].max(1) as f64,
+                        w[2],
+                        w[3],
+                        w[4] as f64 / w[3].max(1) as f64,
+                        w[5],
+                        w[6],
+                        w[7] as f64 / w[6].max(1) as f64,
+                        w[8]
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
@@ -9251,7 +9290,21 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
+    #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_over(texture, state, None, frame)
+    }
+
+    /// (Port of fxceless #1189): [`Self::present`], with a second
+    /// plane laid over `texture` if there is one (`crate::compose`): its
+    /// texture and its state, which it is left in.
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -9344,7 +9397,13 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            // LOCAL (port of fxceless #1189): the second plane laid over the
+            // first, into a texture of ours shown instead (`crate::compose`).
+            let laid = over.and_then(|(ui, ui_state)| crate::compose::record(&self.device, list, texture, ui, ui_state));
+            if let Some(laid) = &laid {
+                copy.keep(laid);
+            }
+            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

@@ -619,6 +619,11 @@ fn runs_most() -> usize {
 /// (`VICTORY_SUBMIT_FRAMES`; 1: the frame before is sent, this one may not be;
 /// 0: both are).
 fn frames_most() -> usize {
+    // Diagnostics: 2 and 1 in turn while the title runs (`crate::ab`).
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SUBMIT_FRAMES") {
+        return if on { 2 } else { 1 };
+    }
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
 }
