@@ -65,6 +65,8 @@ mod inplace;
 #[cfg(feature = "diagnostics")]
 mod heapstat;
 #[cfg(windows)]
+mod port_cbv;
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;
