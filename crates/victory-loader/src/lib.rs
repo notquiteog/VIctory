@@ -26,6 +26,9 @@ mod console_insn;
 mod crash;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod patch;
+// Title patches (trustno1-coder/VIctory-NVIDIA afd84de12): VICTORY_RENDER_SCALE / VICTORY_OWN_UPSCALER / VICTORY_NO_WATCHDOG title patches.
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
