@@ -30,6 +30,9 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! `VICTORY_AMBIENT_MIN=<level>` sets a floor for the estimate so dark
+//! rooms without direct light do not go pitch black.
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
@@ -85,7 +88,12 @@ enum Set {
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
-    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let number = |t: &str| {
+        t.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
@@ -108,7 +116,11 @@ fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+        set.trim()
+            .parse()
+            .ok()
+            .filter(|v: &f32| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0)
     })
 }
 
@@ -127,6 +139,21 @@ fn shade() -> [f32; 2] {
     })
 }
 
+/// Minimum indirect light for the estimate (`VICTORY_AMBIENT_MIN=<level>`;
+/// unset or 0: no floor).
+fn least() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_min(&std::env::var("VICTORY_AMBIENT_MIN").unwrap_or_default()))
+}
+
+fn parse_min(set: &str) -> f32 {
+    set.trim()
+        .parse()
+        .ok()
+        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
@@ -137,7 +164,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -241,7 +268,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap = max(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), air * least);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -320,6 +347,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (least > 0.0) {
+        found = max(found, float3(1.0, 0.98, 0.94) * least * open);
+    }
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -352,7 +382,10 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
+fn make(
+    device: &ID3D12Device,
+    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
+) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
@@ -363,7 +396,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
                 ..Default::default()
             };
             device.CreateComputePipelineState(&desc)
@@ -401,7 +437,10 @@ fn pass() -> Option<&'static Pass> {
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        ..Default::default()
+    };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
@@ -461,6 +500,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = least().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -484,13 +524,23 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Air => run(
+                &pass.air,
+                views.size[0].div_ceil(8),
+                views.size[1].div_ceil(8),
+                views.slices.div_ceil(2),
+            ),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                run(
+                    &pass.raise,
+                    views.size[0].div_ceil(8),
+                    views.size[1].div_ceil(8),
+                    1,
+                );
             }
         }
     }
@@ -512,10 +562,27 @@ mod tests {
     }
 
     #[test]
+    fn minimum_floor() {
+        assert_eq!(parse_min(""), 0.0);
+        assert_eq!(parse_min("-1"), 0.0);
+        assert_eq!(parse_min("nan"), 0.0);
+        assert_eq!(parse_min("0.08"), 0.08);
+    }
+
+    #[test]
     fn roles_by_name() {
-        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
-        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
-        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(
+            role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."),
+            Some(Role::Resolve)
+        );
+        assert_eq!(
+            role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."),
+            Some(Role::Radiance)
+        );
+        assert_eq!(
+            role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"),
+            Some(Role::Air)
+        );
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
