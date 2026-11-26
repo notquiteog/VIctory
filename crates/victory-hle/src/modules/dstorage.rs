@@ -895,23 +895,34 @@ impl Lanes {
 
     /// Starts the next read of the class with the least virtual time, from
     /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// has room for it (or nothing else holds any). While it has none, the
+    /// next read that holds no staging runs instead, in the same order
+    /// (Marvisak/VIctory#1457): the one turned down keeps its place, and
+    /// what is staged only drains until it fits.
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        // The first read of each lane, least first: by its class's virtual
+        // time, then the lane's bytes started; `raw`: of those that hold no
+        // staging only.
+        let next = |raw: bool| {
+            self.lanes
+                .iter()
+                .filter_map(|(&id, lane)| {
+                    let (seq, read) = lane.reads.front()?;
+                    let staging = staging_bytes(&read.request);
+                    (!raw || staging == 0).then_some((self.clock[lane.class], lane.class, lane.clock, *seq, id, staging))
+                })
+                .min()
+        };
+        let first = next(false)?;
+        let (_, class, _, _, id, staging) = if first.5 != 0 && self.staged > 0 && self.staged + first.5 > self.staging {
             self.starved = true;
             self.refused += 1;
-            return None;
-        }
-        lane.reads.pop_front();
+            next(true)?
+        } else {
+            first
+        };
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, Read { request, note }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
