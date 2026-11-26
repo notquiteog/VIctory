@@ -217,8 +217,11 @@ enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
-    /// A copy that its list does on the card ([`place`]).
-    Placed { dst: usize, src: usize, len: usize },
+    /// A copy that its list does on the card ([`place`]). `asked`: it waits
+    /// for flights ([`place::Waits`]): it takes its source on the CPU and
+    /// they may write it, or another step reads on the CPU what it copies
+    /// to or from while they may write that.
+    Placed { dst: usize, src: usize, len: usize, asked: bool },
     /// Anything, anywhere.
     Run,
 }
@@ -268,6 +271,10 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
+            // Taken or not, the steps on the card leave it to the CPU, which
+            // would read its bytes before the flights wrote them: the
+            // submission waits for them as it does without steps on the card.
+            Does::Placed { asked: true, .. } => return Err("a copy at its place waits for flights"),
             Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
         }
@@ -310,7 +317,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
     for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
+        if let Does::Placed { dst, src, len, .. } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
             let (to, from) = ((dst, dst + len), (src, src + len));
@@ -417,6 +424,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
+    // Copies at their place that wait for flights only if another step reads
+    // their bytes (`place::Waits::ForReaders`), by place in `does`.
+    let mut for_readers = Vec::new();
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
@@ -447,10 +457,28 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: *at + *len,
                 },
                 Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                Step::Placed(p) => Does::Placed {
+                    dst: p.dst,
+                    src: p.src,
+                    len: p.len,
+                    asked: match p.waits(written) {
+                        place::Waits::Yes => true,
+                        place::Waits::ForReaders => {
+                            for_readers.push(does.len());
+                            false
+                        }
+                        place::Waits::No => false,
+                    },
+                },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+        }
+    }
+    // (Asked with no list's lock held: `read_by` takes each in turn.)
+    for i in for_readers {
+        if let Does::Placed { dst, len, ref mut asked, .. } = does[i] {
+            *asked = place::read_by(runs, vec![(dst, dst + len)]);
         }
     }
     (does, steps)
@@ -1035,7 +1063,7 @@ mod tests {
     /// bytes behind it, not of what did ahead of it.
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
-        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64, asked: false };
         let behind = |does: &[Does]| {
             let mut found = None;
             let refused = plan(does, 2, true, &mut found);
@@ -1052,6 +1080,26 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
+    /// A copy at its place that waits for flights (its source on the CPU may
+    /// be written by them) keeps the whole submission off the card, wherever
+    /// it stands and however apart from the steps that are asked for: the
+    /// submission then waits, as without steps on the card. Before, the
+    /// asked copy was taken and the submission did not wait, so the copy's
+    /// source was read before the flights wrote it.
+    #[test]
+    fn a_copy_at_its_place_that_waits_keeps_the_steps_off_the_card() {
+        let waits = Does::Placed { dst: 2000, src: 3000, len: 64, asked: true };
+        let apart = copy(9000, 8000, 16, true);
+        for does in [vec![apart, waits], vec![waits, apart], vec![waits]] {
+            for by_order in [true, false] {
+                assert!(plan(&does, 2, by_order, &mut None).is_err(), "{does:?}");
+            }
+        }
+        // Not waiting, it is in nobody's way here.
+        let free = Does::Placed { dst: 2000, src: 3000, len: 64, asked: false };
+        assert_eq!(planned(&[apart, free]), [(0, 0)]);
     }
 
     /// Whatever the steps, done level by level (in a level every read
