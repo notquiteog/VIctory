@@ -91,6 +91,22 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc(
+        base,
+        size,
+        kind,
+        flags,
+        protect,
+    )
+}
+
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -178,7 +194,11 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+        // Windows rounds a fixed address down to a page: told from the
+        // caller's address, so that its last byte's 64 KiB block is told too
+        // (after fxceless/victory-fork d03859a2, fork PR #1185).
+        let start = if base.is_null() { at } else { base };
+        victory_gpu::title_memory_allocated(start as usize, size);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at

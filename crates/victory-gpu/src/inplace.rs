@@ -301,12 +301,14 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views_mut();
-    v.sections.retain(|s| s.0 != section);
-    // A handle's number given out again: the view was of the section that
-    // had it before (it stays mapped: someone may be writing through it).
-    v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views_mut();
+        v.sections.retain(|s| s.0 != section);
+        // A handle's number given out again: the view was of the section that
+        // had it before (it stays mapped: someone may be writing through it).
+        v.whole.retain(|w| w.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title

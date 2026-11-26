@@ -20,6 +20,8 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod renderdoc;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -41,6 +43,8 @@ mod book;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod framegen;
 #[cfg(windows)]
+pub mod framelog;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -59,6 +63,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]

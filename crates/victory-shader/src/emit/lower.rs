@@ -2147,6 +2147,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -2542,6 +2548,9 @@ impl<'a> Lower<'a> {
         if !every && halves {
             need(self.cur_ir);
             return Err(WHERE);
+        }
+        if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
+            return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
         }
         if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
             return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
@@ -9357,7 +9366,9 @@ impl<'a> Lower<'a> {
                         // the console wave (the ray-tracing builder's scans read a sum of
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
+                        if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1"))
+                            || super::firstlane_own_here()
+                        {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
