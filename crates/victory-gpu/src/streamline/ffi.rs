@@ -114,6 +114,9 @@ pub(crate) const USE_MANUAL_HOOKING: u64 = 1 << 2;
 pub(crate) const ALLOW_OTA: u64 = 1 << 3;
 /// Not set here: loading what those updates downloaded.
 pub(crate) const LOAD_DOWNLOADED_PLUGINS: u64 = 1 << 6;
+/// The DXGI factory we upgrade becomes a proxy object; without it the
+/// runtime rewrites the factory class's own table.
+pub(crate) const USE_DXGI_FACTORY_PROXY: u64 = 1 << 5;
 pub(crate) const USE_FRAME_BASED_RESOURCE_TAGGING: u64 = 1 << 7;
 
 // `sl::LogLevel`.
@@ -431,3 +434,110 @@ pub(crate) type GetNativeInterface = unsafe extern "C" fn(*mut c_void, *mut *mut
 // sl_dlss.h, through `slGetFeatureFunction`.
 pub(crate) type DlssGetOptimalSettings = unsafe extern "C" fn(*const DlssOptions, *mut DlssOptimalSettings) -> i32;
 pub(crate) type DlssSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssOptions) -> i32;
+
+// Frame generation: sl_dlss_g.h, sl_reflex.h and sl_pcl.h of the same tag.
+
+// `sl::DLSSGMode`.
+pub(crate) const DLSSG_OFF: u32 = 0;
+pub(crate) const DLSSG_ON: u32 = 1;
+
+// `sl::DLSSGStatus` (bits; 0 is fine).
+pub(crate) const DLSSG_STATUS: [(u32, &str); 5] = [
+    (1, "the resolution is too low"),
+    (2, "Reflex was not detected at run time"),
+    (4, "the HDR format is not supported"),
+    (8, "the common constants are invalid"),
+    (16, "GetCurrentBackBufferIndex was not called"),
+];
+
+/// `sl::DLSSGOptions`, version 5.
+#[repr(C)]
+pub(crate) struct DlssgOptions {
+    pub base: Base,
+    pub mode: u32,
+    pub num_frames_to_generate: u32,
+    pub flags: u32,
+    pub dynamic_res_width: u32,
+    pub dynamic_res_height: u32,
+    pub num_back_buffers: u32,
+    pub mvec_depth_width: u32,
+    pub mvec_depth_height: u32,
+    pub color_width: u32,
+    pub color_height: u32,
+    pub color_buffer_format: u32,
+    pub mvec_buffer_format: u32,
+    pub depth_buffer_format: u32,
+    pub hud_less_buffer_format: u32,
+    pub ui_buffer_format: u32,
+    pub on_error_callback: *const c_void,
+    pub reserved15: i8,
+    pub queue_parallelism_mode: u32,
+    pub enable_user_interface_recomposition: i8,
+    pub dynamic_target_frame_rate: f32,
+}
+
+pub(crate) const DLSSG_OPTIONS: Guid = Guid(0xfac5_f1cb, 0x2dfd, 0x4f36, [0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5]);
+/// `sl::Boolean::eInvalid`, the default of the options' reserved member.
+pub(crate) const INVALID: i8 = 2;
+
+/// `sl::DLSSGState`, version 4.
+#[repr(C)]
+pub(crate) struct DlssgState {
+    pub base: Base,
+    pub estimated_vram_usage_in_bytes: u64,
+    pub status: u32,
+    pub min_width_or_height: u32,
+    pub num_frames_actually_presented: u32,
+    pub num_frames_to_generate_max: u32,
+    pub reserved4: i8,
+    pub is_vsync_support_available: i8,
+    pub inputs_processing_completion_fence: *mut c_void,
+    pub last_present_inputs_processing_completion_fence_value: u64,
+    pub is_dynamic_mfg_supported: i8,
+}
+
+pub(crate) const DLSSG_STATE: Guid = Guid(0xcc8a_c8e1, 0xa179, 0x44f5, [0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61]);
+
+/// `sl::ReflexMode::eLowLatency`.
+pub(crate) const REFLEX_LOW_LATENCY: u32 = 1;
+
+/// `sl::ReflexOptions`, version 1.
+#[repr(C)]
+pub(crate) struct ReflexOptions {
+    pub base: Base,
+    pub mode: u32,
+    pub frame_limit_us: u32,
+    pub use_markers_to_optimize: bool,
+    pub virtual_key: u16,
+    pub id_thread: u32,
+}
+
+pub(crate) const REFLEX_OPTIONS: Guid = Guid(0xf03a_f81a, 0x6d0b, 0x4902, [0xa6, 0x51, 0xc4, 0x96, 0x5e, 0x21, 0x54, 0x34]);
+
+// `sl::PCLMarker`.
+pub(crate) const MARKER_SIMULATION_START: u32 = 0;
+pub(crate) const MARKER_SIMULATION_END: u32 = 1;
+pub(crate) const MARKER_RENDER_SUBMIT_START: u32 = 2;
+pub(crate) const MARKER_RENDER_SUBMIT_END: u32 = 3;
+pub(crate) const MARKER_PRESENT_START: u32 = 4;
+pub(crate) const MARKER_PRESENT_END: u32 = 5;
+
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(size_of::<DlssgOptions>() == 120);
+    assert!(offset_of!(DlssgOptions, on_error_callback) == 96);
+    assert!(offset_of!(DlssgOptions, queue_parallelism_mode) == 108);
+    assert!(offset_of!(DlssgOptions, dynamic_target_frame_rate) == 116);
+    assert!(size_of::<DlssgState>() == 88);
+    assert!(offset_of!(DlssgState, inputs_processing_completion_fence) == 64);
+    assert!(offset_of!(DlssgState, is_dynamic_mfg_supported) == 80);
+    assert!(size_of::<ReflexOptions>() == 48);
+    assert!(offset_of!(ReflexOptions, virtual_key) == 42);
+};
+
+pub(crate) type DlssgSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssgOptions) -> i32;
+pub(crate) type DlssgGetState = unsafe extern "C" fn(*const ViewportHandle, *mut DlssgState, *const DlssgOptions) -> i32;
+pub(crate) type ReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
+pub(crate) type ReflexSleep = unsafe extern "C" fn(*const FrameToken) -> i32;
+pub(crate) type PclSetMarker = unsafe extern "C" fn(u32, *const FrameToken) -> i32;

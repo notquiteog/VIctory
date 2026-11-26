@@ -16,11 +16,16 @@
 //! the title's upscaler would have been (`external::record`), on resources
 //! whose states we name; the list's bindings are ours to put back after it.
 //!
+//! Frame generation ([`generate`], `VICTORY_FRAMEGEN=dlss`) is the one
+//! exception to "no proxies": the presenter's swap chain is then made by a
+//! proxy factory of the runtime's, as `sl.dlss_g` requires.
+//!
 //! Super resolution ([`Dlss`], one of the two backends of
 //! [`crate::upscale`]) is what `victory-hle`'s FidelityFX module runs in
 //! place of the title's AMD upscaler when DLSS serves.
 
 mod ffi;
+pub(crate) mod generate;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -85,6 +90,8 @@ struct DlssFunctions {
 struct Runtime {
     api: Api,
     dlss: DlssFunctions,
+    /// Frame generation, if asked for and supported.
+    generation: Option<generate::Functions>,
     /// Serializes every call into the runtime: its feature functions are
     /// not thread safe, and one frame's calls belong together.
     calls: Mutex<Calls>,
@@ -98,6 +105,7 @@ struct Calls {
     options: Option<([u32; 2], [u32; 2], Quality)>,
     upscales: u64,
     failures: u32,
+    generation: generate::State,
 }
 
 // SAFETY: code addresses and plain data; the mutex serializes the calls.
@@ -160,7 +168,9 @@ pub fn load(dir: &Path) -> Result<String, String> {
     }
     let dir = std::path::absolute(dir).map_err(|e| e.to_string())?;
     let mut signed = Vec::new();
-    for file in std::iter::once(INTERPOSER).chain(SUPER_RESOLUTION) {
+    let generate = crate::upscale::asked_frame_generation() == crate::upscale::FrameGeneration::Dlss;
+    let files = std::iter::once(INTERPOSER).chain(SUPER_RESOLUTION).chain(generate::FILES.into_iter().filter(|_| generate));
+    for file in files {
         let path = dir.join(file);
         if !path.is_file() {
             return Err(format!("no {file} in {}", dir.display()));
@@ -211,7 +221,10 @@ pub fn load(dir: &Path) -> Result<String, String> {
     let log_dir = std::env::var_os("VICTORY_DLSS_LOG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
     let log_dir_wide = log_dir.as_deref().map(wide);
     let verbose = std::env::var_os("VICTORY_DLSS_LOG").is_some_and(|v| v == "verbose");
-    let features = [ffi::FEATURE_DLSS];
+    let mut features = vec![ffi::FEATURE_DLSS];
+    if generate {
+        features.extend(generate::FEATURES);
+    }
     let preferences = ffi::Preferences {
         base: Base::new(ffi::PREFERENCES, 1),
         show_console: false,
@@ -224,7 +237,10 @@ pub fn load(dir: &Path) -> Result<String, String> {
         log_message_callback: Some(log_message),
         // We put the list's state back ourselves; no proxies; tags belong
         // to a frame. No updates over the network.
-        flags: ffi::DISABLE_CL_STATE_TRACKING | ffi::USE_MANUAL_HOOKING | ffi::USE_FRAME_BASED_RESOURCE_TAGGING,
+        flags: ffi::DISABLE_CL_STATE_TRACKING
+            | ffi::USE_MANUAL_HOOKING
+            | ffi::USE_FRAME_BASED_RESOURCE_TAGGING
+            | if generate { ffi::USE_DXGI_FACTORY_PROXY } else { 0 },
         features_to_load: features.as_ptr(),
         num_features_to_load: features.len() as u32,
         application_id: 0,
@@ -269,11 +285,20 @@ pub fn load(dir: &Path) -> Result<String, String> {
             ),
         }
     };
+    // Frame generation is extra: without it super resolution still serves.
+    let generation = if generate {
+        // SAFETY: the adapter description lives through the calls.
+        generate::load(|feature| unsafe { (api.is_feature_supported)(feature, &adapter) }, find, function)
+            .inspect_err(|why| tracing::warn!("DLSS frame generation: {why}; off"))
+            .ok()
+    } else {
+        None
+    };
     let mut version = ffi::FeatureVersion { base: Base::new(ffi::FEATURE_VERSION, 1), sl: ffi::Version::default(), ngx: ffi::Version::default() };
     // SAFETY: a version structure of ours to fill.
     unsafe { (api.get_feature_version)(ffi::FEATURE_DLSS, &mut version) };
     let what = format!(
-        "Streamline {}.{}.{} with DLSS {}.{}.{} from {} on {name}; mode {}",
+        "Streamline {}.{}.{} with DLSS {}.{}.{} from {} on {name}; mode {}; frame generation {}",
         version.sl.major,
         version.sl.minor,
         version.sl.build,
@@ -282,8 +307,9 @@ pub fn load(dir: &Path) -> Result<String, String> {
         version.ngx.build,
         dir.display(),
         asked_mode().name(),
+        if generation.is_some() { "on" } else { "off" },
     );
-    let _ = RUNTIME.set(Runtime { api, dlss, calls: Mutex::new(Calls::default()), _signed: signed });
+    let _ = RUNTIME.set(Runtime { api, dlss, generation, calls: Mutex::new(Calls::default()), _signed: signed });
     Ok(what)
 }
 
@@ -544,7 +570,9 @@ fn upscale_locked(rt: &Runtime, calls: &mut Calls, list: &ID3D12GraphicsCommandL
             "DLSS: an upscale recorded (slEvaluateFeature)"
         );
     }
-    check("slEvaluateFeature", code)
+    check("slEvaluateFeature", code)?;
+    generate::after_upscale(rt, calls, list, token, &mut depth, &mut motion, [u.render, motion_size]);
+    Ok(())
 }
 
 #[cfg(test)]
