@@ -540,11 +540,33 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
+/// Whether [`HOST_WRITTEN`] holds anything, changed under its lock. Readers
+/// look here first: most submissions have no such texture, and every use of
+/// a texture by a list being recorded took the one lock to find an empty
+/// set (DexNom/VIctory#24).
+static HOST_WRITTEN_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a host copy or resolve has written `resource`.
+fn is_host_written(resource: usize) -> bool {
+    if !HOST_WRITTEN_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&resource))
+}
+
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
+        let new = set.get_or_insert_with(Default::default).insert(resource as usize);
+        // While the lock is held: a reader that sees `true` waits for the
+        // insert, and `forget`'s `false` cannot come over this.
+        HOST_WRITTEN_ANY.store(true, std::sync::atomic::Ordering::Release);
+        new
     };
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
@@ -607,11 +629,7 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
-    HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+    is_host_written(resource)
 }
 
 /// The title released a resource.
@@ -620,9 +638,15 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = set.as_mut() {
+            set.remove(&resource);
+            if set.is_empty() {
+                // Under the lock, as `host_written`'s.
+                HOST_WRITTEN_ANY.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
@@ -725,14 +749,9 @@ pub(crate) struct Digest(u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written {
+    if is_host_written(resource as usize) {
         return;
     }
     // Once a list for each first level; not again for one that the list's
