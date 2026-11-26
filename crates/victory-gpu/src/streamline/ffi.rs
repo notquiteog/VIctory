@@ -541,3 +541,78 @@ pub(crate) type DlssgGetState = unsafe extern "C" fn(*const ViewportHandle, *mut
 pub(crate) type ReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
 pub(crate) type ReflexSleep = unsafe extern "C" fn(*const FrameToken) -> i32;
 pub(crate) type PclSetMarker = unsafe extern "C" fn(u32, *const FrameToken) -> i32;
+
+// Ray reconstruction: sl_dlss_d.h of the same tag. (DLSS NR, `sl.dlss_nr`,
+// has no public header: nothing of it is bound.)
+
+/// `sl::DLSSDOptions`, version 3. The presets stay `eDefault` (0).
+#[repr(C)]
+pub(crate) struct DlssdOptions {
+    pub base: Base,
+    pub mode: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub sharpness: f32,
+    pub pre_exposure: f32,
+    pub exposure_scale: f32,
+    pub color_buffers_hdr: i8,
+    pub indicator_invert_axis_x: i8,
+    pub indicator_invert_axis_y: i8,
+    /// `sl::DLSSDNormalRoughnessMode`: 0 separate textures, 1 roughness in
+    /// the normals' alpha.
+    pub normal_roughness_mode: u32,
+    pub world_to_camera_view: Matrix,
+    pub camera_view_to_world: Matrix,
+    pub alpha_upscaling_enabled: i8,
+    pub dlaa_preset: u32,
+    pub quality_preset: u32,
+    pub balanced_preset: u32,
+    pub performance_preset: u32,
+    pub ultra_performance_preset: u32,
+    pub ultra_quality_preset: u32,
+}
+
+pub(crate) const DLSSD_OPTIONS: Guid = Guid(0x0ad8_7504, 0x774e, 0x4bf3, [0x96, 0x33, 0xa4, 0x4d, 0x1f, 0x7f, 0x9c, 0xb8]);
+/// `sl::DLSSDOptimalSettings` has the members of [`DlssOptimalSettings`].
+pub(crate) const DLSSD_OPTIMAL_SETTINGS: Guid = Guid(0xfbd0_c637, 0xa28f, 0x41f2, [0xbc, 0x91, 0xb4, 0x21, 0xfa, 0xee, 0x8e, 0x1e]);
+
+impl DlssdOptions {
+    /// The header's defaults, for a mode and an output size.
+    pub(crate) fn new(mode: u32, output: [u32; 2]) -> Self {
+        const IDENTITY: Matrix = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        Self {
+            base: Base::new(DLSSD_OPTIONS, 3),
+            mode,
+            output_width: output[0],
+            output_height: output[1],
+            sharpness: 0.0,
+            pre_exposure: 1.0,
+            exposure_scale: 1.0,
+            color_buffers_hdr: TRUE,
+            indicator_invert_axis_x: FALSE,
+            indicator_invert_axis_y: FALSE,
+            normal_roughness_mode: 0,
+            world_to_camera_view: IDENTITY,
+            camera_view_to_world: IDENTITY,
+            alpha_upscaling_enabled: FALSE,
+            dlaa_preset: 0,
+            quality_preset: 0,
+            balanced_preset: 0,
+            performance_preset: 0,
+            ultra_performance_preset: 0,
+            ultra_quality_preset: 0,
+        }
+    }
+}
+
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(size_of::<DlssdOptions>() == 224);
+    assert!(offset_of!(DlssdOptions, normal_roughness_mode) == 60);
+    assert!(offset_of!(DlssdOptions, world_to_camera_view) == 64);
+    assert!(offset_of!(DlssdOptions, alpha_upscaling_enabled) == 192);
+    assert!(offset_of!(DlssdOptions, ultra_quality_preset) == 216);
+};
+
+pub(crate) type DlssdGetOptimalSettings = unsafe extern "C" fn(*const DlssdOptions, *mut DlssOptimalSettings) -> i32;

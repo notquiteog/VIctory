@@ -20,12 +20,16 @@
 //! exception to "no proxies": the presenter's swap chain is then made by a
 //! proxy factory of the runtime's, as `sl.dlss_g` requires.
 //!
+//! Ray reconstruction and DLSS NR are only looked at ([`neural`],
+//! `VICTORY_DLSS_NR=1`).
+//!
 //! Super resolution ([`Dlss`], one of the two backends of
 //! [`crate::upscale`]) is what `victory-hle`'s FidelityFX module runs in
 //! place of the title's AMD upscaler when DLSS serves.
 
 mod ffi;
 pub(crate) mod generate;
+mod neural;
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
@@ -177,6 +181,24 @@ pub fn load(dir: &Path) -> Result<String, String> {
         }
         signed.push(trust::signed_by(&path, trust::NVIDIA)?);
     }
+    // Ray reconstruction and DLSS NR, to be looked at: each with its plugin
+    // and model there and signed.
+    let mut looked_at = Vec::new();
+    if neural::asked() {
+        for (feature, files) in [neural::RAY_RECONSTRUCTION, neural::NEURAL] {
+            let checked: Result<Vec<_>, String> = files
+                .iter()
+                .map(|file| trust::signed_by(&dir.join(file), trust::NVIDIA))
+                .collect();
+            match checked {
+                Ok(files) => {
+                    signed.extend(files);
+                    looked_at.push(feature);
+                }
+                Err(why) => tracing::warn!("VICTORY_DLSS_NR: {why}; that feature is left out"),
+            }
+        }
+    }
     let interposer = dir.join(INTERPOSER);
     let module = {
         use windows_sys::Win32::System::LibraryLoader::{
@@ -225,6 +247,7 @@ pub fn load(dir: &Path) -> Result<String, String> {
     if generate {
         features.extend(generate::FEATURES);
     }
+    features.extend(&looked_at);
     let preferences = ffi::Preferences {
         base: Base::new(ffi::PREFERENCES, 1),
         show_console: false,
@@ -294,9 +317,17 @@ pub fn load(dir: &Path) -> Result<String, String> {
     } else {
         None
     };
-    let mut version = ffi::FeatureVersion { base: Base::new(ffi::FEATURE_VERSION, 1), sl: ffi::Version::default(), ngx: ffi::Version::default() };
-    // SAFETY: a version structure of ours to fill.
-    unsafe { (api.get_feature_version)(ffi::FEATURE_DLSS, &mut version) };
+    let feature_version = |feature: u32| {
+        let mut version = ffi::FeatureVersion { base: Base::new(ffi::FEATURE_VERSION, 1), sl: ffi::Version::default(), ngx: ffi::Version::default() };
+        // SAFETY: a version structure of ours to fill.
+        unsafe { (api.get_feature_version)(feature, &mut version) };
+        version
+    };
+    if !looked_at.is_empty() {
+        // SAFETY: the adapter description lives through the calls.
+        neural::report(&looked_at, |feature| unsafe { (api.is_feature_supported)(feature, &adapter) }, feature_version, find, function);
+    }
+    let version = feature_version(ffi::FEATURE_DLSS);
     let what = format!(
         "Streamline {}.{}.{} with DLSS {}.{}.{} from {} on {name}; mode {}; frame generation {}",
         version.sl.major,
