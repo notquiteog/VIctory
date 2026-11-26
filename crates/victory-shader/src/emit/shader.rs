@@ -96,6 +96,11 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// First group in X for the second execution of a wide indirect dispatch.
 pub const USER_GROUP_BASE: u32 = 0x107;
+/// How many of the title's view slots the view heap bound for this draw or
+/// dispatch has host slots for (`HostHeap::count`): the host's dynamic slots
+/// start there. A view the program picks by a title index at or past it is
+/// not there to read ([`Shader::title_view_index`]).
+pub const USER_TITLE_VIEW_COUNT: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -457,6 +462,21 @@ impl Shader {
             216,
             &[h, p],
         )
+    }
+
+    /// `index`, a view index the title's program computed, where the heap
+    /// has a host slot for that title slot (below `count`,
+    /// [`USER_TITLE_VIEW_COUNT`]), and the null slot `null` elsewhere: the
+    /// host's own slots (tables made for a draw) start at `count`, and one
+    /// of their descriptors is not what the title's slot of that number
+    /// held. Indices the host hands out (a table's place) do not come here.
+    /// (After Artking175, notquiteog/victory-nvidia#1.)
+    pub fn title_view_index(&mut self, block: usize, index: V, count: V, null: u32) -> V {
+        let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, count);
+        let null = self.m.i32(null);
+        let v = self.m.select(block, inside, index, null);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        v
     }
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
