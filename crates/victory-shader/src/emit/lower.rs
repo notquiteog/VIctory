@@ -1316,15 +1316,36 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start,
 /// what it writes for the console's own hardware, and whether pixel shaders'
 /// wave operations include helper lanes (shader model 6.7 on the host,
-/// [`super::set_helper_lane_waves`]).
-pub fn host_settings() -> [u32; 5] {
+/// [`super::set_helper_lane_waves`]), and whether heap handles stay in
+/// their blocks ([`heap_handles_local`]).
+pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
         super::shader::view_heap_limit(),
         super::shader::raw_views(),
         host_rdna(),
         u32::from(super::helper_lane_waves()),
+        u32::from(heap_handles_local()),
     ]
+}
+
+/// Whether a handle made from the descriptor heap, and a handle's
+/// annotation, are reused within their block only and not across blocks
+/// (`bitcode::opt`'s reuse pass). AMD's compiler on RDNA 4 (`amdxc64.dll`)
+/// reads through a null pointer when an
+/// `annotateHandle(createHandleFromHeap(...))` is shared by blocks
+/// (DexNom/VIctory#7, manoel0810). On where the host's shaders run on AMD
+/// RDNA hardware ([`set_host_rdna`]) and off elsewhere, where the code is
+/// as it was; `VICTORY_HEAP_HANDLES_LOCAL=1` or `=0` says otherwise. Part
+/// of the translation ([`host_settings`]).
+pub(super) fn heap_handles_local() -> bool {
+    static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| match std::env::var("VICTORY_HEAP_HANDLES_LOCAL").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    set.unwrap_or_else(|| HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
