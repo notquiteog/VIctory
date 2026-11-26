@@ -169,6 +169,9 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// The dynamic ranges no recorded or executing command list holds.
     slots: Mutex<DynamicSlots>,
+    /// Signalled when dynamic slots are given back ([`HostHeap::release`]),
+    /// for a recording thread that waits for some ([`HostHeap::dynamic`]).
+    freed: std::sync::Condvar,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1547,6 +1550,7 @@ impl HostHeap {
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             slots: Mutex::new(DynamicSlots::new(extra)),
+            freed: std::sync::Condvar::new(),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1648,6 +1652,29 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// How long a recording thread waits for dynamic slots to be given back before its table is
+/// refused (`VICTORY_SLOT_WAIT_US`, 2000 unless said; 0: not at all, as before).
+fn slot_wait() -> std::time::Duration {
+    static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let us = std::env::var("VICTORY_SLOT_WAIT_US").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2000);
+        std::time::Duration::from_micros(us)
+    })
+}
+
+thread_local! {
+    /// When this thread last waited for slots in vain.
+    static GAVE_UP: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn gave_up_lately() -> bool {
+    GAVE_UP.with(|g| g.get().is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(50)))
+}
+
+fn gave_up_now() {
+    GAVE_UP.with(|g| g.set(Some(std::time::Instant::now())));
+}
+
 /// What the dynamic slots are asked for and why a table is refused, said every five seconds
 /// while tables are asked for: a pool that is full and one that is only in pieces want
 /// different cures, and so does a title that uses fewer of its own slots than it asked for.
@@ -1670,6 +1697,13 @@ pub(crate) mod slot_stats {
 
     pub(crate) fn mirrored(index: u32) {
         HIGHEST.fetch_max(index, Relaxed);
+    }
+
+    /// Waits for slots to be given back: those that found a run, and those that did not.
+    static WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    pub(crate) fn waited(found: bool) {
+        WAITS[usize::from(!found)].fetch_add(1, Relaxed);
     }
 
     /// Tables made afresh, by why: those holding a constant buffer (tables, slots), and
@@ -1742,6 +1776,14 @@ pub(crate) mod slot_stats {
             return;
         }
         say_fresh();
+        let waits = [WAITS[0].swap(0, Relaxed), WAITS[1].swap(0, Relaxed)];
+        if waits != [0, 0] {
+            tracing::info!(
+                "waits for dynamic descriptor slots, the last 5 s (VICTORY_SLOT_WAIT_US): {} found their slots, {} did not and their tables were refused",
+                waits[0],
+                waits[1]
+            );
+        }
         let asked: Vec<u64> = ASKED.iter().map(|a| a.swap(0, Relaxed)).collect();
         let slots = ASKED_SLOTS.swap(0, Relaxed);
         let r: Vec<u64> = REFUSED.iter().map(|a| a.swap(0, Relaxed)).collect();
@@ -1784,7 +1826,29 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let (first, free) = {
             let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-            let first = slots.take(n);
+            let mut first = slots.take(n);
+            // No run of `n` free slots: the slots of flights the card is running come back
+            // within a millisecond or two, as each lands, so a short wait for them usually
+            // finds the run, where giving up at once drops the draw (vegetation, drawn by
+            // indirect mesh dispatches, came and went with the refusals: 304,067 tables in
+            // 22 of 48 five-second windows of one session on an RTX 5060 Ti). A thread whose
+            // wait found nothing does not wait again for 50 ms: where every slot is held by
+            // lists not yet sent, no wait helps.
+            if first.is_none() && slot_wait() > std::time::Duration::ZERO && !gave_up_lately() {
+                let until = std::time::Instant::now() + slot_wait();
+                while first.is_none() {
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        break;
+                    }
+                    slots = self.freed.wait_timeout(slots, until - now).unwrap_or_else(|e| e.into_inner()).0;
+                    first = slots.take(n);
+                }
+                slot_stats::waited(first.is_some());
+                if first.is_none() {
+                    gave_up_now();
+                }
+            }
             (first, slots.available())
         };
         let Some(first) = first else {
@@ -2637,6 +2701,7 @@ impl HostHeap {
             return;
         };
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).release(at, n);
+        self.freed.notify_all();
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
