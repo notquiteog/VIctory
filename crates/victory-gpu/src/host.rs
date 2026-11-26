@@ -4921,7 +4921,9 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
-                    landed.push((flight.lists, flight.order));
+                    let mut lists = flight.lists;
+                    crate::list::tables_landed(&mut lists);
+                    landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -5388,7 +5390,9 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
-                        landed.push((flight.lists, flight.order));
+                        let mut lists = flight.lists;
+                        crate::list::tables_landed(&mut lists);
+                        landed.push((lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),

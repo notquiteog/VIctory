@@ -1646,6 +1646,129 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// What the dynamic slots are asked for and why a table is refused, said every five seconds
+/// while tables are asked for: a pool that is full and one that is only in pieces want
+/// different cures, and so does a title that uses fewer of its own slots than it asked for.
+pub(crate) mod slot_stats {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    /// Tables asked for by size: 1, 2-4, 5-8, 9-16, 17-32, 33-64, more; and their slots.
+    static ASKED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static ASKED_SLOTS: AtomicU64 = AtomicU64::new(0);
+    /// Refusals: how many, the slots they asked for, the free slots summed over them, and how
+    /// many came while the pool had as many free slots as were asked for (no run long enough).
+    static REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// The fewest slots free at any asking, and the pool's size.
+    static FEWEST: AtomicU32 = AtomicU32::new(u32::MAX);
+    static POOL: AtomicU32 = AtomicU32::new(0);
+    /// The highest of the title's own slots mirrored so far, and the title slots the heap has.
+    static HIGHEST: AtomicU32 = AtomicU32::new(0);
+    static TITLE: AtomicU32 = AtomicU32::new(0);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn mirrored(index: u32) {
+        HIGHEST.fetch_max(index, Relaxed);
+    }
+
+    /// Tables made afresh, by why: those holding a constant buffer (tables, slots), and
+    /// those only reaching past the host heap's title slots (tables, slots).
+    static FRESH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// The tables of the second kind made since the last line, by what they are (title
+    /// address, slots, contents): how many times each was made, in whatever list.
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32, u64), u32>>> = std::sync::Mutex::new(None);
+
+    /// A table is being made afresh in a list.
+    pub(crate) fn fresh(key: (u64, u32, u64), constant_buffer: bool) {
+        let at = if constant_buffer { 0 } else { 2 };
+        FRESH[at].fetch_add(1, Relaxed);
+        FRESH[at + 1].fetch_add(u64::from(key.1), Relaxed);
+        if !constant_buffer {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            *seen.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Said with the line of [`asked`].
+    fn say_fresh() {
+        let f: Vec<u64> = FRESH.iter().map(|a| a.swap(0, Relaxed)).collect();
+        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let distinct = seen.len() as u64;
+        let distinct_slots: u64 = seen.keys().map(|k| u64::from(k.1)).sum();
+        let most = seen.values().copied().max().unwrap_or(0);
+        let big: u64 = seen.keys().filter(|k| k.1 > 64).count() as u64;
+        let big_slots: u64 = seen.iter().filter(|(k, _)| k.1 > 64).map(|(k, n)| u64::from(k.1) * u64::from(*n)).sum();
+        tracing::info!(
+            "tables made afresh, the last 5 s: {} holding a constant buffer ({} slots); {} only for reaching past the host heap's title slots ({} slots),              which are {} different tables ({} slots if each were made once; the one made most often {} times); of those, {} different tables are over 64              slots and took {} slots in all",
+            f[0],
+            f[1],
+            f[2],
+            f[3],
+            distinct,
+            distinct_slots,
+            most,
+            big,
+            big_slots,
+        );
+    }
+
+    pub(crate) fn asked(n: u32, free: u32, pool: u32, title: u32, refused: bool) {
+        let class = match n {
+            0..=1 => 0,
+            2..=4 => 1,
+            5..=8 => 2,
+            9..=16 => 3,
+            17..=32 => 4,
+            33..=64 => 5,
+            _ => 6,
+        };
+        ASKED[class].fetch_add(1, Relaxed);
+        ASKED_SLOTS.fetch_add(u64::from(n), Relaxed);
+        FEWEST.fetch_min(free, Relaxed);
+        POOL.store(pool, Relaxed);
+        TITLE.store(title, Relaxed);
+        if refused {
+            REFUSED[0].fetch_add(1, Relaxed);
+            REFUSED[1].fetch_add(u64::from(n), Relaxed);
+            REFUSED[2].fetch_add(u64::from(free), Relaxed);
+            if free >= n {
+                REFUSED[3].fetch_add(1, Relaxed);
+            }
+        }
+        let now = crate::host::now_ms();
+        let said = SAID.load(Relaxed);
+        if now < said + 5_000 || SAID.compare_exchange(said, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        say_fresh();
+        let asked: Vec<u64> = ASKED.iter().map(|a| a.swap(0, Relaxed)).collect();
+        let slots = ASKED_SLOTS.swap(0, Relaxed);
+        let r: Vec<u64> = REFUSED.iter().map(|a| a.swap(0, Relaxed)).collect();
+        let total: u64 = asked.iter().sum();
+        tracing::info!(
+            "dynamic descriptor slots, the last 5 s: {total} tables asked ({} slots, {:.1} a table); by size 1: {}, 2-4: {}, 5-8: {}, 9-16: {}, 17-32: {}, \
+             33-64: {}, more: {}; refused {} ({} slots), of them {} with as many slots free as asked for (no run long enough), {:.0} slots free on \
+             average when refused; fewest free at any asking {} of a pool of {}; the title's own slots: {} in the heap, the highest mirrored so far {}",
+            slots,
+            slots as f64 / total.max(1) as f64,
+            asked[0],
+            asked[1],
+            asked[2],
+            asked[3],
+            asked[4],
+            asked[5],
+            asked[6],
+            r[0],
+            r[1],
+            r[3],
+            r[2] as f64 / r[0].max(1) as f64,
+            FEWEST.swap(u32::MAX, Relaxed),
+            POOL.load(Relaxed),
+            TITLE.load(Relaxed),
+            HIGHEST.load(Relaxed),
+        );
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1689,6 +1812,7 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            slot_stats::asked(n as u32, self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic, self.count, true);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1699,6 +1823,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        slot_stats::asked(n as u32, self.free.load(std::sync::atomic::Ordering::Relaxed), self.dynamic, self.count, false);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
@@ -2958,6 +3083,9 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        if !self.sampler {
+            slot_stats::mirrored(index);
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.

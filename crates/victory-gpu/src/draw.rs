@@ -3298,6 +3298,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
+            crate::descriptor::host::slot_stats::fresh(key, entries().any(|u| u.kind == ResourceType::Cbv));
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
