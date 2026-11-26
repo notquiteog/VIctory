@@ -134,6 +134,12 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    if window
+        && stretch()
+        && let Cover::Run(section, offset) = cover(start as usize, len as usize)
+    {
+        return place_stretch(start, len, section, offset);
+    }
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -165,6 +171,109 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// `VICTORY_STRETCH=1` (off by default): a window of title memory that is
+/// one run of one section's pages, shown page by page, is used in place
+/// through the view of our own on the section ([`place_stretch`]).
+///
+/// The title maps its streaming heaps one 64 KiB view at a time, each view
+/// an allocation of its own, so [`place_part`] cannot open them (and
+/// [`level`] turns view memory down); but the pages of such a heap follow
+/// one another in their section. Our own view ([`beside`]) shows the same
+/// pages in one piece, so the heap is opened there: the shaders read and
+/// write the title's bytes, with no copy, no refresh and no copy-back. The
+/// idea is `VICTORY_STRETCH` of Belobug/VIctory-Belobug-AMD (0434b3a), which
+/// measured copy-back going from 36 to 12 ms a frame there; taken from
+/// fxceless/victory-fork#1127.
+///
+/// shortcut: a window goes as any in place when the title maps other pages
+/// under it ([`title_memory_freeing`]). While its heap stands our view of
+/// the section cannot be unmapped ([`title_memory_section_gone`] then leaves
+/// it mapped). Not run on this tree yet.
+pub(crate) fn stretch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_some_and(|v| v == "1"))
+}
+
+/// Windows placed through our own view of a section ([`stretch`]), and the
+/// asks for one that were turned down.
+static STRETCHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Title memory `[start, start + len)`, one run of `section` from byte
+/// `offset` on ([`Cover::Run`]), placed through our own view of the
+/// section; `None` leaves the caller to make a copy.
+fn place_stretch(start: u64, len: u64, section: usize, offset: u64) -> Option<Placed> {
+    let refused = |what: &str, error: Option<String>| -> Option<Placed> {
+        if STRETCHED[1].fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                start = format_args!("{start:#x}"),
+                len,
+                error = error.unwrap_or_default(),
+                "a run of title view memory not opened in place ({what}): a copy instead"
+            );
+        }
+        None
+    };
+    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // The 64 KiB pages that hold the window, in the title's address space
+    // and in the section.
+    let lead = start % K64 as u64;
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - (start - lead);
+    let Some(from) = offset.checked_sub(lead) else {
+        return refused("not on a page of the section", None);
+    };
+    // The run must hold the rounded pages too.
+    if cover((start - lead) as usize, bytes as usize) != Cover::Run(section, from) {
+        return refused("its pages are not all of the run", None);
+    }
+    let section_bytes = views().sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+    if from + bytes > section_bytes {
+        return refused("past the section", None);
+    }
+    // The same pages in our own view of the whole section. They are
+    // committed: the runtime commits a page before it shows it, for every
+    // view of the section (as [`beside`] relies on).
+    let Some(at) = beside((start - lead) as usize, bytes as usize) else {
+        return refused("no view of our own on its section", None);
+    };
+    let host = crate::host::host()?;
+    let heap = match open(&host.device, From::Part(at, bytes as usize)) {
+        Ok(heap) => heap,
+        Err(e) => {
+            STATS[5].fetch_add(1, Ordering::Relaxed);
+            return refused("the host refused the heap", Some(e.to_string()));
+        }
+    };
+    let buffer = match place(&host.device, &heap, 0, bytes) {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            STATS[5].fetch_add(1, Ordering::Relaxed);
+            return refused("the host refused the buffer", Some(e.to_string()));
+        }
+    };
+    // Guarded blocks there would not see what shaders write: they are
+    // opened, as before a write of the kernel's.
+    crate::watch::writing(start as usize, len as usize);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + lead;
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(len, Ordering::Relaxed);
+    let count = STRETCHED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 8 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            start = format_args!("{start:#x}"),
+            len,
+            section,
+            "a run of title view memory in place through our own view (VICTORY_STRETCH=1)"
+        );
+    }
+    say();
+    Some(Placed { buffer, heap, gpu, bias: lead })
 }
 
 /// What [`place_for`] gave is gone.
@@ -199,7 +308,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed;          through our own view of a section (VICTORY_STRETCH): {} placed, {} turned down",
         s[0],
         s[1] >> 20,
         s[2],
@@ -207,7 +316,9 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        STRETCHED[0].load(Ordering::Relaxed),
+        STRETCHED[1].load(Ordering::Relaxed)
     );
 }
 
