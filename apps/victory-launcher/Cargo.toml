@@ -1,0 +1,54 @@
+[package]
+name = "victory-launcher"
+description = "Desktop launcher and per-user installer: install, set up, play, prepare shaders, update."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_json = "1.0.154"
+# The window: immediate-mode GUI drawn with OpenGL (pure Rust).
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+# The logo shown in the window, a user's own logo made into the shortcuts'
+# icon, and the screenshot hook's PNG.
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
+# Update check and download over HTTPS (rustls; no system curl, no tokens).
+ureq = "3.5.2"
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+sha2 = "0.11.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# The drawn default logo (or the builder's own) -> a multi-size .ico,
+# embedded as the program's icon resource.
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
+winresource = "0.1.34"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
