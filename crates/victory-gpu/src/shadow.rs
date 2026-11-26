@@ -1989,6 +1989,11 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
+    let word = |of: &[u8], i: usize| u64::from_ne_bytes([of[i], of[i + 1], of[i + 2], of[i + 3], of[i + 4], of[i + 5], of[i + 6], of[i + 7]]);
+    let all_differ = |i: usize| {
+        let d = word(now, i) ^ word(was, i);
+        d.wrapping_sub(0x0101_0101_0101_0101) & !d & 0x8080_8080_8080_8080 == 0
+    };
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
@@ -2007,6 +2012,12 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             break;
         }
         let first = i;
+        // Differing bytes, eight at a time while all eight differ (a run
+        // the title rewrote whole; fxceless/victory-fork#1129): no byte of
+        // the two words' exclusive or is zero.
+        while i + 8 <= n && all_differ(i) {
+            i += 8;
+        }
         while i < n && now[i] != was[i] {
             i += 1;
         }
