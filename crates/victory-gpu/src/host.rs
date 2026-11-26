@@ -8445,6 +8445,10 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else if !batch.due.is_empty() {
+                        // Host callbacks can use a refresh result, including the
+                        // mip mask that maps a reserved texture for this upload.
+                        batch.refresh_textures();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
