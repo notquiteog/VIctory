@@ -4436,15 +4436,6 @@ float4 lit() : SV_Target { return 1.0; }
         };
         let state = host_copy(depth).unwrap().state.load(Relaxed);
         let state = D3D12_RESOURCE_STATES(state as i32);
-        let colour = host.rtv(Some(&target), None);
-        let depth_view = host.dsv(
-            host_depth,
-            Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
-                Format: DXGI_FORMAT(45),
-                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            }),
-        );
         let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources and views.
         unsafe {
@@ -4452,10 +4443,21 @@ float4 lit() : SV_Target { return 1.0; }
             if state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
-            l.ClearRenderTargetView(colour, &[0.0; 4], None);
-            l.SetGraphicsRootSignature(&signature);
-            l.SetPipelineState(&pipeline);
-            l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            host.output_views(|views| {
+                let colour = views.rtv(Some(&target), None);
+                let depth_view = views.dsv(
+                    host_depth,
+                    Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                        Format: DXGI_FORMAT(45),
+                        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    }),
+                );
+                l.ClearRenderTargetView(colour, &[0.0; 4], None);
+                l.SetGraphicsRootSignature(&signature);
+                l.SetPipelineState(&pipeline);
+                l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            });
             l.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
