@@ -735,13 +735,13 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     };
     let mip = index % mips;
     let plane = index / mips / slices;
-    let depth_stencil = matches!(desc.format, 19..=22 | 44..=47);
     // Each plane contains all the mip levels and array slices. Depth and
     // stencil copies use separate formats and 512-byte row alignment.
-    let (format, pitch_alignment) = match (depth_stencil, plane) {
-        (true, 0) => (39, 512), // DXGI_FORMAT_R32_TYPELESS
-        (true, 1) => (60, 512), // DXGI_FORMAT_R8_TYPELESS
-        (false, 0) => (desc.format, PITCH),
+    let (format, pitch_alignment) = match (desc.format, plane) {
+        (19..=22 | 44..=47, 0) => (39, 512),               // DXGI_FORMAT_R32_TYPELESS
+        (118..=120, 0) => (53, 512),                       // DXGI_FORMAT_R16_TYPELESS
+        (19..=22 | 44..=47 | 118..=120, 1) => (60, 512),   // DXGI_FORMAT_R8_TYPELESS
+        (_, 0) => (desc.format, PITCH),
         _ => return None,
     };
     let (element, block) = element(format)?;
@@ -3718,6 +3718,56 @@ mod tests {
             );
             assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
+            assert_eq!(total, 24_072, "format {format}");
+            assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    #[test]
+    fn d16_s8_depth_stencil_footprints_follow_the_pc_plane_order() {
+        // Console 16-bit depth + 8-bit stencil formats (118..=120) have two
+        // planes: R16_TYPELESS (53, 2 B/texel) for depth and R8_TYPELESS (60,
+        // 1 B/texel) for stencil, both with 512-byte row pitch alignment.
+        let expected = [
+            (512, 53, 16, 8),
+            (4_608, 53, 8, 4),
+            (6_656, 53, 16, 8),
+            (10_752, 53, 8, 4),
+            (12_800, 60, 16, 8),
+            (16_896, 60, 8, 4),
+            (18_944, 60, 16, 8),
+            (23_040, 60, 8, 4),
+        ];
+        for format in 118..=120 {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(16, 8, format, 2)
+            };
+            let mut layouts = [NO_FOOTPRINT; 8];
+            let (mut rows, mut sizes, mut total) = ([0; 8], [0; 8], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                8,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+
+            assert_eq!(
+                layouts.map(|l| (l.offset, l.format, l.width, l.height)),
+                expected,
+                "format {format}"
+            );
+            assert!(
+                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
+                "format {format}"
+            );
+            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
+            assert_eq!(sizes, [32, 16, 32, 16, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
         }
