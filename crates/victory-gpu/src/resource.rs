@@ -2511,8 +2511,10 @@ fn host_texture_as(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). The console allows one on any texture; the
+    // host only on render targets and depth buffers, and refuses creation
+    // otherwise (E_INVALIDARG): drop it there.
+    let clear_value = (!clear.is_null() && d.flags & (TARGET | DEPTH) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
