@@ -94,6 +94,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_BUILDER_EARLY=0` | the builder's pipelines are made one after another at its first dispatch, as before (Known gaps) |
 | `VICTORY_BVH_SIZES_BOUND=0` | a structure's compacted size is not given a bound before the card's lands (on with the builder; Known gaps) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
@@ -143,6 +144,25 @@ dispatches, faults and what came.
   earlier asking of the same slot landed after it. What is not found is left
   as before. Every ten seconds the log says how many answers, structures
   found, sizes asked with a bound and without, bounds put back.
+
+  The first run with it (bench bvh-bound1, 2026-11-26) ended in the title's
+  watchdog (`mov [0]` at +0x23cf683, 30 s after frame 1064 began), not in
+  anything the bound did: no bound was ever given (no size program had been
+  translated yet). The batches' bounds were right: 0x1cc00, the prebuild
+  answer, is the spacing of the title's own uncompacted destinations in the
+  same batch. What held the frame was the builder's first dispatch, which
+  made its 53 pipelines one after another on its thread: 8 s with a warm
+  driver cache in the next run (its frame 1053 took 13 s), about a second
+  each with a cold one, 40 made when the watchdog came. Now they are queued
+  for the workers when the title creates them, and all at once at that
+  first dispatch (`VICTORY_BVH_BUILDER_EARLY=0`: as before). A bound is
+  still more than the structure needs (0x1cc00 against some 0x13000 here):
+  the title takes that much of its pool for a structure whose size it reads
+  before the card's lands, which is the case that wrote over neighbours.
+  Making that read wait for the landing (the slot's page without access
+  until then) was not done: the page holds other slots and the title's
+  data, the layer writes it with the kernel's copies, and a wait on a title
+  thread for our line is the kind that ended this run.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame

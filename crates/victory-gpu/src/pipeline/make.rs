@@ -260,6 +260,15 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Queues `p` for the workers if it is not made or queued yet: `asked`, as
+/// a draw's is (before the pipelines nothing has asked for), or else among
+/// those made early. Does not wait.
+pub(crate) fn soon(p: &Arc<Pending>, asked: bool) {
+    if p.made.get().is_none() && !p.shaders.is_empty() {
+        start(p, if asked { REQUESTED } else { EARLY });
+    }
+}
+
 /// The stages and hashes of `p`'s shaders, for the log.
 pub(crate) fn names(p: &Pending) -> String {
     p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ")
