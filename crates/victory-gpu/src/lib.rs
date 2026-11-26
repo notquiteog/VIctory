@@ -88,6 +88,9 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+// NVIDIA DLSS through the user's Streamline folder (VICTORY_DLSS_DIR).
+#[cfg(windows)]
+pub mod streamline;
 pub mod signature;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -96,11 +99,17 @@ mod ab;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+// Whose signature a vendor DLL carries, checked before it is loaded.
+#[cfg(windows)]
+pub mod trust;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+// What an upscaler is given each frame, and whose runs (VICTORY_UPSCALER).
+#[cfg(windows)]
+pub mod upscale;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

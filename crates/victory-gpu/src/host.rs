@@ -6620,11 +6620,22 @@ impl HostList {
         // SAFETY: as in `crate::resource::host_resource`; the list's states
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
+        self.transition_copy(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// As [`HostList::transition`], for a host copy held by the caller (the
+    /// title's object may be gone; Belobug e48eb83eb): the state it leaves,
+    /// if that is a change.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 self.changed_something();
                 None
             }
@@ -6633,7 +6644,7 @@ impl HostList {
                 if before != wanted {
                     self.changed_something();
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -9317,12 +9328,19 @@ impl Host {
             if let Some(fg) = &mut p.framegen {
                 fg.disable(&p.swap_chain);
             }
+            crate::streamline::generate::before_resize([width, height]);
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(crate::streamline::generate::swap_chain_flags() as i32),
+                    )
             };
             match resized {
                 Ok(()) => {
@@ -9356,6 +9374,9 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+            // DLSS frame generation presents from a thread of the runtime's
+            // own: the frame's list is run before the present is asked for.
+            let read_now = read_now || crate::streamline::generate::enabled();
             // Frame generation presents through its proxy from the one list
             // upstream runs it with, not one sent ahead: in a sent-ahead
             // list it crashed a run freeing objects (`bury`) after 4 minutes.
@@ -9447,8 +9468,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            let dlss_frame = crate::streamline::generate::before_present([width, height]);
             // The proxy paces generated frames against the display.
             let status = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            if let Some(frame) = dlss_frame {
+                crate::streamline::generate::after_present(frame);
+            }
             #[cfg(feature = "diagnostics")]
             if generated && let Some(fg) = &mut p.framegen {
                 if status.is_ok() {
@@ -9498,25 +9523,29 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: crate::streamline::generate::swap_chain_flags(),
                 ..Default::default()
+            };
+            // With DLSS the swap chain is the runtime's own: it must see
+            // every present (and frame generation presents through it).
+            let dlss_chain = crate::streamline::swap_chain(&factory, &self.queue, hwnd, &desc);
+            let plain = |made: Option<IDXGISwapChain3>| match made {
+                Some(chain) => Ok(chain),
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                    .and_then(|chain| chain.cast::<IDXGISwapChain3>()),
             };
             #[cfg(feature = "diagnostics")]
             let (swap_chain, framegen) = match crate::framegen::enabled()
                 .then(|| crate::framegen::Presentation::create(&factory, &self.device, &self.queue, hwnd, &desc))
                 .flatten()
+                .filter(|_| dlss_chain.is_none())
             {
                 Some((swap_chain, fg)) => (swap_chain, Some(fg)),
-                None => (
-                    factory
-                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
-                        .and_then(|chain| chain.cast::<IDXGISwapChain3>())?,
-                    None,
-                ),
+                None => (plain(dlss_chain)?, None),
             };
             #[cfg(not(feature = "diagnostics"))]
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let swap_chain = plain(dlss_chain)?;
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");

@@ -68,6 +68,10 @@ pub(crate) struct Shader {
     /// ([`crate::ambient::activates_rays`]).
     #[cfg(windows)]
     activates_rays: bool,
+    /// It draws the sky as the title reflects it
+    /// ([`crate::ambient::draws_sky`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -118,6 +122,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(windows)]
+            if let Some(role) = (stage == "compute").then(|| crate::ambient::role(bytes)).flatten() {
+                tracing::info!(?role, hash = &full.to_hex()[..16], "a program the stand-in for the indirect light follows");
+            }
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -126,6 +134,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 activates_rays: stage == "compute" && crate::ambient::activates_rays(bytes),
+                #[cfg(windows)]
+                draws_sky: stage == "pixel" && crate::ambient::draws_sky(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]

@@ -404,16 +404,51 @@ impl<'a> Lower<'a> {
         self.s
             .m
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
-        // 32-bit floats: 24 dwords from byte 16.
+        // 32-bit floats: 24 dwords from byte 16, the first 12 in the node's
+        // first 64 bytes. In title memory the second 12 lie in the same 64 KiB
+        // page, and so in the same copy, for 1,023 of 1,024 aligned nodes: only
+        // a node that starts at 0xFFC0 in its page looks its second half up
+        // again (DexNom/VIctory#21).
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let mut words = self.bvh_node_words(at, None, 16, 12);
-        let second = self.bvh_second_half(at);
-        words.extend(self.bvh_node_words(second, None, 0, 12));
-        let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
-        // (The look for the second half goes on in another block.)
-        let wide_block = self.cur;
-        self.s.m.terminate(wide_block, Term::Br(join));
+        let words = self.bvh_node_words(at, None, 16, 12);
+        let first: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
+        let floats = |l: &mut Self, at: NodeAt| -> (Vec<V>, usize) {
+            let words = l.bvh_node_words(at, None, 0, 12);
+            let mut all = first.clone();
+            all.extend(words.iter().map(|&w| l.as_float(w)));
+            // (The look for the second half may go on in another block.)
+            let end = l.cur;
+            l.s.m.terminate(end, Term::Br(join));
+            (all, end)
+        };
+        // Where the wide floats come from: (floats, block, whether the second
+        // half's page is there).
+        let wide: Vec<(Vec<V>, usize, Option<V>)> = match at {
+            NodeAt::Buffer { .. } => {
+                let second = self.bvh_second_half(at);
+                let (all, end) = floats(self, second);
+                vec![(all, end, None)]
+            }
+            NodeAt::Memory { handle, byte, low, mapped, .. } => {
+                let (k64k, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFC0));
+                let within = self.s.m.bin(self.cur, Bin::And, low, k64k);
+                let crosses = self.s.m.cmp(self.cur, pred::IUGE, within, last);
+                let (cross_block, same_block) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(self.cur, Term::CondBr(crosses, cross_block, same_block));
+                self.cur = same_block;
+                let k64 = self.s.m.i32(64);
+                let byte = self.s.m.bin(same_block, Bin::Add, byte, k64);
+                let (same, same_end) = floats(self, NodeAt::Buffer { handle, byte });
+                self.cur = cross_block;
+                let second = self.bvh_second_half(at);
+                let NodeAt::Memory { mapped: second_mapped, .. } = second else {
+                    unreachable!("the second half of a node in title memory is in title memory")
+                };
+                let (cross, cross_end) = floats(self, second);
+                vec![(same, same_end, Some(mapped)), (cross, cross_end, Some(second_mapped))]
+            }
+        };
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
@@ -440,24 +475,28 @@ impl<'a> Lower<'a> {
         // A page that is not there reads zeros, which are a child and a box:
         // no child of it is hit. (The last two boxes of a 128-byte node are in
         // its second half.)
-        let there = match (at, second) {
-            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
+        let there = match at {
+            NodeAt::Memory { mapped: first, .. } => {
                 let i1t = self.s.m.type_of(first);
                 let mapped = self.s.m.phi(join, i1t);
-                self.s
-                    .m
-                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
+                let mut from: Vec<(V, usize)> = wide
+                    .iter()
+                    .map(|(_, end, there)| (there.expect("in title memory"), *end))
+                    .collect();
+                from.push((first, half_block));
+                self.s.m.set_phi(mapped, from);
                 let both = self.s.m.bin(join, Bin::And, first, mapped);
                 Some([first, first, both, both])
             }
-            _ => None,
+            NodeAt::Buffer { .. } => None,
         };
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
-            self.s
-                .m
-                .set_phi(phi, vec![(floats[n], wide_block), (halves[n], half_block)]);
+            let mut from: Vec<(V, usize)> =
+                wide.iter().map(|(floats, end, _)| (floats[n], *end)).collect();
+            from.push((halves[n], half_block));
+            self.s.m.set_phi(phi, from);
             coords.push(phi);
         }
         // The inverse direction held finite ([`bvh::boxes`]).

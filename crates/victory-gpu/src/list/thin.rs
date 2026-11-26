@@ -149,6 +149,18 @@ impl Front {
         }
     }
 
+    /// Writes down `work`, to run when the translation of the recording
+    /// reaches this place, with the list of ours it goes to. False (and
+    /// `work` is dropped) if nothing is being recorded.
+    pub(super) fn host(&mut self, work: HostWork) -> bool {
+        if self.closed || self.recording.is_none() {
+            return false;
+        }
+        // The box of the box: one word in the stream, taken back once.
+        self.put(HOST, &[Box::into_raw(Box::new(work)) as u64]);
+        true
+    }
+
     fn close(&mut self) {
         if self.closed {
             return;
@@ -469,6 +481,12 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+/// Host work in the list's order ([`Front::host`]): one word, the box.
+const HOST: u64 = after(17);
+
+/// Work a host library records into the list of ours a recording goes to
+/// (`crate::external::in_order`), given that list.
+pub(crate) type HostWork = Box<dyn FnOnce(This) + Send>;
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -697,6 +715,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            continue;
+        }
+        if op == HOST {
+            // SAFETY: made by `Front::host`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut HostWork) };
+            if !skip {
+                work(list);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

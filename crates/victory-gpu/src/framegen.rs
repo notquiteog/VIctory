@@ -282,6 +282,9 @@ pub(crate) fn load(dir: &Path, ml: bool) -> Result<String, String> {
     if !path.is_file() {
         return Err(format!("no {DLL} there"));
     }
+    // Only AMD's own build: a valid signature of Advanced Micro Devices.
+    // The file stays open (and so unchanged) for the life of the process.
+    std::mem::forget(crate::trust::signed_by(&path, crate::trust::AMD)?);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // SAFETY: a NUL-terminated path; its own folder and System32 only.
     let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) };

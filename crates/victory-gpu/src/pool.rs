@@ -57,6 +57,9 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
 
+/// How long a pool asks for no new block after one was refused, in ms.
+const GROWTH_REST: u64 = 500;
+
 fn now() -> u64 {
     crate::host::now_ms()
 }
@@ -180,11 +183,13 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// When a block may be asked for again after one was refused.
+    retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -226,10 +231,14 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
+        // A refused block is not asked for again for each small piece after it
+        // (on a PC short of commit, one 64 MiB refusal was followed by one more
+        // per texture); the free ranges of the blocks there are still served.
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let i = self.add(make()?, ripe.started);
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -242,7 +251,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = make()
+                && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -251,6 +260,18 @@ impl<B: Clone> Pool<B> {
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    /// A new block, unless one was refused less than `GROWTH_REST` ms ago.
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at {
+            return None;
+        }
+        let block = make();
+        if block.is_none() {
+            self.retry_growth_at = now.saturating_add(GROWTH_REST);
+        }
+        block
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -537,6 +558,22 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After codec-d/cool_fox ab75ac3e0's test: the sizes of one refused burst.
+    #[test]
+    fn a_refused_block_is_not_asked_for_again_for_each_small_piece() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        for size in [704_008, 179_720, 179_720, 24_080, 48_648, 524_288, 89_616, 351_760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24_080, 512, 12 + GROWTH_REST, || Some(1)).is_some());
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

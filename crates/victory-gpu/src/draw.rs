@@ -1420,6 +1420,11 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky as This);
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -2720,6 +2725,14 @@ impl State {
             crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
             return;
         }
+        // A program that walks ray-tracing structures nothing has built
+        // (`VICTORY_BVH_HOLD=1`).
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it walks ray-tracing structures nothing has built (VICTORY_BVH_HOLD=1)".to_owned());
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2796,7 +2809,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2822,31 +2835,59 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32), resource))
         };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflections => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
+        if role == Role::Reflections {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| {
+                tracing::info!(found = image.is_some(), "the program that writes the reflections last is dispatched");
+            });
+        }
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflections => image,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((of, image, lit)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflections) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
+        // The resolve's other images of the light's kind and size, once each.
+        let mut others: Vec<(u32, usize, D3D12_GPU_DESCRIPTOR_HANDLE)> = Vec::new();
+        if role == Role::Resolve && crate::ambient::others() {
+            for u in t.used.iter().filter(|u| {
+                u.kind == ResourceType::Uav && u.root == RootType::Table && u.slot == LIGHT.0
+            }) {
+                let Some((d, handle, r)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
+                    continue;
+                };
+                if r != lit
+                    && d.Format.0 == format
+                    && (d.Width, d.Height) == (of.Width, of.Height)
+                    && d.Dimension == of.Dimension
+                    && !others.iter().any(|o| o.1 == r as usize)
+                {
+                    others.push((u.table_offset_dwords, r as usize, handle));
+                }
+            }
+            others.sort_by_key(|o| o.0);
+        }
         crate::ambient::after(list, role, &Views {
             image,
+            others: others.iter().map(|o| (o.0, o.2)).collect(),
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
@@ -3913,6 +3954,11 @@ impl State {
             crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
             return false;
         }
+        if kind == 2 && crate::pipeline::walk_held(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it walks ray-tracing structures nothing has built (VICTORY_BVH_HOLD=1)".to_owned());
+            return false;
+        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -4150,6 +4196,15 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            // As after a dispatch whose counts the title gives itself: the
+            // title runs its last reflection pass this way.
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
         }
