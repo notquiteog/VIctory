@@ -308,14 +308,9 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
+    switch_values(&mut out, env!("VICTORY_SHADER_SWITCHES"), |name| {
+        std::env::var_os(name)
+    });
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.push(u8::from(helper_lane_waves()));
@@ -325,6 +320,26 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
+}
+
+/// The fingerprint's part for the switches `names` lists (comma-separated),
+/// each value read through `value`: `NAME\0` when unset, `NAME=value\0`
+/// when set, so a switch set to nothing keys apart from an unset one
+/// (several count as on when merely set, `VICTORY_STRICT_JOINS` and
+/// `VICTORY_MESH_OUTPUT_STRICT` among them). Pure, for testing.
+fn switch_values(
+    out: &mut Vec<u8>,
+    names: &str,
+    value: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for name in names.split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        if let Some(value) = value(name) {
+            out.push(b'=');
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -1181,6 +1196,38 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("127")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    /// Switches that count as on when merely set (`VICTORY_STRICT_JOINS`,
+    /// `VICTORY_MESH_OUTPUT_STRICT`) translate differently when set to an
+    /// empty value than when unset, so the cache key must tell the two apart.
+    #[test]
+    fn a_switch_set_to_nothing_keys_apart_from_an_unset_one() {
+        use std::ffi::OsString;
+        let key = |strict: Option<&str>, mesh: Option<&str>| {
+            let mut out = Vec::new();
+            super::switch_values(
+                &mut out,
+                "VICTORY_MESH_OUTPUT_STRICT,VICTORY_STRICT_JOINS",
+                |name| match name {
+                    "VICTORY_MESH_OUTPUT_STRICT" => mesh.map(OsString::from),
+                    "VICTORY_STRICT_JOINS" => strict.map(OsString::from),
+                    other => panic!("{other} is not in the list"),
+                },
+            );
+            out
+        };
+        assert_ne!(key(None, None), key(Some(""), None));
+        assert_ne!(key(None, None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(Some("1"), None));
+        // A value cannot run into the next switch's name.
+        assert_ne!(key(Some("x"), None), key(None, Some("x")));
+        assert_eq!(key(Some("1"), None), key(Some("1"), None));
+        // Both are switches the real key reads.
+        let read: Vec<_> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        assert!(read.contains(&"VICTORY_STRICT_JOINS"), "{read:?}");
+        assert!(read.contains(&"VICTORY_MESH_OUTPUT_STRICT"), "{read:?}");
     }
 
     #[test]
