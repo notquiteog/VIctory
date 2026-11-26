@@ -938,8 +938,16 @@ impl Shader {
             features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
-        let isg1 = container::signature(&self.inputs, true);
-        let osg1 = container::signature(&self.outputs, false);
+        // A validator for shader model 6.7 compares signature parts byte for byte with
+        // its own, whose name table ends on a dword; 1.6 writes it unpadded.
+        let pad = |mut part: Vec<u8>| {
+            if minor >= 7 {
+                part.resize(part.len().next_multiple_of(4), 0);
+            }
+            part
+        };
+        let isg1 = pad(container::signature(&self.inputs, true));
+        let osg1 = pad(container::signature(&self.outputs, false));
         let flag = if self.pixel {
             self.outputs.iter().any(|o| (17..=19).contains(&o.kind))
         } else {
@@ -958,7 +966,7 @@ impl Shader {
             wave_size: self.wave_size,
         });
         let hash = [0u8; 20];
-        let psg1 = container::signature(&self.prims, false);
+        let psg1 = pad(container::signature(&self.prims, false));
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
