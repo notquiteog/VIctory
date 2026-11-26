@@ -4463,6 +4463,50 @@ fn make_twinned(
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
+            if resource[0] != BUFFER && !*unordered {
+                // A shader view of a placed texture that has no resource:
+                // `placed_texture` makes none for address 0 (and for a
+                // description the host refuses). This is not unordered
+                // access, and was said as such by the line below until now:
+                // every "placed unordered texture view not mirrored" of
+                // runs before this was read with `address=0x0` and a view
+                // whose word 2 is 5768 (0x1688, the default component
+                // mapping, which only a shader view's description has; an
+                // unordered one has its mip there) and whose words 4 and 5
+                // are a first level and a level count (0 and 15: all), as
+                // every placed shader view's are. The title writes such a
+                // view for a texture it has no memory for (yet): a null
+                // view, which is what the slot gets (`null_for`, in the
+                // view's dimension). Each shape is said once (the first 64),
+                // with all 16 words of the view, and how often so far.
+                static SAID: Mutex<std::collections::BTreeSet<(u64, [u32; 5])>> =
+                    Mutex::new(std::collections::BTreeSet::new());
+                static TIMES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let times = TIMES[usize::from(address != 0)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let shape = (address, [resource[4], resource[6], resource[7], resource[8], desc[1]]);
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if (said.len() < 64 && said.insert(shape)) || times.is_power_of_two() {
+                    if address == 0 {
+                        tracing::info!(
+                            times,
+                            "placed shader texture view without memory (address 0: the title's null view, reads zeros): {}x{} format {} layers {} levels {}, resource {resource:?}, view {desc:?}",
+                            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+                            resource[6],
+                            resource[8],
+                            resource[7] & 0xffff,
+                            resource[7] >> 16
+                        );
+                    } else {
+                        tracing::warn!(
+                            address = format_args!("{address:#x}"),
+                            times,
+                            "placed shader texture view not made (null: reads zeros; no resource for its memory): resource {resource:?}, view {desc:?}"
+                        );
+                    }
+                }
+                return None;
+            }
             if resource[0] != BUFFER {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
@@ -4479,8 +4523,10 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        unordered = true,
+                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}, then {:?}",
+                        &desc[..10],
+                        &desc[12..]
                     );
                 }
                 return None;
