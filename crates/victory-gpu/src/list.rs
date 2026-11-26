@@ -205,6 +205,29 @@ impl Detached {
     }
 }
 
+/// The flight these lists flew in has landed: the card has run them, and
+/// nothing reads the slots of their descriptor tables again. The slots are
+/// given back now and not when the lists are reset, which waits another 64
+/// submissions (`crate::host::bury_lag`, about two frames) so that the
+/// memory their commands named outlives them. That wait is for memory; held
+/// for slots too it kept every table for two frames longer than the card
+/// needed it. A frame asks for about 196,000 slots, and a host whose view
+/// heap is capped at 1,000,000 (NVIDIA) has 262,144 of them: on an RTX 5060
+/// Ti the pool stood at no free slot, 57,000 tables were refused in five
+/// seconds, and their draws were dropped. A host with room for four times
+/// as many (AMD) never ran out.
+/// `VICTORY_SLOTS_AT_LANDING=0`: with the lists' reset, as before.
+#[cfg(windows)]
+pub(crate) fn tables_landed(lists: &mut [Detached]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_AT_LANDING").is_none_or(|v| v != "0")) {
+        return;
+    }
+    for list in lists {
+        list._state.tables_done();
+    }
+}
+
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
