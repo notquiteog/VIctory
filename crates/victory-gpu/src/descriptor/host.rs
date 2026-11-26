@@ -5917,7 +5917,10 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         };
         for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
             let v = view(start + off, raw);
-            assert_eq!(width(&v), len.next_multiple_of(256));
+            // At least the view's bytes; a buffer placed in the card's memory
+            // (NVIDIA cards of 16 GB, `small_on_card`) is made 64 KiB wide.
+            let w = width(&v);
+            assert!(w >= len.next_multiple_of(256) && w % 256 == 0, "width {w} for {len} bytes");
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
             assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
         }

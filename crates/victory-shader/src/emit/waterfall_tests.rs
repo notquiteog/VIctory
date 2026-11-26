@@ -515,6 +515,7 @@ fn a_title_index_past_the_titles_slots_reads_the_null_slot() {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil).expect("DXIL validation failed");
