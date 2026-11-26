@@ -47,6 +47,25 @@ pub fn record<R>(
     out
 }
 
+/// Runs `work` where host work for the title list `list` can be recorded,
+/// at the place the list is at now: at once if the list is recorded as it
+/// is called, else (lists whose calls are only written down,
+/// `VICTORY_THIN=1`) later, on the thread of ours that translates the list,
+/// when it reaches this place. `work` is given the list to name in
+/// [`host_texture`] and [`record`]: the title's own, or the one of ours its
+/// calls go to. The title's objects it names must live until the list has
+/// run, as for any list call. False, with `work` dropped, if `list` is no
+/// list being recorded.
+pub fn in_order(list: *const Object, work: impl FnOnce(*const Object) + Send + 'static) -> bool {
+    crate::list::in_order(list, Box::new(work))
+}
+
+/// Whether the title list `list` is recorded as it is called (it has a host
+/// list now), so that host work goes into it at once.
+pub fn recorded_as_called(list: *const Object) -> bool {
+    crate::list::host_list(list).is_some()
+}
+
 /// What frame generation needs of an upscaled frame besides its depth and
 /// motion vectors: the upscale's constants (as its description has them)
 /// and the motion and depth bits of its creation flags.

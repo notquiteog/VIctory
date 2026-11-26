@@ -520,8 +520,40 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         return UNKNOWN_TYPE;
     }
     // SAFETY: an upscaling, by its type.
-    let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
+    let dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
+    if context.is_null() {
+        return PARAMETER;
+    }
+    // SAFETY: the title passes its context slot.
+    let context = unsafe { *context };
+    if victory_gpu::external::recorded_as_called(list) {
+        return dispatch_into(host, context, dispatch, list);
+    }
+    // A list whose calls are only written down (`VICTORY_THIN=1`): the
+    // upscaling is recorded when the list is translated, from this copy of
+    // its description (what the title chained behind it is gone by then),
+    // and the title is told it went well.
+    struct Job(*mut c_void, DispatchUpscale);
+    // SAFETY: the host's context and the title's objects, which live until
+    // the list has run and are used in the list's order.
+    unsafe impl Send for Job {}
+    let mut job = Job(context, dispatch);
+    if !job.1.header.next.is_null() {
+        once!(warn, "FidelityFX: what the title chains behind an upscaling is left out when its list is only written down");
+        job.1.header.next = null_mut();
+    }
+    let placed = victory_gpu::external::in_order(list, move |list| {
+        let job = job;
+        dispatch_into(host, job.0, job.1, list);
+    });
+    if placed { OK } else { PARAMETER }
+}
+
+/// Records the title's upscaling `dispatch` for the host context `context`
+/// into `list` (the title's list, or the list of ours its calls go to).
+fn dispatch_into(host: &Host, mut context: *mut c_void, mut dispatch: DispatchUpscale, list: *const Object) -> u32 {
+    let context = &raw mut context;
     // Depth and motion as the title names them, for frame generation.
     #[cfg(feature = "diagnostics")]
     let title = dispatch;

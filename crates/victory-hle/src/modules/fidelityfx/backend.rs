@@ -340,18 +340,47 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         once!(warn, kind = format_args!("{kind:#x}"), "host upscaler: only upscaling is served; a FidelityFX dispatch was refused");
         return UNKNOWN_TYPE;
     }
+    let Some(&backend) = BACKEND.get() else {
+        return NO_PROVIDER;
+    };
     // SAFETY: an upscaling, by its type.
-    let d = unsafe { desc.cast::<DispatchUpscale>().read() };
-    let list = d.list.cast::<Object>().cast_const();
+    let job = Job(unsafe { desc.cast::<DispatchUpscale>().read() });
+    let flags = ours.flags;
+    // At this place of the list: now, or when a list that is only written
+    // down is translated. The title is told it went well either way.
+    let placed = victory_gpu::external::in_order(job.0.list.cast::<Object>().cast_const(), move |list| {
+        let job = job;
+        upscale(backend, flags, &job.0, list);
+    });
+    if placed {
+        OK
+    } else {
+        once!(warn, "host upscaler: an upscaling into a list that is not being recorded; it did not run");
+        PARAMETER
+    }
+}
+
+/// The title's upscaling description, for the thread that records it.
+struct Job(DispatchUpscale);
+
+// SAFETY: plain values and the title's objects, which live until the list
+// has run and are used in the list's order.
+unsafe impl Send for Job {}
+
+/// Records the upscaling `d` (of a context made with `flags`) into `list`.
+fn upscale(backend: &dyn Upscaler, flags: u32, d: &DispatchUpscale, list: *const Object) {
     // Colour, depth, motion vectors, exposure, (reactive and transparency
-    // masks,) output: their host copies, in the states the title names.
+    // masks,) output: their host copies, in the states the title names as
+    // far as the host copies can be in them (a depth target read as a
+    // shader resource keeps what its flags allow); the backend is told the
+    // state each is really in.
     let host = |index: usize| {
         let r = &d.resources[index];
         if r.resource.is_null() {
             return Ok(None);
         }
         host_state(r.state)
-            .and_then(|w| victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w).filter(|&(_, state)| state == w))
+            .and_then(|w| victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w))
             .map(Some)
             .ok_or((index, r.state))
     };
@@ -360,11 +389,19 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         Ok((Some(color), Some(depth), Some(motion), exposure, Some(output))) => (color, depth, motion, exposure, output),
         Ok(_) => {
             once!(warn, "host upscaler: an upscaling without colour, depth, motion vectors or output; it did not run");
-            return PARAMETER;
+            return;
         }
         Err((index, state)) => {
-            once!(warn, index, state, "host upscaler: a resource has no host texture in its state; the upscaling did not run");
-            return PARAMETER;
+            once!(
+                warn,
+                index,
+                state,
+                state_known = host_state(state).is_some(),
+                list_is_ours = victory_gpu::external::record(list, |_| ()).is_some(),
+                description = ?d.resources[index].description,
+                "host upscaler: a resource has no host texture; the upscaling did not run"
+            );
+            return;
         }
     };
     let f = |i: usize| f32::from_bits(d.rest[i]);
@@ -380,10 +417,7 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         descriptions = ?[d.resources[0].description, d.resources[1].description, d.resources[2].description, d.resources[6].description],
         "host upscaler: the title's first upscaling (reactive and transparency masks, sharpening: not carried over)"
     );
-    let non_linear = ours.flags & NON_LINEAR_COLOR != 0 || d.rest[17] & DISPATCH_NON_LINEAR != 0;
-    let Some(backend) = BACKEND.get() else {
-        return NO_PROVIDER;
-    };
+    let non_linear = flags & NON_LINEAR_COLOR != 0 || d.rest[17] & DISPATCH_NON_LINEAR != 0;
     let frame = Frame {
         color: (&color.0, color.1),
         depth: (&depth.0, depth.1),
@@ -394,11 +428,11 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         output_size: [d.rest[6], d.rest[7]],
         jitter: [f(0), f(1)],
         motion_scale: [f(2), f(3)],
-        motion_at_output: ours.flags & MOTION_AT_OUTPUT_SIZE != 0,
-        motion_jittered: ours.flags & MOTION_JITTERED != 0,
-        depth_inverted: ours.flags & DEPTH_INVERTED != 0,
-        hdr: ours.flags & HDR != 0 && !non_linear,
-        auto_exposure: ours.flags & AUTO_EXPOSURE != 0,
+        motion_at_output: flags & MOTION_AT_OUTPUT_SIZE != 0,
+        motion_jittered: flags & MOTION_JITTERED != 0,
+        depth_inverted: flags & DEPTH_INVERTED != 0,
+        hdr: flags & HDR != 0 && !non_linear,
+        auto_exposure: flags & AUTO_EXPOSURE != 0,
         pre_exposure: f(11),
         reset: d.rest[12] & 0xff != 0,
         near: f(13),
@@ -406,13 +440,8 @@ pub(super) fn dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         fov_y: f(15),
         frame_time_ms: f(10),
     };
-    match victory_gpu::external::record(list, |host_list| backend.upscale(host_list, &frame)) {
-        Some(Ok(())) => OK,
-        Some(Err(why)) => {
-            once!(error, "host upscaler: an upscaling failed ({why}); the title's output texture was not written");
-            PARAMETER
-        }
-        None => PARAMETER,
+    if let Some(Err(why)) = victory_gpu::external::record(list, |host_list| backend.upscale(host_list, &frame)) {
+        once!(error, "host upscaler: an upscaling failed ({why}); the title's output texture was not written");
     }
 }
 

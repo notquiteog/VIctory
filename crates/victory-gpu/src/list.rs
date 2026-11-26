@@ -179,6 +179,25 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// Runs `work` where host work for the title list `this` can be recorded,
+/// in the list's order: at once, with the list itself, if it has a host
+/// list; for a list whose calls are only written down (`thin`), when the
+/// thread that translates it reaches this place, with the list of ours it
+/// goes to. False, with `work` dropped, if the list is neither.
+#[cfg(windows)]
+pub(crate) fn in_order(this: This, work: thin::HostWork) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    if host_list(this).is_some() {
+        work(this);
+        return true;
+    }
+    // SAFETY: the title passes one of our lists, on the thread that
+    // records into it.
+    unsafe { (*this.cast_mut().cast::<List>()).thin.host(work) }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
