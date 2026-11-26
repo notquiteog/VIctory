@@ -217,7 +217,12 @@ fn resolve_card_limits(
 /// 3,439 copies of 1,254 MB are on the card instead of 57 of 925 MB, the card
 /// works 128 ms a frame and the frame takes 146 ms (run minkb64, median;
 /// 142-150 the middle half) against 161 and 158 ms without (new-base,
-/// new-base2; 157-161 and 156-162). What the copies under 4 MiB hold is little, and every load a
+/// new-base2; 157-161 and 156-162). With this as the default: 140 ms (run
+/// def1; 136-142) against 160 ms with `VICTORY_CARD_BUFFERS_MIN_MB=4` (run
+/// old1; 155-165). The runs were minutes apart and other agents moved the
+/// player between them (5,600 to 7,500 draws a frame), so the scene is not
+/// exactly one; the two sides' middle halves never met.
+/// What the copies under 4 MiB hold is little, and every load a
 /// shader makes from one in the PC's memory crosses the bus. The submitting
 /// thread pays for it (55 ms a frame for the copies in the card's memory
 /// instead of 10: 110,000 ranges sent up), which the frame does not feel
