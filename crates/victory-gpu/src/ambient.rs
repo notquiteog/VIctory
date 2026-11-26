@@ -255,18 +255,6 @@ fn air() -> f32 {
     })
 }
 
-/// LOCAL: how many times the estimate the title's own result may keep
-/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset). Without rays the
-/// probes hold the sky's light indoors too; at 4 times the estimate a room
-/// looked towards a window or the sky goes very bright.
-fn most() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
-    })
-}
-
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
