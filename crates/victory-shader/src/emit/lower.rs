@@ -14727,7 +14727,7 @@ mod tests {
         ];
         for op in ops {
             let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
@@ -14746,7 +14746,7 @@ mod tests {
                 0xBE83_0380,           // s_mov_b32 s3, 0
                 S_ENDPGM,
             ];
-            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
+            lowers(&words, 0).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
         }
         // The zero counts also leave "result != 0" in SCC.
         for op in [0x0D, 0x0E] {
@@ -14758,7 +14758,7 @@ mod tests {
                 0xBE83_0380,           // s_mov_b32 s3, 0
                 S_ENDPGM,
             ];
-            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
+            lowers(&words, 0).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
         }
     }
 

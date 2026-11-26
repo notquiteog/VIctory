@@ -100,6 +100,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    try_build_cs(body, threads, lds_bytes).expect("lower")
+}
+
+/// [`build_valu_cs`] that returns the lowering's error instead of panicking.
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_cs(body, 1, 0)
+}
+
+/// [`build_cs`] that returns the lowering's error instead of panicking.
+fn try_build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -168,8 +178,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -190,7 +199,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         assert_eq!(copy[4..20], ours[..], "container hash mismatch");
     }
 
-    shader
+    Ok(shader)
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -2502,6 +2511,16 @@ fn typed_float_loads_preserve_nan_bits() {
 
 #[test]
 fn v_ldexp_f16_matches_rdna2() {
+    // The console's round-to-nearest (`VICTORY_F16_NEAREST=1`): a host that converts
+    // toward zero (NVIDIA) gives the largest finite half for 1.0 * 2^16 instead of +inf.
+    let was = super::lower::TEST_F16_NEAREST.replace(Some(true));
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::lower::TEST_F16_NEAREST.set(self.0);
+        }
+    }
+    let _restore = Restore(was);
     // VOP2 `v_ldexp_f16 v0, v1, v2` (opcode 0x3b), preserving upper half from v3.
     let vop2_cs = build_valu_cs(&[
         vop1(0x001, 0, vgpr(3)),   // v_mov_b32 v0, v3 (sentinel upper half)

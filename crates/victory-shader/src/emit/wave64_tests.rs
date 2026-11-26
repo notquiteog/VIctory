@@ -528,7 +528,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // ... and the lowering names the block, around which that branch is the one to widen
     let needs = lower::take_needs();
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &needs), Some(vec![branch]));
+    assert_eq!(lower::branches_around(&st, &needs).map(|(b, _)| b), Some(vec![branch]));
     // (taken, past the body, when every lane's bit is clear)
     assert_eq!(st.wave_any[branch], Some(false));
     // wave-wide, every lane runs the reduction (EXEC stays a guard on what it does there)
@@ -687,7 +687,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         per_lane.err()
     );
     let st = structure::structure(&p).expect("structure");
-    assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
+    assert_eq!(lower::branches_around(&st, &lower::take_needs()).map(|(b, _)| b), Some(vec![branch]));
     let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
