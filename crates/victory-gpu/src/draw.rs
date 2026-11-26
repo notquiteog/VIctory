@@ -1090,6 +1090,9 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            // The list draws into it when it runs, which may be after the
+            // title let the texture go: held until the list is reset.
+            list.keep(texture);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             views.push((Some(texture), record.desc()));
@@ -1099,6 +1102,7 @@ impl State {
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            list.keep(texture);
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
