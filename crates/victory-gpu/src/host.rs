@@ -3937,6 +3937,7 @@ mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
+pub(crate) mod truestamp;
 #[cfg(feature = "diagnostics")]
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
@@ -4549,6 +4550,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let began = truestamp::mark(list);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4622,6 +4624,7 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    truestamp::marked(0, began, truestamp::mark(list));
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4704,6 +4707,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let began = truestamp::mark(list);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4728,6 +4732,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    truestamp::marked(1, began, truestamp::mark(list));
                     list.Close()?;
                     list.cast()
                 })()
@@ -6477,7 +6482,9 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                // (All of a slow command's note: what it binds is at its end.)
+                let ms = ticks as f64 * 1e3 / frequency.max(1) as f64;
+                (ms, notes[i].0.chars().take(if ms >= 5.0 { 6000 } else { 300 }).collect())
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -8981,6 +8988,7 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
+        truestamp::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

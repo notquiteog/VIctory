@@ -272,8 +272,11 @@ impl Role {
             Some(Role::Pipelines)
         } else if name.starts_with("victory-wide-") {
             Some(Role::Wide)
-        } else if name == "victory-late-wait" {
+        } else if name == "victory-late-wait" || name == "victory-relay" {
             Some(Role::Late)
+        } else if name == "victory-submit" {
+            // (The thread of ours that serves the line of submissions.)
+            Some(Role::Submit)
         } else if name == "title-main" {
             Some(Role::TitleMain)
         } else {
