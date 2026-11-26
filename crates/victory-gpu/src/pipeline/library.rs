@@ -512,6 +512,99 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Pipelines a driver's compiler crashed on (names, one per line), in the
+/// library's folder: left out on later runs too.
+const CRASHED_FILE: &str = "crashed.txt";
+
+/// Whether the driver crashed making the pipeline named `name` before.
+fn crashed(name: &str) -> bool {
+    static NAMES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            DIR.get()
+                .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                .map(|t| t.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        })
+        .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver makes on this thread.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes a pipeline on this thread. If its compiler crashes there
+/// (the RDNA 4 one does on some of the world's compute shaders,
+/// `amdxc64.dll+0x861b9f`), the pipeline is noted and left out from then on,
+/// and the thread parked: the others, and the title, go on. From
+/// Belobug/VIctory-Belobug-AMD 0d2f6a6.
+struct Making;
+
+/// Whether the guard against a driver's compiler crashing is set up
+/// ([`Making`]). It is for AMD's compiler. NVIDIA's raises access violations
+/// near address zero while it works and handles them itself: the guard, which
+/// sees them first, took those for crashes, left good pipelines out for good
+/// and parked their threads (20 to 28 a run on an RTX 5080, by the report on
+/// Belobug/VIctory-Belobug-AMD#158). So it is on where the host's card is
+/// AMD's and off elsewhere. `VICTORY_COMPILER_GUARD=1` or `=0` says otherwise.
+fn compiler_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_COMPILER_GUARD").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)),
+    })
+}
+
+impl Making {
+    fn new(name: &str) -> Making {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Making
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING.try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default());
+    let name = name.unwrap_or_default();
+    // Only reads or writes of the first pages: our own guards' faults are
+    // elsewhere.
+    if record.ExceptionCode != ACCESS_VIOLATION
+        || name.is_empty()
+        || record.ExceptionInformation[1] >= 0x10000
+    {
+        return 0; // EXCEPTION_CONTINUE_SEARCH: not ours
+    }
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out");
+    if let Some(dir) = DIR.get() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+        if let Ok(mut f) = file {
+            let _ = writeln!(f, "{name}");
+        }
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -519,6 +612,14 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if crashed(name) {
+        // E_FAIL: left out, as a pipeline the driver refused.
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
+    }
+    let create = || {
+        let _making = compiler_guard().then(|| Making::new(name));
+        create()
+    };
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
