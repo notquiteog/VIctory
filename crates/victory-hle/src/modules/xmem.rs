@@ -681,6 +681,26 @@ pub(crate) fn pages_census() -> (usize, usize, usize, usize) {
     (pages, physical.views.len(), physical.views.values().map(|v| v.0).sum(), used.len())
 }
 
+/// With a watched request: a line (a few) when the GPU's page mapping shows
+/// pages of its destination at another address, which is where draws name
+/// them.
+fn watched_alias(to: usize, from: usize, len: usize) {
+    let (start, bytes) = (WATCHED[0].load(Ordering::Relaxed), WATCHED[1].load(Ordering::Relaxed));
+    if bytes == 0 || from == 0 || from >= start + bytes || from + len <= start {
+        return;
+    }
+    static SAID: AtomicUsize = AtomicUsize::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 60 {
+        tracing::info!(
+            read = WATCHED[2].load(Ordering::Relaxed),
+            to = format_args!("{to:#x}"),
+            from = format_args!("{from:#x}"),
+            len,
+            "stream watch: pages of the watched request's destination are shown at another address (a GPU page mapping)"
+        );
+    }
+}
+
 /// See [`pages_written`].
 pub(crate) fn stream_notice() -> bool {
     static ON: LazyLock<bool> =
@@ -1266,6 +1286,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
+    watched_alias(to, from, len);
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
@@ -1292,6 +1313,9 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     lift_thread();
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
+    }
+    for &(to, from, len) in ranges {
+        watched_alias(to as usize, from as usize, len as usize);
     }
     // By the page: the address, and the one whose page it is to show.
     let pages: Vec<(usize, Option<usize>)> = ranges

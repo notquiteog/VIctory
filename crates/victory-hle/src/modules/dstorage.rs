@@ -802,7 +802,8 @@ fn stream_watch(request: &Request) {
 
 /// The streaming log (`VICTORY_DSTORAGE_LOG=<file>`): a line for every
 /// request (`R`: queue, number, file, offset, source bytes, destination
-/// bytes, options, when enqueued, submitted, started, done, result), every
+/// bytes, options, when enqueued, submitted, started, done, result, and the
+/// destination: an address, or its page list), every
 /// status entry written (`S`: array, number, when enqueued, when written),
 /// the title's first look at it after (`P`: array, when written, when
 /// seen), every file opened (`F`), and each second what the title's mapping
@@ -866,7 +867,7 @@ pub(crate) mod stream_log {
         let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
         let r = &job.request;
         line(format_args!(
-            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
+            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}\t{:x}",
             job.lane,
             job.seq,
             r.source as usize,
@@ -877,7 +878,8 @@ pub(crate) mod stream_log {
             ago(job.note.enqueued),
             ago(job.note.submitted),
             ago(Some(started)),
-            result.err().unwrap_or(0)
+            result.err().unwrap_or(0),
+            r.destination as usize
         ));
     }
 }
