@@ -694,6 +694,11 @@ fn dropped(pipeline: usize) {
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
+/// Since the last line of the log: uploads recorded by the pass for a slot
+/// whose view was written, the milliseconds from that write to the upload in
+/// all, and the longest; and the same three for slots that memory mapped or
+/// written under their view made due (from when the runtime told of it).
+pub(crate) static HEAP_TEXTURES_WAITED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 }
 
 /// Dispatches run on the host so far.
@@ -2598,6 +2603,13 @@ impl State {
     /// constants as hex dwords, root views with the title buffer they
     /// point into). A program that does not translate has no bindings to
     /// list; these say which memory it would have read and written (the
+            if let Some((since, by_memory)) = host.texture_slot_since(index, write) {
+                let waited = crate::host::now_ms().saturating_sub(since);
+                let at = if by_memory { 3 } else { 0 };
+                HEAP_TEXTURES_WAITED[at].fetch_add(1, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 1].fetch_add(waited, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 2].fetch_max(waited, Ordering::Relaxed);
+            }
     /// ray-tracing structure builder passes its buffers this way).
     #[cfg(feature = "diagnostics")]
     fn list_dropped_roots(&self, groups: [u32; 3]) {

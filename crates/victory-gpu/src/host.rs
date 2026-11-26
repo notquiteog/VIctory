@@ -9072,6 +9072,19 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                let w = [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURES_WAITED[i].swap(0, Ordering::Relaxed));
+                if w[0] + w[3] > 0 {
+                    tracing::info!(
+                        "textures picked by index, since the line before: {} uploads recorded {:.0} ms after their view was written \
+                         (the longest {} ms), {} uploads {:.0} ms after memory was mapped or written under their view (the longest {} ms)",
+                        w[0],
+                        w[1] as f64 / w[0].max(1) as f64,
+                        w[2],
+                        w[3],
+                        w[4] as f64 / w[3].max(1) as f64,
+                        w[5]
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
