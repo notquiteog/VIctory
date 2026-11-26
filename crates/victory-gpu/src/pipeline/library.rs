@@ -541,6 +541,22 @@ thread_local! {
 /// Belobug/VIctory-Belobug-AMD 0d2f6a6.
 struct Making;
 
+/// Whether the guard against a driver's compiler crashing is set up
+/// ([`Making`]). It is for AMD's compiler. NVIDIA's raises access violations
+/// near address zero while it works and handles them itself: the guard, which
+/// sees them first, took those for crashes, left good pipelines out for good
+/// and parked their threads (20 to 28 a run on an RTX 5080, by the report on
+/// Belobug/VIctory-Belobug-AMD#158). So it is on where the host's card is
+/// AMD's and off elsewhere. `VICTORY_COMPILER_GUARD=1` or `=0` says otherwise.
+fn compiler_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_COMPILER_GUARD").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device)),
+    })
+}
+
 impl Making {
     fn new(name: &str) -> Making {
         use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
@@ -601,7 +617,7 @@ pub(crate) fn pipeline(
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4005_u32 as i32)));
     }
     let create = || {
-        let _making = Making::new(name);
+        let _making = compiler_guard().then(|| Making::new(name));
         create()
     };
     let wide = HSTRING::from(name);
