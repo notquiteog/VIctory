@@ -56,6 +56,9 @@
 //! sets it, `off` leaves the estimate without.
 //! shortcut: the sky's light is taken to reach everything, indoors too.
 //!
+//! `VICTORY_AMBIENT_HUE=<multiple>` bounds how far what the resolve left
+//! may be from the estimate's hue (1.5; 0: any hue).
+//!
 //! `VICTORY_AMBIENT_MAGENTA=0` leaves magenta in what the resolve left to
 //! the bound alone (it is zeroed otherwise: the probes' memory, not light).
 
@@ -313,11 +316,50 @@ fn parse_reflect(set: &str) -> [f32; 2] {
     reflect
 }
 
+/// How far from the estimate's hue what the resolve left may be: the most a
+/// channel holds, as a multiple of what the estimate's hue has at the same
+/// brightness (`VICTORY_AMBIENT_HUE=<multiple>`, 0: any hue).
+///
+/// Without rays the resolve goes on blending its own history where it has
+/// no new samples, and that history is the probes' memory: on blinds behind
+/// glass, on foliage and on thin plants it stayed a saturated blue or
+/// purple from frame to frame (captures light-base and light-mag,
+/// 2026-11-26). The bound on its brightness let it through: a pure blue of
+/// four times the estimate's brightness has 55 times its blue.
+fn hue() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_HUE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
+            .unwrap_or(1.5)
+    })
+}
+
+/// What is done with the resolve's other images of the light's kind (it
+/// writes three: `VICTORY_AMBIENT_OTHERS`): 0: left as the title has them;
+/// 1: raised and bounded as the light is; 2 (diagnostics): the first is
+/// painted red and the second green, to see what each lights.
+fn others_set() -> u8 {
+    static SET: OnceLock<u8> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_OTHERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(OTHERS)
+    })
+}
+
+const OTHERS: u8 = 0;
+
+/// Whether the resolve's other images are asked for.
+pub(crate) fn others() -> bool {
+    others_set() != 0
+}
+
 /// The words of the passes' constants.
-const WORDS: usize = 18;
+const WORDS: usize = 22;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=18, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
+#define RS "RootConstants(num32BitConstants=22, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -329,6 +371,8 @@ cbuffer Set : register(b0) {
     float follow; float most; float air; float least;
     float magenta; float held; float held_least;
     float sky_gain; float sky_least; float sky_power;
+    float paint_r; float paint_g; float paint_b;
+    float hue;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -546,10 +590,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
         }
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
+    float3 paint = float3(paint_r, paint_g, paint_b);
     float3 found;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
-        light[p] = pack(found);
+        light[p] = pack(found * paint);
         return;
     }
     // Between the four points around, those at its own depth first; which
@@ -589,7 +634,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    // Nor the hue of other memory: the bound above is on brightness alone,
+    // and a blue or purple far below it in brightness still has dozens of
+    // times the estimate's blue. No channel holds more than a multiple of
+    // what the estimate's own hue has at that brightness.
+    if (hue > 0.0) {
+        float3 like = found * (dot(was, LUMA) / max(dot(found, LUMA), 1e-6));
+        was = min(was, hue * like);
+    }
+    light[p] = pack(max(was, found) * paint);
 }
 #endif
 "#;
@@ -696,6 +749,9 @@ static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// For [`Role::Resolve`]: the program's other images of the same kind
+    /// and size, by their place in its table ([`others`]).
+    pub(crate) others: Vec<(u32, D3D12_GPU_DESCRIPTOR_HANDLE)>,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The size of the image, and how many slices it has.
@@ -766,6 +822,20 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[15] = sky_gain.to_bits();
     words[16] = sky_least.to_bits();
     words[17] = sky_power.to_bits();
+    for w in &mut words[18..21] {
+        *w = 1.0f32.to_bits();
+    }
+    words[21] = hue().to_bits();
+    if role == Role::Resolve && !views.others.is_empty() {
+        static OTHER: std::sync::Once = std::sync::Once::new();
+        OTHER.call_once(|| {
+            tracing::info!(
+                places = ?views.others.iter().map(|o| o.0).collect::<Vec<_>>(),
+                set = others_set(),
+                "the resolve's other images of the light's kind"
+            );
+        });
+    }
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -861,6 +931,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     views.size[1].div_ceil(8),
                     1,
                 );
+                for (i, other) in views.others.iter().enumerate() {
+                    if others_set() == 2 {
+                        let paint = [[4.0f32, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]][i % 3].map(f32::to_bits);
+                        l.SetComputeRoot32BitConstants(0, 3, paint.as_ptr().cast(), 18);
+                    }
+                    l.SetComputeRootDescriptorTable(2, other.1);
+                    run(
+                        &pass.raise,
+                        views.size[0].div_ceil(8),
+                        views.size[1].div_ceil(8),
+                        1,
+                    );
+                }
             }
         }
     }

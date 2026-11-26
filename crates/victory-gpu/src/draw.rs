@@ -2761,7 +2761,7 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32), resource))
         };
         let at = match role {
             Role::Resolve => LIGHT,
@@ -2774,7 +2774,7 @@ impl State {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
             Role::Radiance | Role::Air | Role::Reflections => image,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((of, image, lit)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
@@ -2785,8 +2785,29 @@ impl State {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
+        // The resolve's other images of the light's kind and size, once each.
+        let mut others: Vec<(u32, usize, D3D12_GPU_DESCRIPTOR_HANDLE)> = Vec::new();
+        if role == Role::Resolve && crate::ambient::others() {
+            for u in t.used.iter().filter(|u| {
+                u.kind == ResourceType::Uav && u.root == RootType::Table && u.slot == LIGHT.0
+            }) {
+                let Some((d, handle, r)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
+                    continue;
+                };
+                if r != lit
+                    && d.Format.0 == format
+                    && (d.Width, d.Height) == (of.Width, of.Height)
+                    && d.Dimension == of.Dimension
+                    && !others.iter().any(|o| o.1 == r as usize)
+                {
+                    others.push((u.table_offset_dwords, r as usize, handle));
+                }
+            }
+            others.sort_by_key(|o| o.0);
+        }
         crate::ambient::after(list, role, &Views {
             image,
+            others: others.iter().map(|o| (o.0, o.2)).collect(),
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
