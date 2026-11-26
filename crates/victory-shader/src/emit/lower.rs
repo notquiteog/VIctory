@@ -6,7 +6,9 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::thread::LocalKey;
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -1419,6 +1421,25 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Restore the previous mode even when a worker catches a panic and
+/// translates another shader on the same thread.
+fn with_lowering_mode<R>(mode: &'static LocalKey<Cell<bool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore {
+        mode: &'static LocalKey<Cell<bool>>,
+        previous: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.mode.set(self.previous);
+        }
+    }
+    let _restore = Restore {
+        mode,
+        previous: mode.replace(true),
+    };
+    f()
+}
+
 /// As [`with_local_waves`], with every other use of a lane mask as a number
 /// and every lane read and write taken per host wave too: the program runs
 /// as it would on a console of 32-lane waves, lanes numbered 0..31 or
@@ -1427,10 +1448,7 @@ thread_local! {
 /// thread group gets per-half results. The last resort for programs that
 /// do not translate otherwise.
 pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_ANY.replace(true);
-    let r = with_local_waves(f);
-    LOCAL_ANY.set(was);
-    r
+    with_lowering_mode(&LOCAL_ANY, || with_local_waves(f))
 }
 
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
@@ -1450,10 +1468,7 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
-    let was = LOCAL_WAVES.replace(true);
-    let r = f();
-    LOCAL_WAVES.set(was);
-    r
+    with_lowering_mode(&LOCAL_WAVES, f)
 }
 
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
@@ -1617,10 +1632,7 @@ thread_local! {
 /// pair they start: the translation of a program refused with
 /// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
 pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
-    let before = FIRST_HALF_PAIRS.replace(true);
-    let result = translate();
-    FIRST_HALF_PAIRS.set(before);
-    result
+    with_lowering_mode(&FIRST_HALF_PAIRS, translate)
 }
 
 /// Which programs with console lanes in groups of several host waves take their console
@@ -14614,6 +14626,38 @@ mod tests {
         assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
         // Loads past the instructions only: from the lowest of them.
         assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
+
+    #[test]
+    fn scoped_lowering_modes_restore_after_a_panic() {
+        use super::{
+            FIRST_HALF_PAIRS, LOCAL_ANY, LOCAL_WAVES, with_first_half_pairs, with_local_waves,
+            with_local_waves_any,
+        };
+
+        let modes = || (LOCAL_WAVES.get(), LOCAL_ANY.get(), FIRST_HALF_PAIRS.get());
+        assert_eq!(modes(), (false, false, false));
+
+        with_local_waves(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| assert_eq!(modes(), (true, true, true)));
+                assert_eq!(modes(), (true, true, false));
+            });
+            assert_eq!(modes(), (true, false, false));
+        });
+        assert_eq!(modes(), (false, false, false));
+
+        let failure = std::panic::catch_unwind(|| {
+            with_local_waves_any(|| {
+                with_first_half_pairs(|| {
+                    assert_eq!(modes(), (true, true, true));
+                    panic!("synthetic lowering panic");
+                });
+            });
+        })
+        .expect_err("the lowering panic should be caught");
+        assert_eq!(failure.downcast_ref::<&str>(), Some(&"synthetic lowering panic"));
+        assert_eq!(modes(), (false, false, false));
     }
 
     #[test]
