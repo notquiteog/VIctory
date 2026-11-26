@@ -1055,12 +1055,17 @@ impl TextureQueue {
 
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+    /// part; the frames the oldest due one has waited since its write; and
+    /// those uploaded whole that wait for another look at their memory
+    /// ([`TextureQueue::recheck`]: they counted as waiting for their memory,
+    /// and were most of that count).
+    fn census(&self, frame: u64) -> [u64; 6] {
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
+            } else if w.checked.2 != 0 {
+                c[5] += 1;
             } else if w.looks > 0 {
                 c[2] += 1;
             }
@@ -2070,7 +2075,7 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
@@ -5502,7 +5507,7 @@ mod tests {
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
         assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.census(9), [9, 9, 0, 0, 8, 0]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
