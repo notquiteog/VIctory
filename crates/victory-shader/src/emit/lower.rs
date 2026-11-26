@@ -2573,9 +2573,6 @@ impl<'a> Lower<'a> {
         if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
             return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
         }
-        if halves && self.group_wide.is_some() && !self.all_group(self.cur_ir) {
-            return Err("a wave sum of 16-bit floats inside a divergent scalar branch");
-        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
@@ -5483,16 +5480,23 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
+        // shortcut: LDS addresses are taken as aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let byte_addr = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
+            l.s.m.bin(c, Bin::Add, a, o)
+        };
+        let dword_at = |l: &mut Self, at: V| -> V {
+            let c = l.cur;
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
+        };
+        let dword = |l: &mut Self, bytes: u32| -> V {
+            let at = byte_addr(l, bytes);
+            dword_at(l, at)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5586,45 +5590,118 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_read") {
-            let elements = if rest.starts_with('2') {
-                pair(name)
-            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                vec![(offset, width(name))]
-            } else {
-                return Err("an LDS read of bytes or halves");
-            };
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let mut n = 0;
-            for (off, w) in elements {
-                for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
-                    self.write(inst, Reg::V(reg + n), x, guard);
-                    n += 1;
+            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else {
+                    vec![(offset, width(name))]
+                };
+                let mut n = 0;
+                for (off, w) in elements {
+                    for k in 0..w {
+                        let p = dword(self, off + 4 * k);
+                        let x = self.s.m.load(self.cur, p);
+                        self.write(inst, Reg::V(reg + n), x, guard);
+                        n += 1;
+                    }
                 }
+                return Ok(());
             }
+            let (bytes, signed, d16) = match rest {
+                "_u8" => (1u32, false, None),
+                "_i8" => (1, true, None),
+                "_u16" => (2, false, None),
+                "_i16" => (2, true, None),
+                "_u8_d16" => (1, false, Some(false)),
+                "_u8_d16_hi" => (1, false, Some(true)),
+                "_i8_d16" => (1, true, Some(false)),
+                "_i8_d16_hi" => (1, true, Some(true)),
+                "_u16_d16" => (2, false, Some(false)),
+                "_u16_d16_hi" => (2, false, Some(true)),
+                _ => return Err("an LDS read of bytes or halves"),
+            };
+            let at = byte_addr(self, offset);
+            let p = dword_at(self, at);
+            let word = self.s.m.load(self.cur, p);
+            let c = self.cur;
+            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
+            let three = self.s.m.i32(3);
+            let off_in_word = self.s.m.bin(c, Bin::And, at, lane_mask);
+            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
+            let raw = self.s.m.bin(c, Bin::LShr, word, shift);
+            let ext = if signed {
+                let k = self.s.m.i32(32 - 8 * bytes);
+                let hi = self.s.m.bin(c, Bin::Shl, raw, k);
+                self.s.m.bin(c, Bin::AShr, hi, k)
+            } else {
+                let m = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
+                self.s.m.bin(c, Bin::And, raw, m)
+            };
+            let x = match d16 {
+                None => ext,
+                Some(false) => self.low_half(inst, reg, ext),
+                Some(true) => self.high_half(inst, reg, ext),
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
-            let elements = if rest.starts_with('2') {
-                pair(name)
-            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                vec![(offset, width(name))]
-            } else {
-                return Err("an LDS write of bytes or halves");
-            };
-            let mut stores = Vec::new();
-            for (e, (off, w)) in elements.into_iter().enumerate() {
-                let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
-                for (k, x) in vals.into_iter().enumerate() {
-                    stores.push((off + 4 * k as u32, x));
+            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                let elements = if rest.starts_with('2') {
+                    pair(name)
+                } else {
+                    vec![(offset, width(name))]
+                };
+                let mut stores = Vec::new();
+                for (e, (off, w)) in elements.into_iter().enumerate() {
+                    let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+                    for (k, x) in vals.into_iter().enumerate() {
+                        stores.push((off + 4 * k as u32, x));
+                    }
                 }
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let p = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
             }
+            let (bytes, hi_src) = match rest {
+                "_b8" => (1u32, false),
+                "_b16" => (2, false),
+                "_b8_d16_hi" => (1, true),
+                "_b16_d16_hi" => (2, true),
+                _ => return Err("an LDS write of bytes or halves"),
+            };
+            let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+            let at_bytes = byte_addr(self, offset);
+            let p = dword_at(self, at_bytes);
+            let c = self.cur;
+            if hi_src {
+                let k16 = self.s.m.i32(16);
+                val = self.s.m.bin(c, Bin::LShr, val, k16);
+            }
+            let mask_val = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
+            let val = self.s.m.bin(c, Bin::And, val, mask_val);
+            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
+            let three = self.s.m.i32(3);
+            let off_in_word = self.s.m.bin(c, Bin::And, at_bytes, lane_mask);
+            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
+            let shifted_mask = self.s.m.bin(c, Bin::Shl, mask_val, shift);
+            let all_ones = self.s.m.i32(!0u32);
+            let clear_mask = self.s.m.bin(c, Bin::Xor, shifted_mask, all_ones);
+            let shifted_val = self.s.m.bin(c, Bin::Shl, val, shift);
+            // Atomic clear + set so concurrent lanes writing adjacent bytes or
+            // halves within the same 32-bit dword do not race.
             let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
-            }
+            self.s
+                .m
+                .atomic(self.cur, super::bitcode::Rmw::And, p, clear_mask);
+            self.s
+                .m
+                .atomic(self.cur, super::bitcode::Rmw::Or, p, shifted_val);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -6191,6 +6268,85 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_bcnt0_i32_b64" => {
+                    // The count of clear bits: the set bits of the complement.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (i32t, ones) = (self.s.t.i32, self.s.m.i32(u32::MAX));
+                    let (a, b) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let na = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+                    let nb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    self.set(lo, Val::I32(r));
+                    let z = self.s.m.i32(0);
+                    let s = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The lowest clear bit, -1 for none: the lowest set bit
+                    // of the complement, as s_ff1_i32_b64.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (i32t, ones) = (self.s.t.i32, self.s.m.i32(u32::MAX));
+                    let (a, b) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, b, z);
+                    let fb = self.s.m.select(c, none, fb, fb32);
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let r = self.s.m.select(c, low, fa, fb);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    // The first bit from the top of the pair (for the signed
+                    // form, the first that differs from the sign), counted
+                    // from bit 63; -1 for none. The high dword answers unless
+                    // it has no such bit; then it is all sign (or zero), and
+                    // the low dword is searched for a bit that differs from it.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let signed = name == "s_flbit_i32_i64";
+                    let fh = self.s.op(
+                        c,
+                        "unaryBits.i32",
+                        Attr::ReadNone,
+                        i32t,
+                        if signed { 34 } else { 33 },
+                        &[b],
+                    );
+                    let a = if signed {
+                        self.s.m.bin(c, Bin::Xor, a, b)
+                    } else {
+                        a
+                    };
+                    let fl = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let (z, k32, m1) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(u32::MAX));
+                    let fl32 = self.s.m.bin(c, Bin::Add, fl, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let fl = self.s.m.select(c, none, m1, fl32);
+                    let high = self.s.m.cmp(c, pred::NE, fh, m1);
+                    let r = self.s.m.select(c, high, fh, fl);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -6387,6 +6543,18 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
+            "s_ff0_i32_b32" | "s_bcnt0_i32_b32" => {
+                // The same of the complement: the first clear bit (-1 for
+                // none), or the count of clear bits.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -6462,6 +6630,44 @@ impl<'a> Lower<'a> {
                     let nb = self.s.m.bin(c, Bin::Xor, bit, ones);
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
+            }
+            "s_absdiff_i32" => {
+                // |a - b| of the wrapped difference; SCC is set below as for
+                // the other results (nonzero).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let t = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, t, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, t);
+                (self.s.m.select(c, neg, n, t), None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, t, k), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // The low half of the result is half of src0 (low for ll and
+                // lh, high for hh), the high half the one of src1 (low for ll,
+                // high otherwise).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low, high) = (
+                    self.s.m.i32(16),
+                    self.s.m.i32(0xFFFF),
+                    self.s.m.i32(0xFFFF_0000),
+                );
+                let lo_half = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let hi_half = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, lo_half, hi_half), None)
             }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -11406,6 +11612,19 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// `x` (low 16 bits) as the high half of VGPR `reg`, keeping its low half.
+    fn high_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
+        let c = self.cur;
+        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        };
+        let (low, k16) = (self.s.m.i32(0xFFFF), self.s.m.i32(16));
+        let old = self.s.m.bin(c, Bin::And, old, low);
+        let x = self.s.m.bin(c, Bin::Shl, x, k16);
+        self.s.m.bin(c, Bin::Or, old, x)
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let sampler = self.descriptors.get(&((b, i), true)).copied();
         if let Some(Source::Phi { block, args }) = sampler
@@ -14100,6 +14319,65 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn scalar_pack_extend_and_absdiff_lower() {
+        // Each computes into s2 from two constants and branches on it (only
+        // code with an effect needs its operands).
+        let head = [
+            0xBE80_0387, // s_mov_b32 s0, 7
+            0xBE81_0383, // s_mov_b32 s1, 3
+        ];
+        let tail = [
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let ops = [
+            0x9602_0100, // s_absdiff_i32 s2, s0, s1
+            0xBE82_1901, // s_sext_i32_i8 s2, s1
+            0xBE82_1A01, // s_sext_i32_i16 s2, s1
+            0x9902_0100, // s_pack_ll_b32_b16 s2, s0, s1
+            0x9982_0100, // s_pack_lh_b32_b16 s2, s0, s1
+            0x9A02_0100, // s_pack_hh_b32_b16 s2, s0, s1
+        ];
+        for op in ops {
+            let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
+            lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_zero_counts_and_bit_scans_lower() {
+        // s_bcnt0_i32_b32/_b64, s_ff0_i32_b32/_b64, s_flbit_i32_b64 and
+        // s_flbit_i32_i64 of s0 (or the pair s[0:1]), with a branch on the
+        // result so the instruction has an effect.
+        for op in [0x0D, 0x0E, 0x11, 0x12, 0x16, 0x18] {
+            let words = [
+                0xBE80_03C1,           // s_mov_b32 s0, -1
+                0xBE81_0380,           // s_mov_b32 s1, 0
+                0xBE82_0000 | op << 8, // <op> s2, s0 (s[0:1])
+                0xBF07_8002,           // s_cmp_lg_u32 s2, 0
+                0xBF85_0001,           // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,           // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ];
+            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
+        }
+        // The zero counts also leave "result != 0" in SCC.
+        for op in [0x0D, 0x0E] {
+            let words = [
+                0xBE80_03C1,           // s_mov_b32 s0, -1
+                0xBE81_0380,           // s_mov_b32 s1, 0
+                0xBE82_0000 | op << 8, // s_bcnt0_i32_b32/_b64 s2, s0 (s[0:1])
+                0xBF85_0001,           // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,           // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ];
+            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
+        }
     }
 
     #[test]
