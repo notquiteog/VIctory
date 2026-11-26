@@ -1623,8 +1623,16 @@ impl HostHeap {
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+            // A sampler heap is made whole, 2,048 slots on any host: shaders
+            // clamp sampler indices to 2,047 (`heap_handle_at`), so a title
+            // heap of fewer samplers would leave that slot past the end.
+            let size = if sampler {
+                (count + extra).max(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE)
+            } else {
+                count + extra
+            };
+            match make(size) {
+                Ok(heap) => (heap, count, size),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -6397,6 +6405,20 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A sampler heap of a few title samplers still holds the slot shaders
+    /// clamp sampler indices to, and has no dynamic slots.
+    #[test]
+    fn small_sampler_heap_holds_the_clamped_slot() {
+        let Some(heap) = HostHeap::new(true, 16) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count, 16);
+        assert_eq!(heap.dynamic(1), None);
+        // SAFETY: a plain query of a live heap.
+        let total = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert_eq!(total, D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE);
     }
 
     #[test]
