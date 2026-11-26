@@ -1066,6 +1066,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            VENDOR.store(desc.VendorId, Ordering::Relaxed);
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
                 adapter = name.trim_end_matches('\0'),
@@ -1950,6 +1951,15 @@ static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 fn card_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
+}
+
+/// The host adapter's vendor as PCI numbers it (0x10de NVIDIA, 0x1002 AMD,
+/// 0x8086 Intel); 0 until the device is made, or if it could not be asked.
+static VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// [`VENDOR`].
+pub(crate) fn vendor() -> u32 {
+    VENDOR.load(Ordering::Relaxed)
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow

@@ -207,6 +207,27 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// Whether title buffers from 64 KiB on get their copy in the card's memory
+/// where neither `VICTORY_CARD_BUFFERS_MIN_KB` nor `VICTORY_CARD_BUFFERS_MIN_MB`
+/// says a least size: on an NVIDIA card with a budget over 12 GiB.
+///
+/// Measured on an RTX 5060 Ti 16 GB (eight lanes to the PC), standing in the
+/// open world at 31 host submissions and 6,100-6,300 draws a frame, the card
+/// at work for 148 of the frame's 161 ms: with the least size at 64 KiB
+/// 3,439 copies of 1,254 MB are on the card instead of 57 of 925 MB, the card
+/// works 128 ms a frame and the frame takes 146 ms (run minkb64, median;
+/// 142-150 the middle half) against 161 and 158 ms without (new-base,
+/// new-base2; 157-161 and 156-162). What the copies under 4 MiB hold is little, and every load a
+/// shader makes from one in the PC's memory crosses the bus. The submitting
+/// thread pays for it (55 ms a frame for the copies in the card's memory
+/// instead of 10: 110,000 ranges sent up), which the frame does not feel
+/// while it waits for the card; on a card that is not the frame's limit the
+/// old least size may be the better one (`VICTORY_CARD_BUFFERS_MIN_MB=4`).
+fn small_on_card(vendor: u32, local_vram_budget: Option<u64>) -> bool {
+    const NVIDIA: u32 = 0x10de;
+    vendor == NVIDIA && local_vram_budget.is_some_and(|budget| budget >> 20 > 12 * 1024)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -229,10 +250,11 @@ fn card_limits() -> (u64, u64) {
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
+        let min_kib = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&kib| kib > 0);
+        if let Some(kib) = min_kib {
             min_bytes = kib << 10;
+        } else if env_mb("VICTORY_CARD_BUFFERS_MIN_MB").is_none() && small_on_card(crate::host::vendor(), vram_budget) {
+            min_bytes = 64 << 10;
         }
         if card_all() {
             min_bytes = 0;
