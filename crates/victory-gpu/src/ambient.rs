@@ -37,6 +37,14 @@
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
 //!
+//! The title's reflections are traced too: without rays every glossy
+//! surface mirrors the sky, unoccluded (a white glaze on a wooden floor,
+//! five to ten times the room). After the program that writes them last
+//! (`CS_UpdateHistory`) they are held to a multiple of the estimate where
+//! they are (beloooo's find, Belobug 44dcd4371 and c3bd5612c, which hold
+//! them to a part of its constant): `VICTORY_AMBIENT_REFLECT=<most>[,<least>]`,
+//! both as multiples of the light around; 0 leaves them.
+//!
 //! `VICTORY_AMBIENT_MAGENTA=0` leaves magenta in what the resolve left to
 //! the bound alone (it is zeroed otherwise: the probes' memory, not light).
 
@@ -57,6 +65,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the reflections for the last time in a frame; the lighting
+    /// programs read them next.
+    Reflections,
 }
 
 /// The program's part in this, by its name in the container.
@@ -68,6 +79,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflections)
     } else {
         None
     }
@@ -92,6 +105,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reflections are (R9G9B9E5 as 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -177,11 +192,33 @@ fn magenta_out() -> bool {
     *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_MAGENTA").is_none_or(|v| v != "0"))
 }
 
+/// The most and the least a reflection holds, as multiples of the light
+/// around (`VICTORY_AMBIENT_REFLECT=<most>[,<least>]`; a most of 0 leaves
+/// the title's reflections alone, a least of 0 leaves dark ones dark).
+/// shortcut: stands in for what the title's traced reflections would see.
+fn reflect() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
+}
+
+/// What holds the reflections unless something else is asked for.
+const REFLECT: [f32; 2] = [0.5, 0.0];
+
+fn parse_reflect(set: &str) -> [f32; 2] {
+    let mut reflect = REFLECT;
+    for (to, v) in reflect.iter_mut().zip(set.split(',')) {
+        if let Some(v) = v.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0) {
+            *to = v;
+        }
+    }
+    reflect
+}
+
 /// The words of the passes' constants.
-const WORDS: usize = 13;
+const WORDS: usize = 15;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -191,7 +228,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float least;
-    float magenta;
+    float magenta; float held; float held_least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -302,7 +339,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -316,6 +353,41 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// Reflections: no brighter than a multiple of the light around, as the last
+// resolve's points have it (no depth here: taken between the four around).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 around;
+    if (constant > 0.0) {
+        around = float3(1.0, 0.98, 0.94) * constant;
+    } else {
+        float2 g = (float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        float3 all = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            uint at0 = (q.y * PX + q.x) * 3;
+            all += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        }
+        around = lerp(all, cells[CELLS].rgb, 0.2) * level;
+        if (least > 0.0) around = max(around, float3(1.0, 0.98, 0.94) * least);
+    }
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    float most = dot(around, LUMA) * held;
+    if (has > most) light[at.xy] = pack(c * (most / has));
+    else if (has < dot(around, LUMA) * held_least) light[at.xy] = pack(around * held_least);
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -404,6 +476,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -441,6 +514,7 @@ fn make(
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -450,6 +524,7 @@ fn make(
         gather,
         raise,
         air,
+        hold,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -478,6 +553,10 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a resolve has gathered the light around every point: what the
+/// reflections are held to.
+static GATHERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
@@ -509,6 +588,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    let [held, held_least] = reflect();
+    if role == Role::Reflections && (held == 0.0 || (constant == 0.0 && !GATHERED.load(Ordering::Relaxed))) {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -516,6 +599,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
+    }
+    if role == Role::Reflections {
+        static HELD: std::sync::Once = std::sync::Once::new();
+        HELD.call_once(|| tracing::info!(size = ?views.size, held, held_least, "reflections held to the light around"));
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
@@ -532,6 +619,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[10] = air().to_bits();
     words[11] = least().to_bits();
     words[12] = f32::from(magenta_out()).to_bits();
+    words[13] = held.to_bits();
+    words[14] = held_least.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -561,10 +650,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 views.size[1].div_ceil(8),
                 views.slices.div_ceil(2),
             ),
+            Role::Reflections => run(
+                &pass.hold,
+                views.size[0].div_ceil(8),
+                views.size[1].div_ceil(8),
+                1,
+            ),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
+                    GATHERED.store(true, Ordering::Relaxed);
                 }
                 run(
                     &pass.raise,
@@ -601,6 +697,14 @@ mod tests {
     }
 
     #[test]
+    fn reflections_held() {
+        assert_eq!(parse_reflect(""), REFLECT);
+        assert_eq!(parse_reflect("0"), [0.0, REFLECT[1]]);
+        assert_eq!(parse_reflect("2,0.25"), [2.0, 0.25]);
+        assert_eq!(parse_reflect("-1,nan"), REFLECT);
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(
             role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."),
@@ -614,6 +718,7 @@ mod tests {
             role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"),
             Some(Role::Air)
         );
+        assert_eq!(role(b"..CS_UpdateHistory_5f1c.."), Some(Role::Reflections));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
