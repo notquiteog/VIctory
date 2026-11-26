@@ -3021,7 +3021,7 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
 
 /// Texture `this`'s console layout (one plane), where it lies in title
 /// memory and the bytes that layout takes, for `crate::texback`; `None` for
-/// a buffer or a texture with planes.
+/// buffers, multi-plane textures, and layouts we cannot address.
 #[cfg(windows)]
 pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
     if this.is_null() {
@@ -3032,10 +3032,27 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
         return None;
     }
     let t = texture_layout(&r.desc)?;
-    let [plane] = &t.planes[..] else {
+    let [mut plane]: [_; 1] = t.planes.try_into().ok()?;
+    let at = r.data() as usize;
+    const R32_FLOAT: u32 = 41;
+    if r.desc.format == R32_FLOAT && at.is_multiple_of(65536) {
+        use victory_formats::texture::RenderPipeConfig;
+        let pipes = match crate::console::current() {
+            crate::console::Console::SeriesS => RenderPipeConfig::Pipes8Packers4,
+            crate::console::Console::SeriesX => RenderPipeConfig::Pipes32Packers8,
+        };
+        plane.layout.configure_render_xor(pipes);
+    }
+    if !plane.layout.addressable() {
+        // Recording and waiting for a GPU copy cannot produce a CPU-visible
+        // plane if the console's address equation is unavailable.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(width = r.desc.width, height = r.desc.height,
+            format = r.desc.format, swizzle = plane.layout.desc.swizzle.0,
+            "water readback skipped before GPU copy: unsupported console layout"));
         return None;
-    };
-    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+    }
+    Some((plane.layout, at, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -3403,6 +3420,24 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn water_readback_requires_an_addressable_console_plane() {
+        for (swizzle, bias, supported) in [(0x105, 0, true), (0x11b, 0, true),
+            (0x11b, 256, false), (0x119, 0, false)] {
+            let desc = ResourceDesc { layout: swizzle, flags: 4, ..texture(256, 256, 41, 1) };
+            let bytes = footprint(&desc).unwrap().size as usize;
+            let memory = vec![0u8; bytes + 65536 + bias];
+            let at = (memory.as_ptr() as usize).next_multiple_of(65536) + bias;
+            let mut r = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), at as u64, &desc, 0,
+                std::ptr::null(), &PAGEABLE_IIDS[0], &mut r), object::S_OK);
+            let destination = title_texture(r).map(|(_, base, extent)| (base, extent));
+            assert_eq!(destination, supported.then_some((at, bytes)));
+            assert_eq!(resource_release(r), 0);
         }
     }
 
