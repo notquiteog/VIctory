@@ -1471,7 +1471,8 @@ fn own_bits_on() -> bool {
 /// wave operations include helper lanes (shader model 6.7 on the host,
 /// [`super::set_helper_lane_waves`]), and whether heap handles stay in
 /// their blocks ([`heap_handles_local`]), and whether wide indirect
-/// dispatches are split (`split_group_base`).
+/// dispatches are split (`split_group_base`), and whether atomic
+/// subtractions are loops ([`atomic_sub_loops`]).
 pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
@@ -1479,10 +1480,47 @@ pub fn host_settings() -> [u32; 6] {
         super::shader::raw_views(),
         host_rdna(),
         u32::from(super::helper_lane_waves()),
-        // (One word for both, so that a cache made before the second
-        // existed keeps its key while it is off.)
-        u32::from(heap_handles_local()) | u32::from(split_group_base()) << 1,
+        // (One word for the three, so that a cache made before the later
+        // ones existed keeps its key while they are off.)
+        u32::from(heap_handles_local()) | u32::from(split_group_base()) << 1 | u32::from(atomic_sub_loops()) << 2,
     ]
+}
+
+/// Whether an atomic subtraction on group-shared memory (`ds_sub_u32`, and
+/// `ds_add_u32` of a value the program negated) is written as a
+/// compare-exchange loop (`bitcode`'s `atomic_subtracts`) instead
+/// of one `atomicrmw`. NVIDIA's compiler refuses the pipeline of a program
+/// with the one instruction as out of memory (fxceless/victory-fork#1034,
+/// weatherParticle's CS_BeginUpdate on an RTX 5060 Ti and an RTX 5080). On
+/// where the host is an NVIDIA card ([`set_host_nvidia`]) and off elsewhere,
+/// where the code is as it was; `VICTORY_ATOMIC_SUB_LOOP=1` or `=0` says
+/// otherwise. Part of the translation ([`host_settings`]).
+pub(super) fn atomic_sub_loops() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SUB_LOOPS.get() {
+        return on;
+    }
+    static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| match std::env::var("VICTORY_ATOMIC_SUB_LOOP").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    set.unwrap_or_else(|| HOST_NVIDIA.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+static HOST_NVIDIA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host's shaders are compiled by NVIDIA's
+/// driver ([`atomic_sub_loops`]).
+pub fn set_host_nvidia(on: bool) {
+    HOST_NVIDIA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`atomic_sub_loops`], for its thread only.
+    pub(super) static TEST_SUB_LOOPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a handle made from the descriptor heap, and a handle's

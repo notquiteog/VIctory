@@ -1713,6 +1713,84 @@ fn ds_min_max_f32_are_atomic_across_waves() {
 }
 
 #[test]
+fn ds_subtractions_are_atomic_across_waves() {
+    // NVIDIA's compiler refuses the pipeline of an atomic subtraction on
+    // group memory written as one `atomicrmw` (fxceless/victory-fork#1034):
+    // as a compare-exchange loop (`VICTORY_ATOMIC_SUB_LOOP`) it must give
+    // what the one instruction gives. (And WARP loses the device running
+    // an `atomicrmw sub`, which `ds_sub_u32` was until it became the add
+    // of the value negated.)
+    // 64 threads: LDS[0] = v1, then every thread takes its index off, as
+    // `ds_add_u32` of the index negated and as `ds_sub_u32`; v0 = LDS[0],
+    // or (`_rtn`, one thread) what the atomic returned.
+    const DS_ADD_U32: u8 = 0x00;
+    const DS_SUB_U32: u8 = 0x01;
+    const DS_ADD_RTN_U32: u8 = 0x20;
+    const DS_SUB_RTN_U32: u8 = 0x21;
+    let sum: u32 = (0..64).sum();
+    for loops in [true, false] {
+        let build = |body: &[u32], threads: u32| {
+            lower::TEST_SUB_LOOPS.set(Some(loops));
+            let shader = build_cs(body, threads, 512);
+            lower::TEST_SUB_LOOPS.set(None);
+            shader
+        };
+        // The form the card's compiler may refuse is not asked of it.
+        let devices: &[(&str, bool)] = if loops { &[("hardware", false), ("warp", true)] } else { &[("warp", true)] };
+        for negated in [true, false] {
+            let take = |rtn: bool, vdst: u8| -> Vec<u32> {
+                if negated {
+                    // v_sub_nc_u32 v6, 0, v0; ds_add(_rtn)_u32
+                    let mut w = vec![vop2(0x26, 6, 0x80, 0)];
+                    w.extend(ds(if rtn { DS_ADD_RTN_U32 } else { DS_ADD_U32 }, vdst, 5, 6));
+                    w
+                } else {
+                    ds(if rtn { DS_SUB_RTN_U32 } else { DS_SUB_U32 }, vdst, 5, 0).to_vec()
+                }
+            };
+            let mut body = vec![vop1(0x001, 5, 0x80)];
+            body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+            body.push(S_BARRIER);
+            body.extend(take(false, 0));
+            body.push(S_BARRIER);
+            body.extend(ds(DS_READ_B32, 0, 5, 0));
+            let shader = build(&body, 64);
+            run_cases_on(&shader, &[[1_000_000, 0, 0, 0], [5, 0, 0, 0]], devices, |backend, _, inp, got| {
+                assert_eq!(
+                    got,
+                    inp[0].wrapping_sub(sum),
+                    "{backend}: {} less 0..63 over 64 threads (loops {loops}, negated {negated})",
+                    inp[0],
+                );
+            });
+            // One thread (WaveSize(32), which WARP's pipeline creation
+            // refuses): v0 = v2, taken off LDS[0] = v1; the old value returns.
+            if !loops {
+                continue;
+            }
+            for old_result in [true, false] {
+                let mut body = vec![vop1(0x001, 5, 0x80), vop1(0x001, 0, vgpr(2))];
+                body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+                body.extend(take(true, 0));
+                if !old_result {
+                    body.extend(ds(DS_READ_B32, 0, 5, 0));
+                }
+                let shader = build(&body, 1);
+                run_cases_on(
+                    &shader,
+                    &[[100, 7, 0, 0], [0, 1, 0, 0], [7, 0x8000_0000, 0, 0]],
+                    &[("hardware", false)],
+                    |backend, _, inp, got| {
+                        let want = if old_result { inp[0] } else { inp[0].wrapping_sub(inp[1]) };
+                        assert_eq!(got, want, "{backend}: {} less {} (negated {negated}, old value {old_result})", inp[0], inp[1]);
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
     let cmp_lo = build_valu_cs(&[

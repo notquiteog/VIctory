@@ -245,15 +245,23 @@ pub fn run(
         victory_core::ensure_outside_repo(Path::new(&dir))?;
     }
     let paths = crate::default_paths(paths)?;
+    let mut nvidia = false;
     let host_caps = if pipelines {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         if let Some(name) = host.adapter_name() {
             println!("pipeline adapter: {name}");
         }
+        nvidia = host.nvidia();
         host.translation_caps()
     } else {
         None
     };
+    // `VICTORY_HOST_NVIDIA=1` (or `=0`): as for an NVIDIA card (or not),
+    // whose compiler takes no atomic subtraction on group memory
+    // (`VICTORY_ATOMIC_SUB_LOOP`); otherwise the pipeline adapter's vendor.
+    victory_shader::emit::set_host_nvidia(
+        std::env::var_os("VICTORY_HOST_NVIDIA").map_or(nvidia, |v| v == "1"),
+    );
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE")
@@ -303,7 +311,7 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    let work = || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -321,7 +329,20 @@ pub fn run(
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
-                    });
+                    };
+                    // The driver compiles a pipeline on the thread that asks
+                    // for it; the runtime's pipeline workers have this much
+                    // stack (`victory-gpu`'s `pipeline::make`), so a refusal
+                    // here is one the game sees too.
+                    // `VICTORY_TRANSLATE_STACK_MB` says otherwise.
+                    let stack = std::env::var("VICTORY_TRANSLATE_STACK_MB")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(64);
+                    std::thread::Builder::new()
+                        .stack_size(stack << 20)
+                        .spawn_scoped(s, work)
+                        .expect("a worker thread");
                 }
             });
         }
