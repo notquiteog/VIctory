@@ -210,6 +210,10 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            // `VICTORY_HOST_NVIDIA=1`: translate as for an NVIDIA card (`VICTORY_ATOMIC_SUB_LOOP`)
+            if let Some(v) = std::env::var_os("VICTORY_HOST_NVIDIA") {
+                victory_shader::emit::set_host_nvidia(v == "1");
+            }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }

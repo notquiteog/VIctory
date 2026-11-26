@@ -1037,6 +1037,10 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // NVIDIA's compiler refuses an atomic subtraction on group memory
+        // (`victory_shader`'s `VICTORY_ATOMIC_SUB_LOOP`): told here, with the
+        // other host facts, before anything is translated or a cache keyed.
+        victory_shader::emit::set_host_nvidia(crate::indirect::nvidia(&device));
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_7,
         };

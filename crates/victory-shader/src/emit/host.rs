@@ -263,6 +263,12 @@ impl Host {
         Some((waves.WaveLaneCountMax, rdna))
     }
 
+    /// Whether the adapter is an NVIDIA card: `set_host_nvidia` is told so
+    /// for offline translation followed by host pipeline creation.
+    pub fn nvidia(&self) -> bool {
+        adapter_desc(&self.device).is_ok_and(|desc| desc.VendorId == 0x10DE)
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
