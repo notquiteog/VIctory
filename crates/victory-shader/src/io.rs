@@ -222,7 +222,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    let reg = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex input VGPR out of bounds"))?;
+                    loaded.push((Reg::V(reg), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -915,5 +919,30 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn raise_handles_an_extreme_vs_vgpr_without_overflow() {
+        let p = program(&[S_ENDPGM]);
+        // Vertex input with vgpr = 255 and mask = 0x3 (channel 1 overflows u8).
+        let vs = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![crate::native::VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0x3,
+                    vgpr: 255,
+                }],
+                outputs: vec![],
+            },
+            code: vec![],
+        };
+        assert!(matches!(raise(&p, &vs), Err(ShaderError::Malformed(_))));
+
     }
 }
