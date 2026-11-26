@@ -23,7 +23,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    // `victory 0.1.0 (<commit>, <its date>)`: the launcher tells builds apart by it.
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("VICTORY_COMMIT"), ", ", env!("VICTORY_COMMIT_DATE"), ")"),
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {
@@ -106,6 +107,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also print `PROGRESS <done> <total>` lines, for a program that
+        /// shows a progress bar (the launcher).
+        #[arg(long)]
+        progress: bool,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -125,6 +130,10 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// Also print `PROGRESS <done> <total>` lines, for a program that
+        /// shows a progress bar (the launcher).
+        #[arg(long)]
+        progress: bool,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
@@ -219,9 +228,9 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, progress } => translate::precompile(paths, jobs, progress),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, progress, these } => warm::run(jobs, limit, again, used, progress, these),
         Command::Run {
             exe,
             unimplemented,

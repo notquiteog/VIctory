@@ -428,7 +428,7 @@ pub fn run(
 }
 
 /// Every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, progress: bool) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -437,6 +437,14 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
+    // `--progress`: containers looked at, of those found so far (all of
+    // them, once the last file is read: one archive has them all).
+    let (looked, found) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let told = |n: usize| {
+        if progress {
+            println!("PROGRESS {n} {}", found.load(Ordering::Relaxed));
+        }
+    };
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -447,11 +455,17 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                 continue;
             };
             let jobs = sources(&data);
+            found.fetch_add(jobs.len(), Ordering::Relaxed);
+            told(looked.load(Ordering::Relaxed));
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let n = looked.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(64) {
+                                told(n);
+                            }
                             let Some(bytes) = job.bytes() else { continue };
                             let hash = blake3::hash(&bytes);
                             if !lock(&seen).insert(hash) {
@@ -473,6 +487,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                     });
                 }
             });
+            told(looked.load(Ordering::Relaxed));
         }
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
