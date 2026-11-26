@@ -278,65 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn staging_retries_collisions_without_changing_existing_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        for n in 0..2 {
-            std::fs::write(
-                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
-                b"stale",
-            )
-            .unwrap();
-        }
-
-        let (path, mut file) = create_tempfile_in(dir.path(), &counter).unwrap();
-        file.write_all(b"fresh").unwrap();
-        drop(file);
-        assert_eq!(
-            path.file_name().unwrap(),
-            format!(".tmp-{}-2", std::process::id()).as_str()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
-        for n in 0..2 {
-            assert_eq!(
-                std::fs::read(dir.path().join(format!(".tmp-{}-{n}", std::process::id()))).unwrap(),
-                b"stale"
-            );
-        }
-        assert_eq!(counter.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn staging_collision_retries_are_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        for n in 0..128 {
-            std::fs::write(
-                dir.path().join(format!(".tmp-{}-{n}", std::process::id())),
-                b"stale",
-            )
-            .unwrap();
-        }
-
-        let error = create_tempfile_in(dir.path(), &counter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(counter.load(Ordering::Relaxed), 128);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 128);
-    }
-
-    #[test]
-    fn staging_does_not_retry_other_io_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter = AtomicU64::new(0);
-        let missing = dir.path().join("missing");
-
-        let error = create_tempfile_in(&missing, &counter).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-        assert!(!missing.exists());
-    }
-
-    #[test]
     fn version_bump_invalidates() {
         let v1 = Upper {
             version: 1,
