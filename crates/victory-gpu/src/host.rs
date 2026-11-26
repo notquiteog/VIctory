@@ -2416,6 +2416,10 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// With [`stages`]: the list that sends what changed, recorded and not
+    /// yet given to the queue (the line's second stage does, ahead of the
+    /// submission's lists).
+    prelude: Option<ID3D12CommandList>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2722,6 +2726,13 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// Whether a submission's send to copies in the card's memory goes to the
+/// queue from the line's second stage ([`stages`]), with its lists: for a
+/// submission sent ahead (`flown`) with the stages on.
+fn held_order_wanted(flown: bool) -> bool {
+    flown && stages::on()
+}
 
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
@@ -3921,6 +3932,8 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    #[cfg(feature = "diagnostics")]
+    stages::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3945,6 +3958,7 @@ mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+pub(crate) mod stages;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -4501,7 +4515,13 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+        held: &mut Option<std::sync::MutexGuard<'static, u64>>,
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4547,6 +4567,11 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
+        // With the line in two stages, the send goes to the queue with the
+        // submission's lists, and the order of the queue is held until it is
+        // handed over (`held`).
+        let defer = held_order_wanted(flown);
+        let mut prelude: Option<ID3D12CommandList> = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
@@ -4640,7 +4665,11 @@ impl Host {
                     }
                     truestamp::marked(0, began, truestamp::mark(list));
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    if defer {
+                        prelude = Some(list.cast()?);
+                    } else {
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    }
                     Ok(())
                 })()
             };
@@ -4649,7 +4678,11 @@ impl Host {
             }
             used.push((false, sync));
         }
-        drop(order);
+        if defer {
+            *held = order;
+        } else {
+            drop(order);
+        }
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4658,6 +4691,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            prelude,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5008,6 +5042,10 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                // Every send numbered so far is on the queue: the line's
+                // second stage gives them to it, and none is numbered while
+                // the order is held here.
+                stages::drain();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -5545,6 +5583,8 @@ impl Host {
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
             return;
         }
+        // (It gives the queue work, behind the flights.)
+        stages::drain();
         let was_working = working(true);
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
@@ -5731,6 +5771,12 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Waited for here, the card gets nothing ahead of what the line's
+        // second stage still holds ([`stages`]).
+        let staged = late && stages::on();
+        if !staged {
+            stages::drain();
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -5742,7 +5788,9 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let mut own = if late { self.card_steps(runs) } else { None };
+        // Its descriptors, if the line's second stage writes them.
+        let slots = own.as_mut().and_then(|own| own.slots.take());
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5765,7 +5813,9 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        // (In two stages, the second does it, behind the slots of the
+        // submissions before.)
+        let heaps_synced = (!staged).then(crate::descriptor::begin_sync_heaps);
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -5921,7 +5971,14 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        // What goes up to copies in the card's memory goes to the queue with
+        // the lists (in two stages), or now, behind everything handed over.
+        if !(staged && held_order_wanted(flown)) {
+            stages::drain();
+        }
+        let mut held = None;
+        let mut card = self.card_before(&declared, &picked, flown, &mut held);
+        let prelude = card.as_mut().and_then(|c| c.prelude.take());
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -5933,10 +5990,12 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        drop(heaps_synced);
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        if !staged {
+            drop(heaps_synced);
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+        }
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -5961,23 +6020,53 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+            let value = *submitted;
+            let send = move || {
+                let Some(host) = host() else {
+                    return;
+                };
+                if staged {
+                    // The submission's descriptors, then the heaps' records
+                    // and the slots that waited, then its lists: as one
+                    // thread did them.
+                    if let Some(slots) = slots {
+                        slots();
+                    }
+                    let _records = crate::timeline::span("submit: waiting for the heaps' records");
+                    drop(crate::descriptor::begin_sync_heaps());
+                    crate::descriptor::make_waiting();
                 }
-                self.queue.Signal(&self.fence, *submitted)
+                let lists = lists;
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    // What goes up to copies in the card's memory, ahead of
+                    // the lists that read it.
+                    if let Some(prelude) = prelude {
+                        host.queue.ExecuteCommandLists(&[Some(prelude)]);
+                    }
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        host.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    host.queue.Signal(&host.fence, value)
+                };
+                awake::sent(&host.device);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, value, stamp);
+                host.card_sent();
+                if let Err(e) = signalled {
+                    fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+                }
             };
-            awake::sent(&self.device);
-            #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
-            stage.next("submit: noting what is in the air");
-            if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            if staged {
+                stages::hand(Box::new(send));
+            } else {
+                send();
             }
+            // (Handed over: a fetch on this queue may number itself behind it.)
+            drop(held);
+            stage.next("submit: noting what is in the air");
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -9467,6 +9556,9 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
+            // The picture's copy may still be with the line's second stage:
+            // on the queue before the swap chain's present.
+            stages::drain();
             let mut showing = crate::timeline::span("the host's Present");
             let dlss_frame = crate::streamline::generate::before_present([width, height]);
             // The proxy paces generated frames against the display.
