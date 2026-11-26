@@ -2054,6 +2054,17 @@ pub(crate) fn let_go_idle() {
     // back goes, the longest idle first, whatever the card's rule keeps. (The
     // second is what protects a host texture handed out and not yet recorded:
     // see above.)
+    // (What goes gives its piece back to the blocks these textures are cut
+    // from, `crate::pool`, and the blocks stay: no run gave one back. So the
+    // commit gains nothing at once, the next look wants the same again, and
+    // everything idle goes; what it does gain is that fewer new blocks are
+    // made. Letting go only while the blocks had under 512 MiB free was
+    // tried and taken out again: in the same five minutes of free roam, with
+    // a camera turn and a walk, 0 copies went against 42,163, of which 7,969
+    // were made again, but the blocks grew to 4,928 MB against 3,776 MB, and
+    // the frames with blips were as many, 240 of 761 against 198 of 780
+    // (runs stream-RA-new and stream-RB-old). The blips there are the title
+    // taking its trees in and out, not this.)
     const COMMIT_IDLE_MS: u64 = 10_000;
     let for_commit = if by_clock {
         0

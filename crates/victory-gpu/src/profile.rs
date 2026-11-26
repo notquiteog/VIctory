@@ -272,11 +272,11 @@ impl Role {
             Some(Role::Pipelines)
         } else if name.starts_with("victory-wide-") || name.starts_with("victory-land") || name == "victory-aside" || name == "victory-heap-sync" {
             Some(Role::Wide)
-        } else if name == "victory-submit" {
-            // (This tree's submitting thread does not say so itself.)
-            Some(Role::Submit)
         } else if name == "victory-late-wait" || name == "victory-relay" {
             Some(Role::Late)
+        } else if name == "victory-submit" {
+            // (The thread of ours that serves the line of submissions.)
+            Some(Role::Submit)
         } else if name == "title-main" {
             Some(Role::TitleMain)
         } else {

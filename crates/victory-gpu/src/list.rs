@@ -2239,7 +2239,7 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
-        GPU_TIMESTAMP => Written::GpuTimestamp,
+        GPU_TIMESTAMP => gpu_timestamp(this),
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };
@@ -2247,6 +2247,20 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     if let Written::Value(value) = what {
         value_written(this, address, value);
     }
+}
+
+/// What a GPU timestamp asked for at this place of the list is written as:
+/// the card's own clock at this place, if it can be had
+/// (`crate::host::truestamp`), else the PC's when the list has landed.
+fn gpu_timestamp(this: This) -> Written {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(place) = crate::host::truestamp::stamp(&list.list)
+    {
+        return Written::CardTimestamp(place);
+    }
+    let _ = this;
+    Written::GpuTimestamp
 }
 
 /// The title wrote a value at the bottom of the pipe (not a timestamp, not

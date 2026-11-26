@@ -1,0 +1,114 @@
+name: Build and release
+
+# Every push to main: build both programs and replace the rolling pre-release
+# `nightly` (what the launcher's "Latest build" update channel follows).
+# Every tag v*: the same build, published as a normal release (the "Stable"
+# channel). The packing is tools/package-release.ps1, which also runs locally.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  # A newer push to main makes the older build pointless; a tag's build runs to its end.
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      # A release's tag is the version the launcher compares itself with.
+      - name: The tag is the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          if ($toml -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') { throw 'No [workspace.package] version in Cargo.toml.' }
+          if ("v$($Matches[1])" -ne $env:GITHUB_REF_NAME) {
+            throw "The tag is $env:GITHUB_REF_NAME but Cargo.toml says version $($Matches[1]). Set [workspace.package] version first, then tag v<that version>."
+          }
+
+      # cargo build --locked --release of victory and victory-launcher, then
+      # VI-Setup.exe, the zip, SHA256SUMS, build.json and release-notes.md in dist/.
+      - name: Build and pack
+        shell: pwsh
+        env:
+          GIT_COMMIT: ${{ github.sha }}
+        run: |
+          $env:GIT_COMMIT_DATE = (git show -s --format=%cs HEAD).Trim()
+          ./tools/package-release.ps1 -OutDir dist
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VI-${{ github.sha }}
+          path: |
+            dist/VI-Setup.exe
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/build.json
+          retention-days: 14
+
+      # The rolling pre-release: deleted and made again at the built commit,
+      # so that its tag moves and its assets are never a mix of two builds.
+      - name: Publish the latest build (nightly)
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $date = (git show -s --format=%cs HEAD).Trim()
+          $subject = (git show -s --format=%s HEAD).Trim()
+          $assets = @('dist/VI-Setup.exe') + @(Get-ChildItem dist/*.zip | ForEach-Object { $_.FullName }) + @('dist/SHA256SUMS', 'dist/build.json')
+          # (dist/release-notes.md begins with the notice every release carries.)
+          $notes = @(
+            (Get-Content dist/release-notes.md -Raw).Trim()
+            ''
+            "Built automatically from the newest commit on main: $subject"
+            ''
+            'This is the "Latest build" update channel of the launcher: newest fixes first, not tested like a release.'
+          ) -join "`n"
+          Set-Content notes.md $notes -Encoding utf8
+          gh release delete nightly --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag 2>$null
+          $global:LASTEXITCODE = 0
+          gh release create nightly @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --latest=false --title "VI latest build ($short, $date)" --notes-file notes.md
+          if ($LASTEXITCODE -ne 0) { throw "gh release create nightly failed ($LASTEXITCODE)." }
+
+      - name: Publish the release (tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @('dist/VI-Setup.exe') + @(Get-ChildItem dist/*.zip | ForEach-Object { $_.FullName }) + @('dist/SHA256SUMS', 'dist/build.json')
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Someone made the release by hand: give it this build's files.
+            gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --title "VI $($tag.TrimStart('v'))" --notes-file dist/release-notes.md --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Publishing $tag failed ($LASTEXITCODE)." }

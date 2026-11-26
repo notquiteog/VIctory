@@ -306,6 +306,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// LOCAL (fxceless a35c557393): the formats of the views
+    /// [`State::set_targets`] bound (eight targets, then depth), for the
+    /// draws' pipelines (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -679,7 +683,28 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
-pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Whether the slots waiting for their texture's upload
+/// (`HostHeap::texture_slots_flip`) are looked at where every list first uses
+/// the view heap, not only in the pass over the heap's textures, which runs
+/// once a frame, early: an upload recorded there has run by the time later
+/// lists of the same frame are recorded, and the slot showed the neutral
+/// texture (or the texture's other level) until the next frame's pass all the
+/// same: 1.36 frames after it was asked for on average over 85,000 slots (run
+/// stream-RB-old; 1.30 to 1.45 in four other runs), 1.05 over 70,000 with this
+/// (stream-RA-new). `VICTORY_FLIP_EACH_LIST=0`: in the pass alone, as before.
+fn flip_each_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIP_EACH_LIST").is_none_or(|v| v != "0"))
+}
+
+pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Since the last line of the log: uploads recorded by the pass for a slot
+/// whose view was written, the milliseconds from that write to the upload in
+/// all, and the longest; the same three for slots that memory mapped,
+/// unmapped or about to be written under their view made due (from when the
+/// runtime told of it); and for slots over memory the runtime had written
+/// (from when it said the bytes were there).
+pub(crate) static HEAP_TEXTURES_WAITED: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// Since the start: looks at a slot uploaded in part that found no more of
 /// its memory mapped; uploads of textures not all mapped; and of those,
 /// the ones whose first page was not there (asked by the first page alone,
@@ -1081,6 +1106,16 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        // The formats of the host views, for the draws' pipelines (before
+        // the bind cache below, which can return early).
+        let mut formats = [0u32; 9];
+        for (i, (texture, desc)) in views.iter().take(8).enumerate() {
+            formats[i] = bound_format(*texture, desc.as_ref().map(|d| d.Format));
+        }
+        if let Some((texture, record)) = dsv.as_ref() {
+            formats[8] = bound_format(Some(*texture), record.depth_desc().as_ref().map(|d| d.Format));
+        }
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1243,6 +1278,15 @@ impl State {
         if kind == victory_shader::emit::USER_GROUP_BASE {
             return 0;
         }
+        if kind == victory_shader::emit::USER_TITLE_VIEW_COUNT {
+            // The title slots the bound view heap has host slots for: the
+            // host's own start there (`HostHeap::count`). Every index where
+            // that cannot be told, as before the bound.
+            return (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                .flatten()
+                .map_or(u32::MAX, crate::descriptor::host::HostHeap::count);
+        }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
             return match self.roots_ref(compute).get(usize::from(slot)) {
                 Some(&Root::View(address)) if kind == USER_ROOT_ADDRESS => address as u32,
@@ -1362,7 +1406,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1375,6 +1419,11 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky as This);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1519,7 +1568,13 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                &t.host.half_views,
+                compute,
+            );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1932,6 +1987,11 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
+        // Slots whose texture's upload has run meanwhile show it from this
+        // list on, not from the next frame's pass (`flip_each_list`).
+        if flip_each_list() {
+            host.texture_slots_flip();
+        }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
@@ -2224,7 +2284,19 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // `VICTORY_RELOOK_MS` (4,000 unless said; trustno1-coder/VIctory-NVIDIA
+        // 77e13a974, where the switch is from, runs with 20,000): at 4,000 the
+        // opening cutscene's 4 frames a second looked at its ~20,000 slots
+        // waiting for their memory every 16 frames, thousands of queries
+        // a second and most of the pass's time, while slots never looked
+        // at waited. The runtime's mappings already make a slot due
+        // (`texture_slots_remapped`); these looks are only for what that
+        // does not tell.
+        static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let relook = *RELOOK_MS.get_or_init(|| {
+            std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4_000)
+        });
+        let most = (relook / took).clamp(16, if relook > 4_000 { 1024 } else { 256 });
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2579,6 +2651,13 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            if let Some((since, origin)) = host.texture_slot_since(index, write) {
+                let waited = crate::host::now_ms().saturating_sub(since);
+                let at = usize::from(origin.min(2)) * 3;
+                HEAP_TEXTURES_WAITED[at].fetch_add(1, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 1].fetch_add(waited, Ordering::Relaxed);
+                HEAP_TEXTURES_WAITED[at + 2].fetch_max(waited, Ordering::Relaxed);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
@@ -2644,6 +2723,14 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
+            return;
+        }
+        // A program that walks ray-tracing structures nothing has built
+        // (`VICTORY_BVH_HOLD=1`).
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it walks ray-tracing structures nothing has built (VICTORY_BVH_HOLD=1)".to_owned());
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
@@ -2722,7 +2809,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2748,31 +2835,59 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32), resource))
         };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflections => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
+        if role == Role::Reflections {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| {
+                tracing::info!(found = image.is_some(), "the program that writes the reflections last is dispatched");
+            });
+        }
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflections => image,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((of, image, lit)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflections) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
+        // The resolve's other images of the light's kind and size, once each.
+        let mut others: Vec<(u32, usize, D3D12_GPU_DESCRIPTOR_HANDLE)> = Vec::new();
+        if role == Role::Resolve && crate::ambient::others() {
+            for u in t.used.iter().filter(|u| {
+                u.kind == ResourceType::Uav && u.root == RootType::Table && u.slot == LIGHT.0
+            }) {
+                let Some((d, handle, r)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
+                    continue;
+                };
+                if r != lit
+                    && d.Format.0 == format
+                    && (d.Width, d.Height) == (of.Width, of.Height)
+                    && d.Dimension == of.Dimension
+                    && !others.iter().any(|o| o.1 == r as usize)
+                {
+                    others.push((u.table_offset_dwords, r as usize, handle));
+                }
+            }
+            others.sort_by_key(|o| o.0);
+        }
         crate::ambient::after(list, role, &Views {
             image,
+            others: others.iter().map(|o| (o.0, o.2)).collect(),
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
@@ -3179,11 +3294,19 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -3191,6 +3314,36 @@ impl State {
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
             if !fresh.contains(&u.slot) {
                 fresh.push(u.slot);
+            }
+        }
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
             }
         }
         // Tables reaching past a host heap smaller than the title's (the
@@ -3254,6 +3407,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = entries()
@@ -3276,6 +3438,11 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    if half.contains(&(slot, k * 8)) {
+                        h.add([u32::MAX, slot.into(), k]);
+                    }
                 }
                 (table, n, h.0)
             };
@@ -3420,7 +3587,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3784,6 +3954,11 @@ impl State {
             crate::pipeline::note_why("it activates the screen probes' rays, and no rays run".to_owned());
             return false;
         }
+        if kind == 2 && crate::pipeline::walk_held(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("it walks ray-tracing structures nothing has built (VICTORY_BVH_HOLD=1)".to_owned());
+            return false;
+        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -3969,7 +4144,16 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            // (A dispatch's groups as title memory has them now, if the
+            // CPU wrote them: what the card runs is what is there then.)
+            let mut groups = [0u32; 3];
+            // SAFETY: twelve bytes of title memory, read through the copy
+            // that leaves by its failing exit, into a local.
+            let read = kind == DISPATCH
+                && crate::safecopy::on()
+                && unsafe { crate::safecopy::copy(groups.as_mut_ptr().cast(), arguments as *const u8, 12) };
+            let said = if read { format!(" groups now {groups:?}") } else { String::new() };
+            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}{said}"), kind == DISPATCH)
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
@@ -4012,6 +4196,15 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            // As after a dispatch whose counts the title gives itself: the
+            // title runs its last reflection pass this way.
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
         }
@@ -4114,6 +4307,18 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
+/// LOCAL (fxceless a35c557393): the format of a host view of `texture`
+/// whose description names `described`: that one, else the texture's own
+/// (what the host gives a view without a format); 0 if neither is known.
+fn bound_format(texture: Option<&ID3D12Resource>, described: Option<DXGI_FORMAT>) -> u32 {
+    match (described, texture) {
+        (Some(format), _) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        (_, Some(texture)) => unsafe { texture.GetDesc() }.Format.0 as u32,
+        _ => 0,
+    }
+}
+
 /// The host state a depth view needs of its texture: the read state if the
 /// view writes no plane the format has (the title's read-only flags), else
 /// the write state.
@@ -4144,7 +4349,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 /// A few things, up to `N` of them without memory of the heap: what a draw's
 /// tables are gone through with, some six lists a stage.
-struct Few<T, const N: usize> {
+pub(crate) struct Few<T, const N: usize> {
     few: [T; N],
     len: usize,
     /// All of them, if they are more.

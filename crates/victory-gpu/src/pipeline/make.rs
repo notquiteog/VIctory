@@ -27,7 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -43,6 +43,14 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// LOCAL: how long draws have waited for it so far, in microseconds
+    /// ([`wait_once`]).
+    waited_us: AtomicU64,
+    /// LOCAL (fxceless a35c557393): the formats its state declares (zeros
+    /// without a graphics state), and the same shaders and state for other
+    /// formats bound at a draw ([`for_formats`]): a chain, one link per set.
+    pub(crate) formats: TargetFormats,
+    variant: OnceLock<Arc<Pending>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +76,8 @@ impl Pending {
             let _ = made.set(None);
         }
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
@@ -76,6 +86,7 @@ impl Pending {
             made,
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -181,6 +192,52 @@ pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
 
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]):
+/// `VICTORY_TARGET_VARIANTS=1`, off unless said.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_some_and(|v| v == "1"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats `bound`
+/// that `p` does not declare: that of the same shaders and state for those
+/// formats, queued and waited for like the title's own.
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and state `g` for the formats `bound`:
+/// found in the chain from `p`, or added to it (logged once per set).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = %hashes(p),
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=1)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
+}
+
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
@@ -230,6 +287,22 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// LOCAL (the problem of fxceless issue #1181): whether one pipeline is
+/// waited for at most one budget over the whole run, not one budget every
+/// frame. A pipeline whose make takes longer than the budget (a driver
+/// compile of tens of seconds, or one that never ends) otherwise cost the
+/// whole budget in every frame in which a draw asked for it: with
+/// `VICTORY_PIPELINE_WAIT_MS=10000` the picture stood still while the thing
+/// drawn with it was in view, and moved again when the camera turned away.
+/// After its budget its draws are dropped until it is made, as with any
+/// pipeline past the frame's budget. `VICTORY_PIPELINE_WAIT_ONCE=1`; off
+/// unless said here (on by default in trustno1-coder/VIctory-NVIDIA
+/// 77e13a974, where it is from, which runs with a budget of 10 s).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -238,6 +311,16 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    // LOCAL: what is left of this pipeline's own budget ([`wait_once`]).
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -248,7 +331,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -269,6 +352,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if wait_once() && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=1)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,

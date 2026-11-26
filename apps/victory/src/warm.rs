@@ -26,7 +26,7 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, progress: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -68,6 +68,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         bad.len(),
         all.len()
     );
+    // `--progress`: made or given up on, of those to make.
+    let told = |n: usize| {
+        if progress {
+            println!("PROGRESS {n} {}", all.len());
+        }
+    };
+    told(0);
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
@@ -92,6 +99,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             if count % 1000 == 0 {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
+                            let over = count + state.2;
+                            if over.is_multiple_of(8) || over == all.len() {
+                                told(over);
+                            }
                             drop(state);
                             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
                         });
@@ -101,7 +112,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                                 // The one it was at.
                                 println!("pipeline {n} {}: {why}", keys[n]);
                                 let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
-                                lock(&state).2 += 1;
+                                let mut state = lock(&state);
+                                state.2 += 1;
+                                told(state.0.len() + state.2);
+                                drop(state);
                                 rest = after;
                             }
                             _ => break,

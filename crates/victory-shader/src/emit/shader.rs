@@ -34,6 +34,25 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// LOCAL (port of fxceless/victory-fork PR #1216, GamingRipperDoc): the
+/// [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view (a
+/// stride no buffer has, no kind bits). A program reads a slot it picks as a
+/// constant buffer only where this mark is; a slot whose dword is 0 holds
+/// neither a buffer nor a constant buffer, and the read gives zeros. Read as
+/// a constant buffer, a texture's descriptor is taken as a buffer's: the
+/// meshlet culling `_Prev` passes then read whatever lies at a made-up
+/// address (a page fault on AMD).
+/// `VICTORY_CONSTANT_MARKS=1` turns it on. Off by default here (on in the
+/// PR): not yet run in the game on this tree, where a constant buffer slot
+/// whose mark is not written yet would read zeros.
+pub const SLOT_STRIDE_CONSTANT: u32 = VIEW_STRIDE_BITS;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
+/// the translator alike.
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -96,6 +115,11 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// First group in X for the second execution of a wide indirect dispatch.
 pub const USER_GROUP_BASE: u32 = 0x107;
+/// How many of the title's view slots the view heap bound for this draw or
+/// dispatch has host slots for (`HostHeap::count`): the host's dynamic slots
+/// start there. A view the program picks by a title index at or past it is
+/// not there to read ([`Shader::title_view_index`]).
+pub const USER_TITLE_VIEW_COUNT: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -459,6 +483,21 @@ impl Shader {
         )
     }
 
+    /// `index`, a view index the title's program computed, where the heap
+    /// has a host slot for that title slot (below `count`,
+    /// [`USER_TITLE_VIEW_COUNT`]), and the null slot `null` elsewhere: the
+    /// host's own slots (tables made for a draw) start at `count`, and one
+    /// of their descriptors is not what the title's slot of that number
+    /// held. Indices the host hands out (a table's place) do not come here.
+    /// (After Artking175, notquiteog/victory-nvidia#1.)
+    pub fn title_view_index(&mut self, block: usize, index: V, count: V, null: u32) -> V {
+        let inside = self.m.cmp(block, super::bitcode::pred::IULT, index, count);
+        let null = self.m.i32(null);
+        let v = self.m.select(block, inside, index, null);
+        self.m.tag(v, super::bitcode::Tag::Clamp);
+        v
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -571,6 +610,9 @@ impl Shader {
                 }
             }
         }
+        // After the clean-up, which may be what leaves a value written as
+        // a negation: no feature comes or goes with it.
+        self.m.atomic_subtracts(super::lower::atomic_sub_loops());
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views
         // picked from the heap (VIctory a1a2077a).
@@ -935,8 +977,16 @@ impl Shader {
             features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
-        let isg1 = container::signature(&self.inputs, true);
-        let osg1 = container::signature(&self.outputs, false);
+        // A validator for shader model 6.7 compares signature parts byte for byte with
+        // its own, whose name table ends on a dword; 1.6 writes it unpadded.
+        let pad = |mut part: Vec<u8>| {
+            if minor >= 7 {
+                part.resize(part.len().next_multiple_of(4), 0);
+            }
+            part
+        };
+        let isg1 = pad(container::signature(&self.inputs, true));
+        let osg1 = pad(container::signature(&self.outputs, false));
         let flag = if self.pixel {
             self.outputs.iter().any(|o| (17..=19).contains(&o.kind))
         } else {
@@ -955,7 +1005,7 @@ impl Shader {
             wave_size: self.wave_size,
         });
         let hash = [0u8; 20];
-        let psg1 = container::signature(&self.prims, false);
+        let psg1 = pad(container::signature(&self.prims, false));
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
         if self.mesh.is_some() {
