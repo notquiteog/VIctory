@@ -333,12 +333,33 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// Whether the builder's pipelines are queued for the workers when the
+/// title creates them, and all at once when its first dispatch wants them,
+/// not made one after another on that dispatch's thread. Made in a row
+/// there, the 53 took 8 s with a warm driver cache (frame 1053 took 13 s)
+/// and over 30 s with a cold one, while the title's main thread waited for
+/// the frame: its watchdog ended the run (`mov [0]` at +0x23cf683, bench
+/// bvh-bound1, 2026-11-26; 40 of the 53 made by then, about a second each).
+/// On by default; `VICTORY_BVH_BUILDER_EARLY=0` makes them as before.
+#[cfg(windows)]
+fn builder_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER_EARLY").is_none_or(|v| v != "0"))
+}
+
+/// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`):
+/// without it the title's rays have nothing to trace.
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,6 +368,13 @@ pub(crate) fn builder_runs() -> bool {
     }
     if b.whole {
         return true;
+    }
+    // All of them to the workers first, so the ones not made yet are made
+    // side by side; this thread then makes or waits for each in turn.
+    if builder_early() {
+        for p in &b.pipelines {
+            make::soon(p, true);
+        }
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
@@ -588,6 +616,10 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        if builder_allowed() && builder_early() {
+            make::soon(&host, false);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
