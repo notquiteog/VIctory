@@ -2503,6 +2503,17 @@ impl Drop for Shadow {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
+            // The heap is what the card reads title memory through, and a
+            // placed buffer does not hold its heap: it is kept until the
+            // submissions that could read through it have finished
+            // (`crate::host::retire`, with its lag), whoever let the last
+            // reference go. The buffer in it is a field, dropped when this
+            // returns: before the heap, as it must be. While the heap stands
+            // the title cannot free those pages (error 87, `crate::inplace`).
+            // (fxceless/victory-fork#943.)
+            if let Some((heap, _bias)) = self.place.take() {
+                crate::host::retire(heap);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
