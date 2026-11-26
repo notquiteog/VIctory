@@ -2555,8 +2555,10 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
-pub(crate) fn install() {
+/// of the crash reporter's. False if the system would not register it: then
+/// no fault of ours is taken (`crate::safecopy` goes back to the kernel's
+/// copies; after fxceless/victory-fork#990).
+pub(crate) fn install() -> bool {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, NTSTATUS, STATUS_GUARD_PAGE_VIOLATION,
     };
@@ -2653,11 +2655,9 @@ pub(crate) fn install() {
             None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
-    });
+    *INSTALLED.get_or_init(|| !unsafe { AddVectoredExceptionHandler(1, Some(on_write)) }.is_null())
 }
 
 /// Sets the guard flag again on the page holding `at` (the address the fault

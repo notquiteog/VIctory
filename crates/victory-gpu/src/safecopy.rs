@@ -323,8 +323,14 @@ pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SAFE_COPY").is_none_or(|v| v != "0");
-        if on {
-            crate::watch::install();
+        // Without the handler a missing page under [`copy`] is a crash, not
+        // a failed copy: through the kernel then, as with the switch off
+        // (after fxceless/victory-fork#990).
+        if on && !crate::watch::install() {
+            tracing::warn!(
+                "copies of title memory go through the kernel: the handler that takes their faults could not be registered"
+            );
+            return false;
         }
         on
     })
