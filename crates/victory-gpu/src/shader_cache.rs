@@ -76,6 +76,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
+            // (trustno1-coder/VIctory-NVIDIA) every node test a miss.
+            "VICTORY_BVH_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
