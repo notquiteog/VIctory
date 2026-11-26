@@ -85,10 +85,12 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
-/// the case did not come up once in runs submit-1 to submit-3, so it has only
-/// its tests behind it.
+/// them (`VICTORY_PLACED_ORDER=0`: wherever it stands, as before), and a
+/// submission where it does is cut behind the copy's list ([`cut_for`]). It
+/// was off: the case did not come up once in runs submit-1 to submit-3. On
+/// since walking the streets: refused for it, submissions stood 1.4 to 3 ms
+/// a frame waiting for flights to land (runs base1, lat1, core6a,
+/// 2026-11-26), about 20 ms each time, on the path to the title's present.
 ///
 /// The fills of constant buffers read the title's ring (7,500 a frame in the
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
@@ -100,7 +102,7 @@ fn placed_order() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -110,8 +112,30 @@ const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads,
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
 
-/// The most steps of a submission done this way.
+/// The most steps of a submission done this way, before
+/// `VICTORY_CARD_STEPS_MOST`.
 const MOST: usize = 12288;
+
+/// The most steps of a submission done this way (`VICTORY_CARD_STEPS_MOST`,
+/// 32768; 12288 before). What reads the bytes is bounded on its own
+/// ([`BETWEEN`]): the steps of one submission read some 84 KB a frame.
+///
+/// Why more: walking the streets one submission a frame has more fills that
+/// depend on the flights' writes than 12,288 (the title's ring of constants
+/// under the skinning passes' writes), and was refused: the submitting
+/// thread stood until the flights had landed, some 20 ms each time, 0.6 to
+/// 2.6 ms a frame on average (runs base1, lat1, core6a, 2026-11-26), all of
+/// it on the path to the title's present.
+fn most() -> usize {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_STEPS_MOST") {
+        return if on { 32768 } else { MOST };
+    }
+    static MOST_ASKED: OnceLock<usize> = OnceLock::new();
+    *MOST_ASKED.get_or_init(|| {
+        std::env::var("VICTORY_CARD_STEPS_MOST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32768).max(1)
+    })
+}
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -291,7 +315,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         if writes.iter().any(|w| w.0 < w.1) {
             join_ranges(&mut written, writes);
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
+        if taken.iter().filter(|t| **t).count() > most() {
             return Err("too many steps depend on it");
         }
         for (i, d) in does.iter().enumerate() {
@@ -413,10 +437,13 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+    // (Made at their size: grown step by step they were a fifth of the
+    // planning, in copies of what was there.)
+    let all: usize = runs.iter().map(|l| l.deferred().copies.len()).sum();
+    let mut does = Vec::with_capacity(all);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
+    let mut steps = Vec::with_capacity(all);
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {

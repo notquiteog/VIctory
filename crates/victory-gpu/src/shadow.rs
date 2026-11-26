@@ -1616,6 +1616,7 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::cores::raise_helper("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -5589,8 +5590,9 @@ static EXACT_SPARE: Mutex<Vec<(u64, ID3D12Resource, usize)>> = Mutex::new(Vec::n
 /// The most spare buffers kept (64 KiB each, mostly).
 const SPARE_MOST: usize = 2048;
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last frame line: askings for such copies, copies made, sweeps,
+/// the microseconds the map's lock was held for them, and the longest.
+static EXACT_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5663,7 +5665,15 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // slots at once and a thousand are made a frame, and a walk of all of
     // them at each one was most of a frame's recording (5 to 45 us a list
     // call).
-    if map.len() >= EXACT_SWEEP_AT.load(Ordering::Relaxed).max(MANY) {
+    // The copies the sweep lets go of, dropped once the map's lock is let go
+    // of (`VICTORY_EXACT_DROP_LATE`, on): a copy's drop gives its buffer back
+    // to the driver, and some 2,500 at a time under the lock stood every
+    // thread that records 13 ms (timeline of run tlbase, 2026-11-26).
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let late = exact_drop_late();
+    let sweeping = std::time::Instant::now();
+    let swept = map.len() >= EXACT_SWEEP_AT.load(Ordering::Relaxed).max(MANY);
+    if swept {
         let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately. Its buffer is kept for
@@ -5676,6 +5686,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             if !stays && spare.len() < SPARE_MOST && shadow.card.is_none() && shadow.place.is_none() && !shadow.mapped {
                 spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
             }
+            if !stays && late {
+                gone.push(shadow.clone());
+            }
             stays
         });
         EXACT_SWEEP_AT.store(map.len() + map.len() / 4 + MANY, Ordering::Relaxed);
@@ -5685,9 +5698,23 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), ExactCopy { shadow: shadow.clone(), used: AtomicU64::new(now) });
+    drop(map);
+    if swept {
+        let us = sweeping.elapsed().as_micros() as u64;
+        EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+        EXACT_STATS[3].fetch_add(us, Ordering::Relaxed);
+        EXACT_STATS[4].fetch_max(us, Ordering::Relaxed);
+    }
+    drop(gone);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Whether the copies [`exact`]'s sweep lets go of are dropped after its lock
+/// (`VICTORY_EXACT_DROP_LATE=0`: under it, as before).
+fn exact_drop_late() -> bool {
+    crate::toggled!("VICTORY_EXACT_DROP_LATE")
 }
 
 /// Copies of single views' bytes made since the start.
@@ -5697,16 +5724,20 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, sweeps, swept_us, longest] = [0, 1, 2, 3, 4].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
     let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; \
+         {sweeps} sweeps of them, the map held {:.1} ms for them, the longest {:.1} ms (VICTORY_EXACT_DROP_LATE {})",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        swept_us as f64 / 1e3,
+        longest as f64 / 1e3,
+        if exact_drop_late() { "on" } else { "off" }
     );
 }
 

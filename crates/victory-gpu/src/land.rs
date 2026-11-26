@@ -243,6 +243,9 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
+                if name == "victory-land" || name == "victory-under" {
+                    crate::cores::raise_helper(name);
+                }
                 pool.help()
             });
         }

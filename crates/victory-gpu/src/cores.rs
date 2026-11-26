@@ -69,6 +69,28 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// Whether the threads that the submitting thread shares a submission's work
+/// with (the refreshes' `victory-wide`, the landings' `victory-land`, the
+/// `victory-under` pool of the steps done on the card and of the title's bytes
+/// under flights' writes) run above normal priority, as that thread does
+/// (`VICTORY_HELPER_PRIORITY=0`: normal, as before).
+///
+/// Why: the submitting thread is the frame's bottleneck, and it waits for
+/// them: 2 ms a frame in `shadow::wide` alone (profile prof1, 2026-11-26),
+/// while they stood beside the eight threads that translate lists and the
+/// title's own, all of normal priority, on the same fast cores.
+pub(crate) fn raise_helper(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_none_or(|v| v != "0")) {
+        return;
+    }
+    // SAFETY: this thread's own priority.
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } != 0;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!(what, ok, "helpers of the submitting thread run above normal priority (VICTORY_HELPER_PRIORITY=0: not)"));
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {

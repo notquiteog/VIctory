@@ -338,6 +338,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                REFUSED[R_NONE].fetch_add(1, Relaxed);
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -349,6 +350,7 @@ impl<W: Work> Lane<W> {
                     continue;
                 }
                 state.items.insert(at, next);
+                REFUSED[R_FOLDED].fetch_add(1, Relaxed);
                 break;
             }
             let Entry { number, queue, what } = next;
@@ -476,22 +478,36 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    REFUSED[R_VALUE].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    REFUSED[R_FENCE].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                if count >= most || lists.1.len() + runs.len() > most_lists {
+                    REFUSED[R_MOST].fetch_add(1, Relaxed);
+                    return Err(next);
+                }
+                if !crate::host::joinable(hosts(), &runs) {
+                    REFUSED[R_JOINABLE].fetch_add(1, Relaxed);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Present(..) => {
+                REFUSED[R_PRESENT].fetch_add(1, Relaxed);
+                return Err(next);
+            }
+            Job::Joined(..) | Job::Lists(..) => {
+                REFUSED[R_OTHER].fetch_add(1, Relaxed);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -559,12 +575,16 @@ impl Work for Job {
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
+                    #[cfg(feature = "diagnostics")]
+                    crate::fence::pace::signal_lined(fence, value);
                     if !crate::host::late_signal(fence, value) {
                         crate::fence::set(fence as This, value);
                     }
                 }
             }
             Job::Signal(fence, value) => {
+                #[cfg(feature = "diagnostics")]
+                crate::fence::pace::signal_lined(fence, value);
                 if !crate::host::late_signal(fence, value) {
                     crate::fence::set(fence as This, value);
                 }
@@ -607,6 +627,20 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+
+/// Diagnostics: why a submission was not taken along with the one before it,
+/// since the last frame-rate line: its lists not translated yet, a memory
+/// value not met, a fence not reached, too many parts or lists, not joinable
+/// (`crate::host::joinable`), a present, something else, nothing behind it.
+static REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+const R_FOLDED: usize = 0;
+const R_VALUE: usize = 1;
+const R_FENCE: usize = 2;
+const R_MOST: usize = 3;
+const R_JOINABLE: usize = 4;
+const R_PRESENT: usize = 5;
+const R_OTHER: usize = 6;
+const R_NONE: usize = 7;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -801,6 +835,8 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 pub(super) fn signal(this: This, fence: This, value: u64) {
     let fence = fence as usize;
     LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
+        #[cfg(feature = "diagnostics")]
+        crate::fence::pace::signal_lined(fence, value);
         if !crate::host::late_signal(fence, value) {
             crate::fence::set(fence as This, value);
         }
@@ -846,6 +882,13 @@ pub(super) fn line(frames: f64) {
         s[DRAINS] / frames,
         s[FORCED] / frames,
         s[JOINED] / frames
+    );
+    let r: Vec<f64> = REFUSED.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "the line, per frame: a submission was not taken along with the one before it: {:.1} its lists not translated yet, \
+         {:.1} a memory value not met, {:.1} a fence not reached, {:.1} too many parts or lists, {:.1} not joinable, {:.1} a \
+         present, {:.1} other, {:.1} nothing behind it",
+        r[R_FOLDED], r[R_VALUE], r[R_FENCE], r[R_MOST], r[R_JOINABLE], r[R_PRESENT], r[R_OTHER], r[R_NONE]
     );
 }
 
