@@ -627,7 +627,7 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
-                || again_if_out_of_memory(|| unsafe { host.device.CreateComputePipelineState(&desc) }),
+                || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
             let pso = match made {
                 Ok(pso) => pso,
@@ -828,7 +828,7 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
-                || again_if_out_of_memory(|| unsafe { host.device.CreateGraphicsPipelineState(desc) }),
+                || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
@@ -1682,24 +1682,4 @@ mod tests {
         ];
         let _ = offsets(&inputs);
     }
-}
-
-/// Makes a host pipeline again, a few times and a little later each time,
-/// when the host says it is out of memory: on a PC at its commit limit (a
-/// 32 GB one in the open world) that is a state of a moment, and a pipeline
-/// refused for it stayed refused for the run (a compute pass of the title's
-/// went without its pipeline: `host pipeline refused ... 0x8007000E`).
-fn again_if_out_of_memory<T>(mut make: impl FnMut() -> windows::core::Result<T>) -> windows::core::Result<T> {
-    const E_OUTOFMEMORY: i32 = 0x8007000Eu32 as i32;
-    let mut made = make();
-    for wait in [50u64, 200, 800, 2000] {
-        match &made {
-            Err(e) if e.code().0 == E_OUTOFMEMORY => {
-                std::thread::sleep(std::time::Duration::from_millis(wait));
-                made = make();
-            }
-            _ => break,
-        }
-    }
-    made
 }
