@@ -497,8 +497,10 @@ pub(crate) fn sampler_table() -> bool {
 
 /// Sampler slots kept for the tables of [`sampler_table`] at the end of
 /// every sampler heap, before its last slot (the one shaders clamp sampler
-/// indices to, which stays a point sampler).
-pub(crate) const SAMPLER_TAIL: u32 = 256;
+/// indices to, which stays a point sampler); fewer where the title's own
+/// slots reach into them. 256 were full after 81 blocks of the title's
+/// 1,786 stages with immediate samplers, 830 of them left static.
+pub(crate) const SAMPLER_TAIL: u32 = 1536;
 
 /// A sampler description in words, to tell two apart (floats by their bits).
 type SamplerKey = [u32; 13];
@@ -563,7 +565,6 @@ pub(super) fn table_sampler(
 /// stage whose samplers are exactly these.
 struct SamplerBlock {
     offset: u32,
-    keys: Vec<SamplerKey>,
     descs: Vec<D3D12_SAMPLER_DESC>,
 }
 
@@ -573,10 +574,12 @@ struct SamplerBlock {
 struct SamplerBlocks {
     list: Vec<SamplerBlock>,
     used: u32,
+    /// The keys of the slots taken, in order.
+    slots: Vec<SamplerKey>,
 }
 
 static SAMPLER_BLOCKS: std::sync::Mutex<SamplerBlocks> =
-    std::sync::Mutex::new(SamplerBlocks { list: Vec::new(), used: 0 });
+    std::sync::Mutex::new(SamplerBlocks { list: Vec::new(), used: 0, slots: Vec::new() });
 
 /// How many blocks exist: what a list compares with before it asks for the
 /// blocks to be written.
@@ -588,8 +591,12 @@ static SAMPLER_BLOCK_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// for want of room in the bound sampler heap.
 static SAMPLER_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Blocks, slots they take, and [`SAMPLER_STATS`].
-pub(crate) fn sampler_stats() -> [u64; 5] {
+/// The most title slots of a sampler heap a tail was made after.
+static TITLE_SAMPLERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Blocks, slots they take, [`SAMPLER_STATS`], and the most title slots of
+/// a sampler heap bound with a tail.
+pub(crate) fn sampler_stats() -> [u64; 6] {
     use std::sync::atomic::Ordering::Relaxed;
     let used = SAMPLER_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).used;
     [
@@ -598,6 +605,7 @@ pub(crate) fn sampler_stats() -> [u64; 5] {
         SAMPLER_STATS[0].load(Relaxed),
         SAMPLER_STATS[1].load(Relaxed),
         SAMPLER_STATS[2].load(Relaxed),
+        u64::from(TITLE_SAMPLERS.load(Relaxed)),
     ]
 }
 
@@ -607,21 +615,23 @@ pub(crate) fn sampler_refused() {
 }
 
 impl SamplerBlocks {
-    /// The offset in the tail of the block holding `descs`: the one made
-    /// before for the same descriptions, else a new one. None for none or
-    /// too many descriptions, or when the tail is full.
+    /// The offset in the tail of a run of slots holding `descs`: one
+    /// written before for the same descriptions in that order (a block of
+    /// its own or a part of others next to each other), else a new block.
+    /// None for none or too many descriptions, or when the tail is full.
     fn block(&mut self, descs: &[D3D12_SAMPLER_DESC]) -> Option<u32> {
         let n = u32::try_from(descs.len()).ok().filter(|&n| n > 0 && n <= SAMPLER_TAIL)?;
         let keys: Vec<SamplerKey> = descs.iter().map(sampler_key).collect();
-        if let Some(b) = self.list.iter().find(|b| b.keys == keys) {
-            return Some(b.offset);
+        if let Some(at) = self.slots.windows(keys.len()).position(|w| w == keys.as_slice()) {
+            return Some(at as u32);
         }
         let offset = self.used;
         if offset + n > SAMPLER_TAIL {
             return None;
         }
         self.used += n;
-        self.list.push(SamplerBlock { offset, keys, descs: descs.to_vec() });
+        self.slots.extend_from_slice(&keys);
+        self.list.push(SamplerBlock { offset, descs: descs.to_vec() });
         Some(offset)
     }
 }
@@ -695,13 +705,18 @@ pub(crate) struct SamplerTail {
     cpu: usize,
     gpu: u64,
     step: u32,
+    /// Its slots: [`SAMPLER_TAIL`], or fewer where the title's reach in.
+    slots: u32,
 }
 
-/// Where the tail of a sampler heap of `count` slots starts, if the title's
-/// first `title` slots leave room for it: [`SAMPLER_TAIL`] slots before the
-/// last.
-fn tail_start(count: u32, title: u32) -> Option<u32> {
-    count.checked_sub(SAMPLER_TAIL + 1).filter(|&first| title <= first)
+/// Where the tail of a sampler heap of `count` slots starts and how many
+/// slots it has: [`SAMPLER_TAIL`] before the last slot, from the title's
+/// first `title` slots on where those reach into them; none if no slot is
+/// left between the title's and the last.
+fn tail_start(count: u32, title: u32) -> Option<(u32, u32)> {
+    let last = count.checked_sub(1)?;
+    let first = last.saturating_sub(SAMPLER_TAIL).max(title);
+    (first < last).then(|| (first, last - first))
 }
 
 impl SamplerTail {
@@ -722,20 +737,26 @@ impl SamplerTail {
         if desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER || step == 0 {
             return None;
         }
-        let first = tail_start(desc.NumDescriptors, title)?;
+        TITLE_SAMPLERS.fetch_max(title, std::sync::atomic::Ordering::Relaxed);
+        let (first, slots) = tail_start(desc.NumDescriptors, title)?;
+        if slots < SAMPLER_TAIL {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(title, slots, "a title sampler heap reaches into the sampler tables' tail: blocks past its room are not bound there (logged once)"));
+        }
         let skip = u64::from(first) * u64::from(step);
         Some(Self {
             heap: heap.clone(),
             cpu: cpu.checked_add(usize::try_from(skip).ok()?)?,
             gpu: gpu.checked_add(skip)?,
             step,
+            slots,
         })
     }
 
     /// The handle of the block of `n` descriptors at `offset`, if the tail
     /// has them all.
     pub(crate) fn handle(&self, offset: u32, n: u32) -> Option<u64> {
-        (offset.checked_add(n)? <= SAMPLER_TAIL).then(|| self.gpu + u64::from(offset) * u64::from(self.step))
+        (offset.checked_add(n)? <= self.slots).then(|| self.gpu + u64::from(offset) * u64::from(self.step))
     }
 
     /// Writes the blocks this heap does not hold yet; how many exist now
@@ -760,10 +781,12 @@ impl SamplerTail {
         };
         let blocks = SAMPLER_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         for block in blocks.list.iter().skip(filled[at].1) {
-            for (i, d) in block.descs.iter().enumerate() {
+            // The slots past this heap's tail are never bound (`handle`).
+            let room = self.slots.saturating_sub(block.offset) as usize;
+            for (i, d) in block.descs.iter().take(room).enumerate() {
                 let slot = (block.offset as usize + i) * self.step as usize;
-                // SAFETY: a slot of the tail of a live sampler heap: blocks
-                // end inside the tail (`SamplerBlocks::block`).
+                // SAFETY: a slot of the tail of a live sampler heap, in range
+                // by the check above.
                 unsafe { host.device.CreateSampler(d, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.cpu + slot }) };
             }
         }
@@ -1750,21 +1773,27 @@ mod tests {
     #[test]
     fn sampler_blocks_are_shared_and_bounded() {
         let one = |filter| table_sampler(&static_sampler(filter, 1, 0), true).unwrap();
-        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0 };
-        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
-        assert_eq!(blocks.block(&[one(0)]), Some(2));
-        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
+        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0, slots: Vec::new() };
+        let (a, b) = (one(0), one(0x15));
+        assert_eq!(blocks.block(&[a, b]), Some(0));
+        // Parts of what is written are found there.
+        assert_eq!(blocks.block(&[a]), Some(0));
+        assert_eq!(blocks.block(&[b]), Some(1));
+        assert_eq!(blocks.block(&[a, b]), Some(0));
         // Same samplers in another order are another block.
-        assert_eq!(blocks.block(&[one(0x15), one(0)]), Some(3));
-        assert_eq!((blocks.list.len(), blocks.used), (3, 5));
+        assert_eq!(blocks.block(&[b, a]), Some(2));
+        // Runs across blocks are found too: a, b, b, a.
+        assert_eq!(blocks.block(&[b, b]), Some(1));
+        assert_eq!(blocks.block(&[a, a]), Some(4));
+        assert_eq!((blocks.list.len(), blocks.used), (3, 6));
         assert_eq!(blocks.block(&[]), None);
-        let many = vec![one(0); SAMPLER_TAIL as usize + 1];
+        let many = vec![a; SAMPLER_TAIL as usize + 1];
         assert_eq!(blocks.block(&many), None);
-        let rest = vec![one(0x10); (SAMPLER_TAIL - 5) as usize];
-        assert_eq!(blocks.block(&rest), Some(5));
+        let rest = vec![one(0x10); (SAMPLER_TAIL - 6) as usize];
+        assert_eq!(blocks.block(&rest), Some(6));
         assert_eq!(blocks.block(&[one(0x11)]), None);
         // What is there is still found when the tail is full.
-        assert_eq!(blocks.block(&[one(0)]), Some(2));
+        assert_eq!(blocks.block(&[b, a, a]), Some(2));
     }
 
     /// The tail lies before the last slot of a whole sampler heap, if the
@@ -1772,16 +1801,25 @@ mod tests {
     #[test]
     fn the_tail_needs_room_after_the_titles_slots() {
         let whole = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
-        assert_eq!(tail_start(whole, 0), Some(whole - 1 - SAMPLER_TAIL));
-        assert_eq!(tail_start(whole, whole - 1 - SAMPLER_TAIL), Some(whole - 1 - SAMPLER_TAIL));
-        assert_eq!(tail_start(whole, whole - SAMPLER_TAIL), None);
-        assert_eq!(tail_start(SAMPLER_TAIL, 0), None);
+        let first = whole - 1 - SAMPLER_TAIL;
+        assert_eq!(tail_start(whole, 0), Some((first, SAMPLER_TAIL)));
+        assert_eq!(tail_start(whole, first), Some((first, SAMPLER_TAIL)));
+        // Title slots reaching in leave the rest, up to the last slot.
+        assert_eq!(tail_start(whole, first + 10), Some((first + 10, SAMPLER_TAIL - 10)));
+        assert_eq!(tail_start(whole, whole - 2), Some((whole - 2, 1)));
+        assert_eq!(tail_start(whole, whole - 1), None);
+        assert_eq!(tail_start(whole, whole), None);
+        assert_eq!(tail_start(1, 0), None);
+        assert_eq!(tail_start(0, 0), None);
         let Some(heap) = table_heap() else { return };
         assert!(SamplerTail::new(heap, whole).is_none());
         let tail = SamplerTail::new(heap, 16).unwrap();
         assert!(tail.handle(0, SAMPLER_TAIL).is_some());
         assert!(tail.handle(1, SAMPLER_TAIL).is_none());
         assert!(tail.handle(u32::MAX, 2).is_none());
+        let short = SamplerTail::new(heap, first + 10).unwrap();
+        assert!(short.handle(0, SAMPLER_TAIL - 10).is_some());
+        assert!(short.handle(1, SAMPLER_TAIL - 10).is_none());
         // SAFETY: plain queries of a live heap and the device.
         let (start, step) = unsafe {
             (
@@ -1789,7 +1827,7 @@ mod tests {
                 host().unwrap().device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER),
             )
         };
-        let first = u64::from(whole - 1 - SAMPLER_TAIL);
+        let first = u64::from(first);
         assert_eq!(tail.handle(0, 1), Some(start + first * u64::from(step)));
         assert_eq!(tail.handle(3, 1), Some(start + (first + 3) * u64::from(step)));
     }
