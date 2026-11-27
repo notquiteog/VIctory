@@ -482,11 +482,12 @@ fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
     }
 }
 
-/// The reference's result with [`super::bvh_walk_guard`]'s cuts (as the
-/// tests set it): of a box, a child at node 0, at the box or (2) before it
-/// is not entered. (These scenes' child ids are made up, so some are.)
+/// The reference's result with [`super::bvh_walk_guard`]'s cuts (at the
+/// level the test runs at, 1 unless it sets one): of a box, a child at
+/// node 0, at the box or (2) before it is not entered. (These scenes' child
+/// ids are made up, so some are.)
 fn guarded(want: [u32; 4], scene: &Scene, case: &Case, pointers: u64, wide: bool, sort: bool) -> [u32; 4] {
-    let level = super::lower::intersect::TEST_WALK_GUARD.get().unwrap_or(0);
+    let level = super::bvh_walk_guard();
     let Some((n, kind @ (4 | 5), _)) = case else {
         return want;
     };

@@ -150,7 +150,10 @@ pub fn helper_lane_waves() -> bool {
 }
 
 /// How node tests guard walks of ray-tracing structures
-/// (`VICTORY_BVH_WALK_GUARD`; 0, off, when unset). The title's walker keeps
+/// (`VICTORY_BVH_WALK_GUARD`; 1 when unset, `=0` off). Level 1 is the
+/// default since the Series X bench gpu-g (2026-11-27, three walking runs
+/// each): the GPU slow state in 33 of 115 samples on main b57be5004, 3 of
+/// 121 with level 1, 9 of 119 with level 2; the picture as on main. The title's walker keeps
 /// its own stack, which a translation does not see; what a node test can
 /// see is the node and the children it hands back. A structure that is
 /// stale or written over (a compacted copy made from an old size, a page
@@ -176,9 +179,9 @@ pub fn bvh_walk_guard() -> u8 {
     }
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("VICTORY_BVH_WALK_GUARD").ok().as_deref().map(str::trim) {
-        Some("1") => 1,
+        Some("0") => 0,
         Some("2") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
