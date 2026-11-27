@@ -170,7 +170,7 @@ fn table() -> std::sync::MutexGuard<'static, Option<Table>> {
 }
 
 /// For the frame-rate line.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 mod stat {
     /// Copies classed G.
     pub const CLASSED: usize = 0;
@@ -187,7 +187,13 @@ mod stat {
     pub const LANDED: usize = 7;
     /// Closed copies found open (another protection put on them).
     pub const REOPENED: usize = 8;
+    /// The longest single title wait, ms.
+    pub const LONGEST: usize = 9;
 }
+
+/// The longest title wait of the run, ms, and the title waits of the run.
+static LONGEST_EVER: AtomicU64 = AtomicU64::new(0);
+static WAITS_EVER: AtomicU64 = AtomicU64::new(0);
 
 /// At `Host::card_before`, for the copies of a submission (numbered
 /// `sent_as`) whose shader writes are declared: those due are classed.
@@ -473,7 +479,11 @@ fn install() -> bool {
                     break;
                 }
             }
-            STATS[stat::WAITED_MS].fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let ms = began.elapsed().as_millis() as u64;
+            STATS[stat::WAITED_MS].fetch_add(ms, Ordering::Relaxed);
+            STATS[stat::LONGEST].fetch_max(ms, Ordering::Relaxed);
+            LONGEST_EVER.fetch_max(ms, Ordering::Relaxed);
+            WAITS_EVER.fetch_add(1, Ordering::Relaxed);
         }
         EXCEPTION_CONTINUE_EXECUTION
     }
@@ -515,14 +525,17 @@ pub(crate) fn line(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
     tracing::info!(
         "memory classes (VICTORY_PORT_CLASSES), over {frames:.0} frames: {} classed G, {copies} closed now ({:.1} MB); widened by the title {}, \
-         by us {}; title touches waited {} ({} ms, {} timed out); refused {}; owed spans landed {}; found open {}",
+         by us {}; title touches waited {} ({} ms, the longest {} ms, {} timed out; in the run {}, the longest {} ms); refused {};          owed spans landed {}; found open {}",
         s[stat::CLASSED],
         bytes as f64 / 1e6,
         s[stat::TITLE],
         s[stat::OURS],
         s[stat::WAITS],
         s[stat::WAITED_MS],
+        s[stat::LONGEST],
         s[stat::TIMED_OUT],
+        WAITS_EVER.load(Ordering::Relaxed),
+        LONGEST_EVER.load(Ordering::Relaxed),
         s[stat::REFUSED],
         s[stat::LANDED],
         s[stat::REOPENED]
