@@ -137,3 +137,108 @@ fn guest_cube_gradient_selects_mip_by_footprint() {
         assert_eq!(levels.as_slice(), expected, "{name}");
     }
 }
+
+/// `image_sample_d_cl_o` (gradients, a texel offset and a least level): it
+/// lowers like `image_sample_d_cl`, the offset word first, and the offset
+/// moves the texel read (after Marvisak/VIctory#3493). One level only: the
+/// clamp is lowered but has no level to raise the sample to here.
+#[test]
+fn a_gradient_sample_with_an_offset_and_a_clamp_applies_the_offset() {
+    const SIZE: u32 = 16;
+    let program = |offset: u32| {
+        let mut words = vec![
+            0xBE81_0380,
+            0xBE83_0380, // s1, s3 = 0 (upper halves of the tables)
+            0xF40C_0400,
+            0xFA00_0000, // texture SRV to s[16:23] from s[0:1]
+            0xF408_0300,
+            0xFA00_0020, // raw output UAV to s[12:15] from s[0:1]+32
+            0xF408_0601,
+            0xFA00_0000, // sampler to s[24:27] from s[2:3]
+            0x7E1E_0280, // v15 = 0 for the output byte offset
+            0x7E02_02FF, // v1 = the offset word
+            offset,
+        ];
+        // Gradients of 1/16 (level 0), the centre of texel (5, 9), clamp 0.
+        let addr = [1.0 / 16.0f32, 0.0, 0.0, 1.0 / 16.0, 11.0 / 32.0, 19.0 / 32.0, 0.0];
+        for (reg, value) in addr.iter().enumerate() {
+            words.extend([0x7E00_02FF | ((reg as u32 + 2) << 17), value.to_bits()]);
+        }
+        // image_sample_d_cl_o v10, v[1:8], s[16:23], s[24:27] dmask:R dim:2D
+        words.extend([0xF000_0108 | (0x33 << 18), 0x00C4_0A01]);
+        words.extend([0xE070_1000, 0x8003_0A0F]); // buffer_store_dword v10, v15, s[12:15], 0 offen
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |slot, user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let range = |kind, at, words, slot, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: words,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![table(0, 0), table(1, 2)],
+            used: vec![
+                range(ResourceType::Srv, 0, 8, 0, 0),
+                range(ResourceType::Uav, 8, 4, 0, 0),
+                range(ResourceType::Sampler, 0, 4, 1, 2),
+            ],
+            io: StageIo::Cs(ComputeIo { rsrc2: 3 << 1, threads: [1, 1, 1] }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        build_compute_shader(&native).expect("image_sample_d_cl_o lowers").0
+    };
+    let plain = program(0);
+    let shifted = program(0x3F01); // x + 1, y - 1 in signed six-bit fields
+    let texels: Vec<[f32; 4]> = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| [(y * 32 + x + 1) as f32, 0.0, 0.0, 1.0]))
+        .collect();
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: f32::MAX,
+        MaxAnisotropy: 1,
+        ..Default::default()
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (name, warp) in [("WARP", true), ("hardware", false)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {name} device; skipped");
+            continue;
+        };
+        for (shader, want) in [(&plain, 294.0f32), (&shifted, 263.0)] {
+            let (root, pso) = host.compute_pipeline(shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                        views: &[View::Texture(SIZE, SIZE, &texels), View::RawUav(1)],
+                        samplers: &[sampler],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(f32::from_bits(out[0][0]), want, "{name}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}

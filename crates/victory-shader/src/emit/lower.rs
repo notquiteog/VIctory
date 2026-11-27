@@ -12843,13 +12843,13 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let has_cl = name.ends_with("_cl");
+        let has_cl = name.ends_with("_cl") || name == "image_sample_d_cl_o";
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_cl_o" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -13026,6 +13026,30 @@ impl<'a> Lower<'a> {
                     os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
                 }
             }
+            if offset_word && (op == 63 || op == 60 && self.s.pixel) {
+                if op == 63 && kind == 5 {
+                    return Err("a cube gradient sample with a texel offset");
+                }
+                // DXIL wants immediate offsets in -8..=7 here; the
+                // console's are 6-bit and may be computed. A
+                // constant word in range becomes immediates
+                // (upstream PR #634); anything else keeps the
+                // offsets computed above (upstream refuses those).
+                let w = addr_val(self, 0)?;
+                if let Some(w) = self.s.m.int_value(w) {
+                    let w = w as u32;
+                    let field = |k: usize| {
+                        let x = (w >> (8 * k) & 0x3F) as i32;
+                        if x >= 32 { x - 64 } else { x }
+                    };
+                    let n = offsets.min(2);
+                    if (0..n).all(|k| (-8..=7).contains(&field(k))) {
+                        for (k, o) in os.iter_mut().enumerate().take(n) {
+                            *o = self.s.m.i32(field(k) as u32);
+                        }
+                    }
+                }
+            }
             let mut args = vec![h, sh];
             args.extend(&cs);
             let clamp = if has_cl {
@@ -13104,27 +13128,6 @@ impl<'a> Lower<'a> {
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     call_sample(self, "sample.f32", 60, &args, &mut gathered)
