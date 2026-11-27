@@ -108,6 +108,27 @@ fn lowered_on(
     lowered_counted(native, p, wide, host_wave, false)
 }
 
+/// The wave size [`lowered`] gives a program (32-lane host waves).
+fn lowered_with_wave(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> (Option<u32>, ()) {
+    let st = structure::structure_wide(p, wide).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower_counted(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    }, false);
+    lower::TEST_HOST_WAVE.set(was);
+    (lowered.expect("lower").wave_size, ())
+}
+
 fn lowered_counted(
     native: &NativeProgram,
     p: &ir::Program,
@@ -1343,4 +1364,26 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
         eprintln!("the old rounding on this device: {written} of 64 dwords written");
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
+}
+
+/// A select on a lane mask held as a number takes the lane's own bit of it, so the program
+/// needs the console's lanes, as one reading the mask through a guard or as data does. It
+/// was lowered without them: in a release build each lane took the bit of its host lane
+/// (with no wave size, whatever the host's waves are); a debug build stopped on the
+/// assertion in `cross_lane`.
+#[test]
+fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
+    let words = [
+        0xBEEA_03FF, // s_mov_b32 vcc_lo, 0x55555555 (every other lane)
+        0x5555_5555,
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x0200_0A80, // v_cndmask_b32 v0, 0, v5, vcc_lo
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    // 64 threads in waves of 32: two console waves, and no LDS
+    let native = native_of(&words, false, 64);
+    let p = crate::spill::build(&native).expect("build");
+    let (wave, _) = lowered_with_wave(&native, &p, &HashSet::new());
+    assert_eq!(wave, Some(32));
 }
