@@ -214,6 +214,15 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     while out.last() == Some(&backslash) {
         out.pop();
     }
+    for part in clean(tail) {
+        out.push(backslash);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+/// The tail's parts, `.` and `..` resolved (`..` stops at the root).
+fn clean(tail: &[u16]) -> Vec<&[u16]> {
     let dot = u16::from(b'.');
     let mut parts: Vec<&[u16]> = Vec::new();
     for part in tail.split(|c| SEPARATORS.contains(c)) {
@@ -224,11 +233,7 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
             _ => parts.push(part),
         }
     }
-    for part in parts {
-        out.push(backslash);
-        out.extend_from_slice(part);
-    }
-    out
+    parts
 }
 
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on a
@@ -314,14 +319,17 @@ fn on_drive(prefix: &[u16], letter: u16, tail: &[u16]) -> Option<(Vec<u16>, bool
     if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
         out.push(b'\\'.into());
     }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
+    if prefix.is_empty() {
+        // The host cleans this form up itself: the tail stays as it came.
+        out.extend_from_slice(tail);
+    } else {
+        // The host does no clean-up on a `\\?\` path: `/` becomes `\` and
+        // `.` and `..` are resolved here (`..` stops at the root).
+        for part in clean(tail) {
+            out.push(b'\\'.into());
+            out.extend_from_slice(part);
         }
-    }));
+    }
     out.push(0);
     Some((out, read_only))
 }
@@ -1124,6 +1132,16 @@ mod tests {
             tr(format!(r"\\?\{letter}:/a/b")),
             Some(format!(r"\\?\{root}\a\b"))
         );
+        // A `\\?\` path the title spells itself gets the same clean-up:
+        // the host does none on that form.
+        assert_eq!(
+            tr(format!(r"\\?\{letter}:/a/./b/../c")),
+            Some(format!(r"\\?\{root}\a\c"))
+        );
+        assert_eq!(
+            tr(format!(r"\\?\{letter}:/../../c")),
+            Some(format!(r"\\?\{root}\c"))
+        );
         assert_eq!(tr(r"C:\Windows".into()), None);
         assert_eq!(tr("relative/path".into()), None);
         assert_eq!(tr(String::new()), None);
@@ -1177,6 +1195,29 @@ mod tests {
         host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
         assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
+    }
+
+    /// A `\\?\` path the title spells with `.` or `..` opens on the host:
+    /// that form turns the host's own clean-up off, so the translation
+    /// resolves the segments.
+    #[test]
+    fn a_verbatim_title_path_resolves_its_dot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"host").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+        let file = format!(r"\\?\{letter}:/sub/../a.txt");
+        let f = _wfopen(w(&file).as_ptr(), w("rb").as_ptr());
+        assert!(!f.is_null(), "{file}");
+        let mut out = [0u8; 4];
+        let n = host!(
+            "ucrtbase.dll",
+            "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize
+        )(out.as_mut_ptr(), 1, out.len(), f);
+        assert_eq!(n, 4);
+        assert_eq!(&out, b"host");
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
     }
 
     #[test]
