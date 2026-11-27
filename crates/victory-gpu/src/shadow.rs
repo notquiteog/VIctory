@@ -5939,19 +5939,19 @@ mod windows16 {
     }
 }
 
-/// Whether [`exact`] keeps its copies in [`pooled`]'s shards
-/// (`VICTORY_EXACT_POOL=1`; off by default until measured).
+/// Whether [`exact`] keeps its copies in [`pooled`]'s shards (on by
+/// default; `VICTORY_EXACT_POOL=0`: one map swept whole, as before).
 fn exact_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_EXACT_POOL").is_some_and(|v| v != "0");
+        let on = std::env::var_os("VICTORY_EXACT_POOL").is_none_or(|v| v != "0");
         tracing::info!(on, "copies of buffer views' own bytes in shards, swept a little at a time (VICTORY_EXACT_POOL)");
         on
     })
 }
 
 /// [`exact`] with its copies in shards, each swept every few copies made
-/// (`VICTORY_EXACT_POOL=1`).
+/// (`VICTORY_EXACT_POOL`, on by default).
 ///
 /// Why (profile rc-prof, walking, Series X, 2026-11-26): of the 680 ms a
 /// frame the eight recording threads worked, 282 were in [`exact`]: 140
