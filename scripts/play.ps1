@@ -21,6 +21,9 @@
 # -WarmAll       compile every pipeline the title has ever created before the start, not only those earlier runs used
 #                (long the first time: tens of thousands; afterwards only new ones)
 # -RayTracing    accepted and ignored (ray tracing is the default); kept so older command lines still work
+# -HardwareRT    ray tracing on the card's ray-tracing cores (VICTORY_RT_HARDWARE=1, docs\hardware-rt.md): work in
+#                progress, off by default; today it builds the card's own structures beside the title's, and the
+#                title's own walks still trace
 #
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -35,7 +38,8 @@ param(
     [hashtable]$More = @{},
     [switch]$NoWarm,
     [switch]$WarmAll,
-    [switch]$RayTracing
+    [switch]$RayTracing,
+    [switch]$HardwareRT
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -69,9 +73,10 @@ if ($Resolution) {
     $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
 }
 if ($Adapter) { $settings.VICTORY_D3D12_ADAPTER = $Adapter }
+if ($HardwareRT -and -not $NoRayTracing) { $settings.VICTORY_RT_HARDWARE = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
-$rays = if ($settings.VICTORY_BVH_BUILDER -eq '0') { 'off' } else { 'on' }
+$rays = if ($settings.VICTORY_BVH_BUILDER -eq '0') { 'off' } elseif ($settings.VICTORY_RT_HARDWARE -eq '1') { 'on (hardware)' } else { 'on' }
 Write-Host "Series $console, the world drawn at $([int]($outHeight * $scale))p, ray tracing $rays"
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

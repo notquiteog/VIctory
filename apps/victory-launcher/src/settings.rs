@@ -208,6 +208,10 @@ pub struct Settings {
     pub resolution: Resolution,
     /// The title's own ray tracing (`play.ps1 -NoRayTracing` when off).
     pub ray_tracing: bool,
+    /// Ray tracing on the card's ray-tracing cores instead of in shaders
+    /// (`play.ps1 -HardwareRT`, `VICTORY_RT_HARDWARE=1`; docs/hardware-rt.md).
+    /// Work in progress, off by default.
+    pub ray_tracing_hardware: bool,
     /// Part of a graphics card's name or its index (`VICTORY_D3D12_ADAPTER`);
     /// empty: the system's first.
     pub adapter: String,
@@ -290,6 +294,7 @@ impl Default for Settings {
             console: Console::default(),
             resolution: Resolution::default(),
             ray_tracing: true,
+            ray_tracing_hardware: false,
             adapter: String::new(),
             smooth_motion: false,
             warm: WarmMode::default(),
@@ -643,6 +648,9 @@ pub fn build_env(s: &Settings) -> BTreeMap<String, String> {
     if !vendor_upscaler {
         set("VICTORY_RENDER_SCALE", s.resolution.render_scale(s.console));
     }
+    if s.ray_tracing && s.ray_tracing_hardware {
+        set("VICTORY_RT_HARDWARE", "1".to_owned());
+    }
     if !s.ray_tracing {
         set("VICTORY_BVH_BUILDER", "0".to_owned());
         let hashes = RT_OFF_HASHES.trim();
@@ -702,6 +710,8 @@ pub fn describe(s: &Settings) -> String {
         .unwrap_or_else(|| "the world drawn at the upscaler's size".to_owned());
     let rays = if env.get("VICTORY_BVH_BUILDER").map(String::as_str) == Some("0") {
         "off"
+    } else if env.get("VICTORY_RT_HARDWARE").map(String::as_str) == Some("1") {
+        "on (hardware)"
     } else {
         "on"
     };
@@ -718,6 +728,7 @@ pub mod help {
     pub const CONSOLE: &str = "Which console the game believes it runs on. Series S makes a 1080p picture and is the fastest measured; Series X makes 2160p, sharper and about half as fast.";
     pub const RESOLUTION: &str = "The height the world is drawn at before the game's own upscaler enlarges it to the picture. Lower is faster and blurrier. Series S cannot be drawn at its full 1080p.";
     pub const RAY_TRACING: &str = "The game's own ray-traced lighting and reflections. Off is faster; a simpler light stands in for it.";
+    pub const RAY_TRACING_HARDWARE: &str = "Where the rays are traced. Software: in the game's own shaders, as on the console (tested). Hardware: on the graphics card's ray-tracing cores (RTX cores and the like). Work in progress: today it only builds the card's own structures beside the game's, and the game's shaders still trace.";
     pub const ADAPTER: &str = "On a PC with more than one graphics card: the one to use.";
     pub const SMOOTH_MOTION: &str = "Starts the game under the name victory_sm.exe, so that a Smooth Motion profile you set for that name in the NVIDIA App applies (the driver's frame generation). Nothing is downloaded.";
     pub const WARM: &str = "Compiling the graphics card's pipelines ahead, so the game does not stutter making them. What is done once is kept; stopping it leaves the rest for next time.";
@@ -933,6 +944,19 @@ mod tests {
         );
         // `--console` is only given for Series S (Series X is victory's default).
         assert_eq!(Console::default(), Console::SeriesS);
+    }
+
+    #[test]
+    fn hardware_ray_tracing_is_the_play_scripts_hardware_rt() {
+        let mut s = Settings::default();
+        assert!(!s.ray_tracing_hardware);
+        assert!(!build_env(&s).contains_key("VICTORY_RT_HARDWARE"));
+        s.ray_tracing_hardware = true;
+        assert_eq!(build_env(&s)["VICTORY_RT_HARDWARE"], "1");
+        assert!(describe(&s).ends_with("ray tracing on (hardware)"));
+        // Without ray tracing there is nothing to trace on the card.
+        s.ray_tracing = false;
+        assert!(!build_env(&s).contains_key("VICTORY_RT_HARDWARE"));
     }
 
     #[test]

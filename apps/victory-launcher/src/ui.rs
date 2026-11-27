@@ -1833,6 +1833,14 @@ impl App {
             ui.add_space(4.0);
             ui.checkbox(&mut s.ray_tracing, "Ray tracing");
             hint(ui, help::RAY_TRACING);
+            ui.add_enabled_ui(s.ray_tracing, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Ray tracing:");
+                    ui.radio_value(&mut s.ray_tracing_hardware, true, "hardware (RTX cores)");
+                    ui.radio_value(&mut s.ray_tracing_hardware, false, "software");
+                });
+            });
+            hint(ui, help::RAY_TRACING_HARDWARE);
             ui.add_space(4.0);
             ui.label("Ambient light");
             hint(ui, help::AMBIENT);
@@ -1874,6 +1882,7 @@ impl App {
             let changed = s.console != defaults.console
                 || s.resolution != defaults.resolution
                 || s.ray_tracing != defaults.ray_tracing
+                || s.ray_tracing_hardware != defaults.ray_tracing_hardware
                 || (s.ambient - defaults.ambient).abs() > 0.001
                 || s.preset != defaults.preset;
             if ui
@@ -1886,6 +1895,7 @@ impl App {
                 s.console = defaults.console;
                 s.resolution = defaults.resolution;
                 s.ray_tracing = defaults.ray_tracing;
+                s.ray_tracing_hardware = defaults.ray_tracing_hardware;
                 s.ambient = defaults.ambient;
                 s.preset = defaults.preset;
             }
