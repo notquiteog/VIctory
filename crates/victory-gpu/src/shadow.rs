@@ -3105,6 +3105,11 @@ fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
 static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
     std::sync::Mutex::new(crate::host::RamBand::Calm);
 
+/// Whether the last sweep's host memory band is above calm (Watch or High).
+pub(crate) fn ram_pressured() -> bool {
+    !matches!(*WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner()), crate::host::RamBand::Calm)
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
