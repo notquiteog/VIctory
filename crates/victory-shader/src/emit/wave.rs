@@ -182,7 +182,10 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            // (an EXEC restore in a later block: later sections of this
+            // block are still sections)
+            i += 1;
+            continue;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
@@ -1191,6 +1194,25 @@ mod tests {
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
         let (found, _) = shape(&words(quads, pairs));
         assert_eq!(found, None);
+    }
+
+    /// A saveexec whose EXEC restore is not in the block (it lives in a
+    /// later one) starts no section, and the scan goes on past it: a whole
+    /// wave section after it in the same block is still found.
+    #[test]
+    fn an_unmatched_saveexec_does_not_hide_later_sections_of_its_block() {
+        let mut w = vec![0xBE8A_25C1]; // s_or_saveexec_b64 s[10:11], -1 (no restore)
+        w.extend(WAVE_OR_V7_TO_S7);
+        let p = build(&w, true);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(4)).unwrap();
+        let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+        // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+        let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+        let secs = sections(&p, 0);
+        assert!(!secs.contains_key(&0), "the unmatched saveexec starts no section");
+        let sec = secs.get(&1).expect("the later section of the block is found");
+        assert_eq!(sec.shapes.get(&total).copied(), Some(Shape::Active(Op::Or, v7, saved, 0)));
     }
 
     #[test]
