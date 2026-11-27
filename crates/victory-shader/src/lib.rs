@@ -30,7 +30,7 @@ pub mod structure;
 /// fails when its sample programs translate differently under the same
 /// version; after a bump, `VICTORY_BLESS_TRANSLATOR=1 cargo test -p
 /// victory-shader translator_version` writes its digests again.
-pub const TRANSLATOR_VERSION: u32 = 1;
+pub const TRANSLATOR_VERSION: u32 = 2;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
