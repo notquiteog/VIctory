@@ -1382,6 +1382,20 @@ fn lds_flag_region(p: &Program, st: &Structured, blocks: &[usize]) -> bool {
     leaks.is_empty()
 }
 
+/// Whether an instruction other than a branch reads the SCC of a mask operation
+/// ([`Structured::scc_some`]) as data: an `s_cselect` of "some lane is set", as the
+/// console compiler's bounded poll loops have it (the title's FidelityFX passes wait in
+/// such loops). As data that SCC asks the console's wave ([`Lower::scc_some`]), so the
+/// program needs the console's lanes.
+fn mask_sccs_read_as_data(p: &Program, st: &Structured) -> bool {
+    p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| !i.name().starts_with("s_cbranch"))
+        .filter_map(|i| i.read(Reg::Scc))
+        .any(|v| st.scc_some.contains_key(&v))
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -2042,7 +2056,9 @@ impl<'a> Lower<'a> {
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
-                || !x.st.wide.is_empty();
+                || !x.st.wide.is_empty()
+                // (so does the SCC of a mask operation read as data)
+                || mask_sccs_read_as_data(p, x.st);
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -2063,7 +2079,8 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
+                    || !x.st.wide.is_empty()
+                    || mask_sccs_read_as_data(p, x.st);
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {

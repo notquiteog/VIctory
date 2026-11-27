@@ -360,6 +360,52 @@ fn a_scalar_a_lane_branch_writes_is_the_waves_after_the_join() {
     }
 }
 
+/// The SCC of a mask operation within EXEC (`s_and_b32` of a compare and
+/// EXEC), read as data by `s_cselect`, is whether some lane of the wave is
+/// set: 1 when lanes below 5 compare true, 2 when none does. And the console
+/// compiler's bounded poll loop of that form: s22 counts up until some lane
+/// has lane + 5 < s22 (lane 0 at 6) or s22 reaches 64.
+#[test]
+fn a_mask_operations_scc_read_as_data_is_the_waves_any() {
+    const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
+        0x7C00_0000 | op << 17 | vsrc1 << 9 | src0
+    }
+    const V_CMP_GT_U32: u32 = 0xC4;
+    let s_and_vcc_exec = sop2(0x0E, 20, 106, 126); // s_and_b32 s20, vcc_lo, exec_lo
+    let select = |below: u32| {
+        vec![
+            vopc(V_CMP_GT_U32, 128 + below, 0), // vcc_lo = below > v0
+            s_and_vcc_exec,
+            sop2(0x0A, 21, 0x81, 0x82), // s_cselect_b32 s21, 1, 2
+            vop1(0x001, 0, sgpr(21)),
+        ]
+    };
+    let body = [
+        sop2(0x00, 22, 22, 0x81), // s_add_u32 s22, s22, 1
+        vopc(V_CMP_GT_U32, 22, 4), // vcc_lo = s22 > v4
+        s_and_vcc_exec,
+        sop2(0x0A, 21, 0x80, 0xC1), // s21 = no lane set
+        0xBF09_C016,                // s_cmp_ge_u32 s22, 64
+        sop2(0x0A, 23, 0xC1, 0x80), // s23 = s22 >= 64
+        sop2(0x16, 23, 23, 21),     // s_orn2_b32 s23, s23, s21: SCC = s23 | !s21
+    ];
+    let back = -(body.len() as i16 + 1);
+    let mut poll = vec![
+        0x25 << 25 | 4 << 17 | 0x85, // v_add_nc_u32 v4, 5, v0
+        s_mov_b32(22, 0x80),
+    ];
+    poll.extend(body);
+    poll.push(0xBF84_0000 | back as u16 as u32); // s_cbranch_scc0 back to the add
+    poll.push(vop1(0x001, 0, sgpr(22)));
+    for (label, words, want) in [("some", select(5), 1), ("none", select(0), 2), ("poll", poll, 6)] {
+        let shader = build_cs(&words, 32, 0);
+        // (WARP's waves are narrower than 32 lanes: no pipeline there.)
+        run_cases_on(&shader, &[[0; 4]], &[("hardware", false)], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {label}");
+        });
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;
