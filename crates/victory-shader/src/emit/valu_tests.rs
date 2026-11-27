@@ -3321,3 +3321,106 @@ fn v_rndne_f32_ties_to_even_and_specials() {
         assert_eq!(got, 2, "{backend}: literal v_cvt_pk_u8_f32(2.5) = {got:#x}, want 2");
     });
 }
+
+/// The shader cache keys translations by [`crate::TRANSLATOR_VERSION`], not
+/// by the translator's source (`victory-gpu`'s `shader_cache`): a change
+/// that alters what the translator makes must bump it, or runs are served
+/// the old translations. This test translates a fixed set of sample programs
+/// and compares a digest of each result (its DXIL and what the host binds
+/// for it) with `translator_digests.txt`, written for one version. A
+/// different result under the same version fails: bump the version, then
+/// write the file again with `VICTORY_BLESS_TRANSLATOR=1`. A bumped version
+/// with the old file fails too, so the file follows every bump.
+mod translator_version {
+    use super::*;
+
+    const FILE: &str = "src/emit/translator_digests.txt";
+
+    /// FNV-1a, 64 bits: fixed across Rust releases and hosts.
+    fn fnv(bytes: &[u8], mut h: u64) -> u64 {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    fn digest(s: &HostShader) -> String {
+        let h = fnv(&s.dxil, 0xcbf2_9ce4_8422_2325);
+        let rest = format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            s.stage,
+            s.user_data,
+            s.samplers,
+            s.static_samplers,
+            s.root_cbvs,
+            s.root_srvs,
+            s.root_uavs,
+            s.root_indexed_views,
+            s.half_views
+        );
+        format!("{:016x}", fnv(rest.as_bytes(), h))
+    }
+
+    /// The sample programs: scalar and vector ALU, compares, branches and
+    /// joins, format loads, cross-lane reads, 32-lane groups.
+    fn samples() -> Vec<(&'static str, HostShader)> {
+        let mut all = Vec::new();
+        all.push(("v_mov", build_valu_cs(&[vop1(0x001, 0, vgpr(1))])));
+        all.push(("v_med3_f32", build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)))));
+        all.push((
+            "s_quadmask",
+            build_valu_cs(&[0xBE90_2C00, sop2(0x0a, 18, 129, 128), sop2(0x1e, 18, 18, 144), sop2(0x10, 16, 16, 18), vop1(1, 0, sgpr(16))]),
+        ));
+        all.push((
+            "branch_join",
+            build_valu_cs(&[0xBF06_0100, 0xBF85_0002, s_mov_b32(2, 128), 0xBF82_0002, s_mov_b32(2, 129), 0xBF85_0000, vop1(0x001, 0, sgpr(2))]),
+        ));
+        for (name, op) in [("v_cmp_lt_f32", 0x001u16), ("v_cmp_lg_f32", 0x005), ("v_cmp_f_f32", 0x000), ("v_cmp_lt_f16", 0x0c9)] {
+            let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            all.push((name, build_valu_cs(&body)));
+        }
+        for (name, op, format) in [("tbuffer_d16_xy_f16", 1u8, 29u8), ("tbuffer_d16_x_unorm", 0, 13), ("tbuffer_d16_xy_uint", 1, 27)] {
+            all.push((name, tbuffer_load_of_v1(op, format)));
+        }
+        let mut body = vop3(0x377, 1, vgpr(0), sgpr(0), sgpr(1)).to_vec();
+        body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + 5, 0));
+        body.push(vop1(0x001, 0, sgpr(12)));
+        all.push(("v_permlane16_32_lanes", build_cs(&body, 32, 0)));
+        all
+    }
+
+    #[test]
+    fn translations_change_only_with_the_translator_version() {
+        // What the translator is told of the host, fixed for this thread:
+        // GPU tests beside this one tell the process what their device is.
+        lower::TEST_HOST_WAVE.set(Some(32));
+        lower::TEST_RDNA.set(Some(0));
+        lower::TEST_SUB_LOOPS.set(Some(false));
+        lower::TEST_GROUP_BASE.set(Some(false));
+        crate::emit::shader::RAW_VIEWS_HERE.set(Some(0));
+        let now: Vec<String> = samples().into_iter().map(|(name, s)| format!("{name} {}", digest(&s))).collect();
+        let head = format!("version {}", crate::TRANSLATOR_VERSION);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE);
+        if std::env::var_os("VICTORY_BLESS_TRANSLATOR").is_some_and(|v| v == "1") {
+            let text = format!("{head}\n{}\n", now.join("\n"));
+            std::fs::write(&path, text).expect("write the digests");
+            return;
+        }
+        let kept = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut lines = kept.lines().map(str::trim).filter(|l| !l.is_empty());
+        let kept_head = lines.next().unwrap_or_default();
+        let kept: Vec<&str> = lines.collect();
+        let differ: Vec<&String> = now.iter().filter(|l| !kept.contains(&l.as_str())).collect();
+        assert!(
+            kept_head == head,
+            "{FILE} is for {kept_head:?}, the translator is {head:?}: write it again with VICTORY_BLESS_TRANSLATOR=1"
+        );
+        assert!(
+            differ.is_empty() && kept.len() == now.len(),
+            "these translations changed under {head} ({differ:?}): bump victory_shader::TRANSLATOR_VERSION \
+             (the shader cache would serve the old ones), then write {FILE} again with VICTORY_BLESS_TRANSLATOR=1"
+        );
+    }
+}

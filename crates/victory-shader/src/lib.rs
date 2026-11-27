@@ -18,6 +18,20 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// The version of what the translator makes, part of the key of every
+/// cached translation (`victory-gpu`'s `shader_cache`): **bump it with any
+/// change that changes the translation of a shader** (its DXIL or what the
+/// host binds for it). Changes that do not (speed, diagnostics, tests,
+/// shaders that did not translate before) leave it, and every shader
+/// translated before is kept across the rebuild. `victory shaders`
+/// translates again what an earlier build of the translator cached and says
+/// how many came out different: if any did, the bump was due. The test
+/// `translations_change_only_with_the_translator_version` (`emit/valu_tests.rs`)
+/// fails when its sample programs translate differently under the same
+/// version; after a bump, `VICTORY_BLESS_TRANSLATOR=1 cargo test -p
+/// victory-shader translator_version` writes its digests again.
+pub const TRANSLATOR_VERSION: u32 = 1;
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
