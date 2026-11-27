@@ -1,14 +1,14 @@
-# VIctory on NVIDIA
+﻿# VIctory for AMD and NVIDIA
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), which runs an Xbox Series title on Windows from files you supply. This fork targets **NVIDIA cards**. The goal is a steady 30 fps with the title's own ray tracing on. It isn't there yet.
+A fork of [VIctory](https://github.com/Marvisak/VIctory), which runs an Xbox Series title on Windows from files you supply. This fork targets **AMD and NVIDIA cards**. The goal is a steady 30 fps with the title's own ray tracing on. It isn't there yet.
 
 **No game files, code or assets are included.** You need your own copy of the game. This project is not affiliated with or endorsed by the game's developer or publisher.
 
 ## Status
 
 - Native ray tracing is **on by default**. To turn it off, use `-NoRayTracing`.
-- Walking outdoors as Series S at half resolution, frames take about 50–90 ms (11–20 fps), and the CPU is the limit.
-- You need 64 GB of RAM: the game uses 25–45 GB.
+- Walking outdoors as Series S at half resolution, frames take about 50â€“90 ms (11â€“20 fps), and the CPU is the limit.
+- You need 64 GB of RAM: the game uses 25â€“45 GB.
 - The first run after a new driver or build stutters while shaders are compiled. `victory warm` compiles them ahead of time.
 
 ## Run it
@@ -27,10 +27,11 @@ cd victory-nvidia
 copy victory.example.toml victory.toml   # set your paths
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <shader archives>   # once, takes minutes
-scripts\play-nvidia.ps1 -Exe <your copy's executable>
+scripts\play-nvidia.ps1 -Exe <your copy's executable>   # NVIDIA
+scripts\play.ps1 -Exe <your copy's executable>          # AMD
 ```
 
-Useful flags:
+Useful flags for `play-nvidia.ps1` (`play.ps1` also takes `-NoRayTracing`):
 
 | Flag | What it does |
 |---|---|
