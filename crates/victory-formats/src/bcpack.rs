@@ -319,38 +319,57 @@ struct Lane {
 
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
-    /// decode at most one symbol.
+    /// decode at most one symbol. Inlined into the schedule's round robin,
+    /// which calls it once per symbol; [`Lane::header`] stays out of line.
+    #[inline(always)]
     fn step(&mut self, t: &Tables) -> Result<(), Error> {
-        if self.phase != 3 {
-            let Some(b) = self.latch.take() else {
-                return Ok(());
-            };
-            self.need = true;
-            match self.phase {
-                0 => {
-                    // The top two bits shrink the alphabet; width >= 3.
-                    let group = self.width - (b >> 6);
-                    self.model = group * 16 + (b & 15);
-                    self.reset = b & 0x10 != 0;
-                    self.long = b & 0x20 != 0;
-                    self.left = 0;
-                    self.phase = 1;
-                }
-                1 if self.long => {
-                    self.left = b.into();
-                    self.phase = 2;
-                }
-                1 => {
-                    self.left = u32::from(b) + 1;
-                    self.phase = 3;
-                }
-                _ => {
-                    self.left = (u32::from(b) << 8 | self.left) + 257;
-                    self.phase = 3;
-                }
-            }
-            return Ok(());
+        if self.phase == 3 {
+            self.payload(t);
+        } else {
+            self.header();
         }
+        Ok(())
+    }
+
+    /// The latched header, length or payload byte that starts or measures a
+    /// fragment: a few steps per fragment, so it is kept out of the
+    /// schedule's loop rather than in it.
+    #[inline(never)]
+    fn header(&mut self) {
+        let Some(b) = self.latch.take() else {
+            return;
+        };
+        self.need = true;
+        match self.phase {
+            0 => {
+                // The top two bits shrink the alphabet; width >= 3.
+                let group = self.width - (b >> 6);
+                self.model = group * 16 + (b & 15);
+                self.reset = b & 0x10 != 0;
+                self.long = b & 0x20 != 0;
+                self.left = 0;
+                self.phase = 1;
+            }
+            1 if self.long => {
+                self.left = b.into();
+                self.phase = 2;
+            }
+            1 => {
+                self.left = u32::from(b) + 1;
+                self.phase = 3;
+            }
+            _ => {
+                self.left = (u32::from(b) << 8 | self.left) + 257;
+                self.phase = 3;
+            }
+        }
+    }
+
+    /// One symbol of a fragment's payload, or the fragment's end: every line
+    /// of it is on the schedule's round robin's hot path, once per symbol,
+    /// so it is inlined into that loop and pays no call.
+    #[inline]
+    fn payload(&mut self, t: &Tables) {
         let mut x = self.x;
         let refill = if x < LOW { self.latch.take() } else { None };
         if let Some(b) = refill {
@@ -386,7 +405,6 @@ impl Lane {
             self.need = self.latch.is_none();
             self.x = if self.reset { 0 } else { x };
         }
-        Ok(())
     }
 }
 
