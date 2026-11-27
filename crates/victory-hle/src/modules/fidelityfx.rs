@@ -496,7 +496,11 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         return PARAMETER;
     }
     // SAFETY: as above.
-    unsafe { (host.query)(context, desc) }
+    let code = unsafe { (host.query)(context, desc) };
+    if kind == backend::GET_JITTER_PHASE_COUNT {
+        return backend::answer_phase_count(desc, code);
+    }
+    code
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {

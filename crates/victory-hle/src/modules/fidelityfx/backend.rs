@@ -38,7 +38,7 @@ use super::{
 // ffx_upscale.h: the upscaler's queries and settings.
 const GET_UPSCALE_RATIO: u64 = 0x1_0002;
 const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
-const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
+pub(super) const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
 const GET_JITTER_OFFSET: u64 = 0x1_0005;
 const MEMORY_USAGE: u64 = 0x1_0008;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
@@ -230,7 +230,33 @@ fn ratio(quality: u32) -> Option<f32> {
 /// The jitter sequence's length for a render and an output width.
 fn jitter_phase_count(render_width: u32, display_width: u32) -> i32 {
     let ratio = display_width as f32 / render_width.max(1) as f32;
-    (8.0 * ratio * ratio) as i32
+    ((8.0 * ratio * ratio) as i32).max(1)
+}
+
+/// After the title's own upscaler answered a jitter phase count query
+/// (`code`): a count of 1 or more is left in the title's slot. The shipping
+/// upscaler writes nothing for sizes it has no tables for, or without a
+/// context; the title keeps the answer as its jitter ring's length and takes
+/// the frame index modulo it, a division by zero (seen by Kemerd's fork on a
+/// player's run). Its own answer is kept whenever it gave one.
+pub(super) fn answer_phase_count(desc: *mut Header, code: u32) -> u32 {
+    // SAFETY: a phase count query, by its kind; the title passed it.
+    let q = unsafe { &*desc.cast::<GetJitterPhaseCount>() };
+    // SAFETY: the title's answer slot for this call, if any.
+    let Some(out) = (unsafe { q.count.as_mut() }) else { return code };
+    if code == OK && *out > 0 {
+        return code;
+    }
+    let ours = jitter_phase_count(q.render_width, q.display_width);
+    once!(
+        warn,
+        code,
+        given = *out,
+        ours,
+        "FidelityFX: the title's upscaler gave no jitter phase count; answered with FidelityFX's own formula"
+    );
+    *out = ours;
+    OK
 }
 
 fn halton(mut index: i32, base: i32) -> f32 {
@@ -448,6 +474,34 @@ fn upscale(backend: &dyn Upscaler, flags: u32, d: &DispatchUpscale, list: *const
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A phase count the title's own upscaler left unset (or refused) is
+    /// answered; one it gave is kept.
+    #[test]
+    fn a_missing_phase_count_is_answered() {
+        let mut out = 0i32;
+        let mut q = GetJitterPhaseCount {
+            header: Header { kind: GET_JITTER_PHASE_COUNT, next: std::ptr::null_mut() },
+            render_width: 1920,
+            display_width: 3840,
+            count: &mut out,
+        };
+        let desc = (&raw mut q).cast::<Header>();
+        assert_eq!(answer_phase_count(desc, PARAMETER), OK);
+        assert_eq!(out, 32);
+        out = 0;
+        assert_eq!(answer_phase_count(desc, OK), OK);
+        assert_eq!(out, 32);
+        out = 5;
+        assert_eq!(answer_phase_count(desc, OK), OK);
+        assert_eq!(out, 5);
+        q.render_width = 0;
+        q.display_width = 0;
+        out = 0;
+        let desc = (&raw mut q).cast::<Header>();
+        assert_eq!(answer_phase_count(desc, OK), OK);
+        assert!(out >= 1);
+    }
 
     /// AMD's sequence, which the title jitters its projection with.
     #[test]
