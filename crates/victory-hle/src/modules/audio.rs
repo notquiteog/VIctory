@@ -549,12 +549,20 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can refill either input while the context stays enabled.
+        // The previous tail was flushed and its overlap reset when it ended.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -1175,6 +1183,50 @@ mod tests {
         let block = |n: usize| &ring[n * 0x100..(n + 1) * 0x100];
         assert!([0, 2, 3].iter().all(|&n| block(n).iter().all(|&b| b == 0)));
         assert!(block(1).iter().all(|&b| b == 0x55));
+    }
+
+    #[test]
+    fn ended_voice_stays_ended_until_input_is_republished() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: the allocation holds the two-packet stream.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(1, 2 | 3 << 27);
+        context.set(2, 32 | INPUT_INVALID << 26 | 1 << 31);
+        context.set(6, input_apu);
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: true,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        assert!(!decode(context, &mut voice));
+        assert!(voice.ended);
+        assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+        assert_eq!(voice.trace.frames, 0);
+
+        context.set_field(0, 20, 2, 2);
+        assert!(decode(context, &mut voice));
+        assert!(!voice.ended);
+        assert_eq!(context.field(2, 26, 6), 0);
+        assert_eq!(voice.trace.frames, 1);
+        assert!(!voice.pcm.is_empty());
+        ApuFree(input);
     }
 
     #[test]
