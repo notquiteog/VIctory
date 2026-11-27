@@ -333,6 +333,9 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The instruction being lowered has `glc`: its title memory is read
+    /// and written through a globally coherent view ([`Lower::memory`]).
+    glc: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -2325,6 +2328,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            glc: false,
             src0: None,
             console_lanes,
             split_lds,
@@ -3830,7 +3834,8 @@ impl<'a> Lower<'a> {
             let _ = (guard, store);
             let c = self.cur;
             let slot = self.s.m.i32(slot);
-            let handle = self.s.heap_handle(c, slot, false, false, (11 | 0x1000, 0));
+            let coherent = if self.glc { 0x4000 } else { 0 };
+            let handle = self.s.heap_handle(c, slot, false, false, (11 | 0x1000 | coherent, 0));
             let (base_low, base_high) = (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
             let at = self.s.m.bin(c, Bin::Sub, lo, base_low);
             let in_low = self.s.m.cmp(c, pred::IUGE, lo, base_low);
@@ -3912,8 +3917,13 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         // The builder's threads read what others of the dispatch wrote (a
-        // refit climbs from children to parents): globally coherent.
-        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        // refit climbs from children to parents): globally coherent. So is
+        // a `glc` access anywhere: the console's passes the compute unit's
+        // cache and sees the stores of other groups (the BVH builder's
+        // treelet pass reads with `glc` the boxes its refit has just
+        // written); on the host a view that is not globally coherent need
+        // not show them within the dispatch.
+        let coherent = if self.glc || crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
@@ -6507,6 +6517,12 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.glc = match &inst.fields {
+            Fields::Smem { cache, .. }
+            | Fields::Buffer { cache, .. }
+            | Fields::Flat { cache, .. } => cache.glc,
+            _ => false,
+        };
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
             || name.starts_with("v_mbcnt_");

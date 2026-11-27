@@ -212,3 +212,91 @@ fn a_float_atomic_minimum_by_integers_matches_the_reference_on_the_card() {
 fn a_float_atomic_maximum_by_integers_matches_the_reference_on_the_card() {
     run(true, true);
 }
+
+/// Each thread loads its dword of title memory, stores it plus 1, loads it
+/// again with `glc` and stores what it read to the UAV; `glc` on the first
+/// load too when `first_glc`.
+fn read_back(first_glc: bool) -> Vec<u32> {
+    let glc = if first_glc { 1 << 16 } else { 0 };
+    vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x3428_0083, // v_lshlrev_b32 v20, 3, v0
+        0xE034_1000,
+        0x8002_0114, // buffer_load_dwordx2 v[1:2], v20, s[8:11], 0 offen
+        0xBF8C_0000, // s_waitcnt 0
+        0xDC30_8000 | glc,
+        0x037D_0001, // global_load_dword v3, v[1:2], off (glc)
+        0xBF8C_0000, // s_waitcnt 0
+        0x4A08_0681, // v_add_nc_u32 v4, 1, v3
+        0xDC70_8000,
+        0x007D_0401, // global_store_dword v[1:2], v4, off
+        0xBBFD_0000, // s_waitcnt_vscnt null, 0
+        0xDC31_8000,
+        0x057D_0001, // global_load_dword v5, v[1:2], off glc
+        0xBF8C_0000, // s_waitcnt 0
+        0x342A_0082, // v_lshlrev_b32 v21, 2, v0
+        0xE070_1000,
+        0x8003_0515, // buffer_store_dword v5, v21, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+/// A `glc` access of title memory goes through a globally coherent view
+/// (the console's passes the compute unit's cache and sees other groups'
+/// stores; the BVH builder's treelet pass reads so the boxes its refit has
+/// just written), one without `glc` through a plain one; either way a
+/// program reads back what it stored.
+#[test]
+fn a_glc_access_of_title_memory_is_coherent() {
+    let build = |first_glc| {
+        TEST_MEMORY_UAV.set(Some((2, BASE)));
+        let built = build_compute_shader(&native(&read_back(first_glc)));
+        TEST_MEMORY_UAV.set(None);
+        built.expect("the program lowers").0
+    };
+    let (plain, coherent) = (build(false), build(true));
+    // the annotation of the first load's handle
+    assert_ne!(plain.dxil, coherent.dxil);
+    let data: Vec<u32> = (0..THREADS as u64)
+        .flat_map(|t| {
+            let at = BASE + 4 * t;
+            [at as u32, (at >> 32) as u32]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for shader in [&plain, &coherent] {
+            let (root, pso) =
+                host.compute_pipeline(shader).unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[
+                            View::Buffer { data: &data, stride: Stride::Raw },
+                            View::RawUav(THREADS),
+                            View::RawUav(THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], vec![1; THREADS as usize], "{label}: read back");
+            assert_eq!(out[1], vec![1; THREADS as usize], "{label}: the stores");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
