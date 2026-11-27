@@ -1130,6 +1130,7 @@ fn create() -> windows::core::Result<Host> {
             );
         }
         tracing::info!("host D3D12 device ready");
+        crate::upload::reserve_early();
         Ok(Host {
             device,
             queue,
