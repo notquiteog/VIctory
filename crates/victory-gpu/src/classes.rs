@@ -11,7 +11,12 @@
 //! How a copy becomes G, learned while the title runs:
 //!
 //! - it lives in the card's memory, is a title buffer's copy (not a window),
-//!   not in place, and its title memory is write-watched;
+//!   not in place, and its title memory is write-watched; it has
+//!   [`LEAST_PAGES`] whole pages or more, and only those are closed;
+//! - with the read probe on (`VICTORY_READ_PROBE=1`), the probe armed
+//!   [`PROBED`] of its pages or more and saw no touch of them by the title;
+//! - no copy of the same length near it ([`SIBLINGS`] lengths) was widened
+//!   by the title: rings of read-back buffers are read one after the other;
 //! - shaders were declared to write it at least [`age`] frames ago
 //!   (`VICTORY_PORT_CLASSES_AGE`, frames; 300 by default), and nothing of it
 //!   was sent up since then: the title did not write it.
@@ -21,10 +26,13 @@
 //! the air have landed. The first touch of it by anything (the title reading
 //! or writing, or code of ours) widens the copy for good: its protection
 //! comes back, and its whole span is fetched and landed behind the next
-//! submission, as a range declared and not compared. A touch by the title
-//! waits for that landing (at most [`WAIT_MS`]); a touch by our own code goes
-//! on at once (it may be the code that lands). A copy let go while G gets its
-//! protection back.
+//! submission, as a range declared and not compared (what the flights in the
+//! air write). A touch by the title also waits for the card's copy as it is
+//! now, fetched on a copy queue of our own and merged at once
+//! (`crate::host::land_now`, at most [`WAIT_MS`]); a touch by our own code
+//! goes on at once (it may be the code that lands). Siblings of a copy the
+//! title widened (same length, near) are widened with it. A copy let go
+//! while G gets its protection back.
 //!
 //! shortcut: by copy, not by allocation key, and learned again each run (no
 //! profile is kept). The no-access pages are whole pages: a neighbour's bytes
@@ -38,8 +46,16 @@ use crate::shadow::Shadow;
 
 const PAGE: usize = 4096;
 
-/// The longest a title touch waits for its copy to land.
-const WAIT_MS: u64 = 250;
+/// The longest a title touch waits for its copy to be fetched and merged.
+const WAIT_MS: u32 = 50;
+
+/// With the read probe: the fewest of a copy's pages it armed before the
+/// copy is classed.
+const PROBED: u64 = 8;
+
+/// Copies of one length within this many lengths of a copy the title
+/// widened are siblings: not classed, and widened with it.
+const SIBLINGS: usize = 64;
 
 /// What the switch asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -202,7 +218,7 @@ fn table() -> std::sync::MutexGuard<'static, Option<Table>> {
 }
 
 /// For the frame-rate line.
-static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 mod stat {
     /// Copies classed G.
     pub const CLASSED: usize = 0;
@@ -221,6 +237,29 @@ mod stat {
     pub const REOPENED: usize = 8;
     /// The longest single title wait, ms.
     pub const LONGEST: usize = 9;
+    /// Copies not classed: siblings of one the title read; the probe saw
+    /// the title touch them.
+    pub const SIBLING: usize = 10;
+    pub const PROBE_READ: usize = 11;
+    /// Siblings widened with one the title touched.
+    pub const SIBLINGS_WIDENED: usize = 12;
+}
+
+/// Copies the title widened: start, length.
+static READ_BY_TITLE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Whether `b` is a sibling of `a` (start, length): the same length, near.
+fn sibling(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.1 == b.1 && a.0.abs_diff(b.0) <= SIBLINGS * a.1
+}
+
+/// Whether `page` (an address in it) is in pages a copy closed.
+pub(crate) fn closed_page(page: usize) -> bool {
+    if mode() != Mode::Use {
+        return false;
+    }
+    let table = table();
+    table.as_ref().is_some_and(|t| closed_at(&t.closed, page / PAGE).is_some())
 }
 
 /// The longest title wait of the run, ms, and the title waits of the run.
@@ -243,12 +282,30 @@ pub(crate) fn consider<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>, sent_a
         {
             continue;
         }
-        let (start, len) = copy.span();
-        let (start, len) = (start as usize, len as usize);
+        let span = copy.span();
+        let (start, len) = (span.0 as usize, span.1 as usize);
         let Some(pages) = interior(start, len) else {
             class.state.store(WIDE, Ordering::Release);
             continue;
         };
+        if READ_BY_TITLE.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&b| sibling(b, (start, len))) {
+            class.state.store(WIDE, Ordering::Release);
+            STATS[stat::SIBLING].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if crate::readprobe::on() {
+            match crate::readprobe::seen_ever(span) {
+                // Not looked at enough yet: later.
+                None => continue,
+                Some((armed, _)) if armed < PROBED => continue,
+                Some((_, 0)) => {}
+                Some(_) => {
+                    class.state.store(WIDE, Ordering::Release);
+                    STATS[stat::PROBE_READ].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
         if mode == Mode::Learn {
             // Logged once.
             class.state.store(WIDE, Ordering::Release);
@@ -325,7 +382,10 @@ pub(crate) fn landed(upto: u64) {
                 let shared = table.closed.range(..end).next_back().is_some_and(|(_, &(e, _))| e > first);
                 // (View memory the write guards protect is theirs.)
                 let guarded = crate::watch::guarded(first * PAGE, end * PAGE);
-                if !shared && !guarded && close(entry.pages) {
+                if !shared && !guarded && {
+                    crate::readprobe::disarm(first * PAGE, end * PAGE);
+                    close(entry.pages)
+                } {
                     table.closed.insert(entry.pages.0, (entry.pages.1, id));
                     class.state.store(G, Ordering::Release);
                 } else {
@@ -468,14 +528,21 @@ fn install() -> bool {
         let address = r.ExceptionInformation[1];
         let page = address / PAGE;
         let by_us = ours(r.ExceptionAddress as usize);
-        let class = {
+        let copy = {
             let mut table = table();
             let Some(table) = table.as_mut() else {
                 return EXCEPTION_CONTINUE_SEARCH;
             };
             let Some((first, id)) = closed_at(&table.closed, page) else {
-                // Another thread widened it a moment ago: the touch goes again.
-                return if was_closed(page) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
+                // Another thread widened it a moment ago: the touch goes
+                // again, once what it fetches is merged.
+                if !was_closed(page) {
+                    return EXCEPTION_CONTINUE_SEARCH;
+                }
+                if !by_us {
+                    crate::host::land_wait();
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
             };
             let (end, _) = table.closed.remove(&first).unwrap_or_default();
             open((first, end));
@@ -493,28 +560,42 @@ fn install() -> bool {
             let how = if r.ExceptionInformation[0] == 1 { "write" } else { "read" };
             // (Formatted later: no allocation here beyond the table's.)
             WIDENED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end - start, address, at, by_us, how));
-            class as *const Class as usize
+            if !by_us {
+                let me = (start, end - start);
+                READ_BY_TITLE.lock().unwrap_or_else(|e| e.into_inner()).push(me);
+                // Its siblings go with it: a ring is read one after another.
+                let siblings: Vec<(u64, (usize, usize))> = table
+                    .copies
+                    .iter()
+                    .filter(|&(&other, e)| other != id && sibling(me, (e.span.0, e.span.1 - e.span.0)))
+                    .map(|(&other, e)| (other, e.pages))
+                    .collect();
+                for (other, pages) in siblings {
+                    if table.closed.get(&pages.0).is_some_and(|&(_, i)| i == other) {
+                        table.closed.remove(&pages.0);
+                        open(pages);
+                        remember(pages.0, pages.1);
+                    }
+                    if let Some(e) = table.copies.get(&other) {
+                        // SAFETY: in the table: the copy lives.
+                        let c = unsafe { &*e.class };
+                        if matches!(c.state(), CLOSING | G) {
+                            c.at.store(0, Ordering::Relaxed);
+                            c.state.store(OWED, Ordering::Release);
+                            STATS[stat::SIBLINGS_WIDENED].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            entry.copy.upgrade()
         };
-        if !by_us {
-            // Until its span has landed, or long enough.
+        if !by_us && let Some(copy) = copy {
+            // What the card's copy holds now, merged before the touch goes
+            // on; what flights in the air write lands as owed.
             let began = std::time::Instant::now();
             STATS[stat::WAITS].fetch_add(1, Ordering::Relaxed);
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                // Under the table's lock: a copy gone from it (landed, or
-                // let go) no longer waits.
-                let table = table();
-                let Some(entry) = table.as_ref().and_then(|t| t.copies.values().find(|e| e.class as usize == class)) else {
-                    break;
-                };
-                // SAFETY: in the table: the copy lives.
-                if unsafe { &*entry.class }.state() != OWED {
-                    break;
-                }
-                if began.elapsed().as_millis() as u64 >= WAIT_MS {
-                    STATS[stat::TIMED_OUT].fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
+            if !crate::host::land_now(&copy, WAIT_MS) {
+                STATS[stat::TIMED_OUT].fetch_add(1, Ordering::Relaxed);
             }
             let ms = began.elapsed().as_millis() as u64;
             STATS[stat::WAITED_MS].fetch_add(ms, Ordering::Relaxed);
@@ -562,7 +643,7 @@ pub(crate) fn line(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
     tracing::info!(
         "memory classes (VICTORY_PORT_CLASSES), over {frames:.0} frames: {} classed G, {copies} closed now ({:.1} MB); widened by the title {}, \
-         by us {}; title touches waited {} ({} ms, the longest {} ms, {} timed out; in the run {}, the longest {} ms); refused {};          owed spans landed {}; found open {}",
+         by us {}; title touches waited {} ({} ms, the longest {} ms, {} not landed in time; in the run {}, the longest {} ms); refused {};          owed spans landed {}; found open {}; not classed: siblings {}, read by the title (probe) {}; siblings widened {}",
         s[stat::CLASSED],
         bytes as f64 / 1e6,
         s[stat::TITLE],
@@ -575,7 +656,10 @@ pub(crate) fn line(frames: f64) {
         LONGEST_EVER.load(Ordering::Relaxed),
         s[stat::REFUSED],
         s[stat::LANDED],
-        s[stat::REOPENED]
+        s[stat::REOPENED],
+        s[stat::SIBLING],
+        s[stat::PROBE_READ],
+        s[stat::SIBLINGS_WIDENED]
     );
     let widened = std::mem::take(&mut *WIDENED.lock().unwrap_or_else(|e| e.into_inner()));
     for (start, len, address, at, by_us, how) in widened {
@@ -646,6 +730,17 @@ mod tests {
         assert_eq!(cut(0x100, 0x800, 0x2000, 0x12000)[1].0, 0x800);
         // Above: all of it.
         assert_eq!(cut(0x13000, 0x14000, 0x2000, 0x12000)[1], (0x13000, 0x14000));
+    }
+
+    #[test]
+    fn a_ring_of_read_back_buffers_is_one_family() {
+        // The ring the title read in lx-use2: 0x20000 bytes, 0x20010 apart.
+        let read = (0xd206f3fb0, 0x20000);
+        assert!(sibling(read, (0xd20713fc0, 0x20000)));
+        assert!(sibling(read, (0xd20733fd0, 0x20000)));
+        // Another length, or far away: not.
+        assert!(!sibling(read, (0xd20713fc0, 0x10000)));
+        assert!(!sibling(read, (0xd206f3fb0 + 65 * 0x20000, 0x20000)));
     }
 
     #[test]

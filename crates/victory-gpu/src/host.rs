@@ -4256,6 +4256,85 @@ struct RelayFetch {
     had: crate::land::Had,
 }
 
+/// The fetch [`land_now`] keeps: its own list, queue, fence and buffer.
+struct NowFetch(RelayFetch);
+
+// SAFETY: used under its lock only; the event handle and the objects are
+// free-threaded.
+unsafe impl Send for NowFetch {}
+
+static NOW_FETCH: Mutex<Option<NowFetch>> = Mutex::new(None);
+
+/// Memory classes: until a [`land_now`] under way is done.
+pub(crate) fn land_wait() {
+    drop(NOW_FETCH.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// Memory classes (`crate::classes`): what the card's copy of `shadow` holds
+/// now is fetched on a copy queue of its own and merged into title memory,
+/// at once, for a title thread that touched the copy's closed pages. Not
+/// behind the flights in the air: what they write lands with the next
+/// submission's plan, as owed. Whether it was landed within `wait_ms`.
+pub(crate) fn land_now(shadow: &crate::shadow::Shadow, wait_ms: u32) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    let Some(host) = host() else {
+        return false;
+    };
+    let len = shadow.span().1;
+    let mut now = NOW_FETCH.lock().unwrap_or_else(|e| e.into_inner());
+    if now.is_none() {
+        // Only on a copy queue: the drawing queue would put it behind
+        // every flight.
+        let Some(fetch) = host.make_relay_fetch().filter(|f| f.queue.is_some()) else {
+            return false;
+        };
+        *now = Some(NowFetch(fetch));
+    }
+    let Some(NowFetch(f)) = now.as_mut() else {
+        return false;
+    };
+    if f.buffer.as_ref().is_none_or(|b| b.2 < len) {
+        let size = len.next_multiple_of(16 << 20);
+        f.buffer = host.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+    }
+    let (Some((buffer, data, _)), Some(queue)) = (f.buffer.clone(), f.queue.clone()) else {
+        return false;
+    };
+    let ((allocator, list), fence, event) = (f.list.clone(), f.fence.clone(), f.event);
+    // SAFETY: the list's last run was waited for (below, or by the timed
+    // out call's successor here); live buffers; our own fence and event.
+    let ran = unsafe {
+        (|| -> windows::core::Result<bool> {
+            if fence.GetCompletedValue() < f.sent {
+                fence.SetEventOnCompletion(f.sent, event)?;
+                WaitForSingleObject(event, INFINITE);
+            }
+            allocator.Reset()?;
+            list.Reset(&allocator, None)?;
+            list.CopyBufferRegion(&buffer, 0, &shadow.buffer, 0, len);
+            list.Close()?;
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+            f.sent += 1;
+            queue.Signal(&fence, f.sent)?;
+            fence.SetEventOnCompletion(f.sent, event)?;
+            Ok(WaitForSingleObject(event, wait_ms) == WAIT_OBJECT_0)
+        })()
+    };
+    if !matches!(ran, Ok(true)) {
+        return false;
+    }
+    // SAFETY: the mapping of the fetched bytes, `len` of them; the copy
+    // into it has run, and the next waits for this call (the lock).
+    let gpu = unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+    let mut title = Vec::new();
+    const PIECE: usize = 64 << 10;
+    for at in (0..len as usize).step_by(PIECE) {
+        // (0: whatever was sent up since is the CPU's, and stays.)
+        shadow.card_merge_relay(at, &gpu[at..(at + PIECE).min(len as usize)], 0, &mut title);
+    }
+    true
+}
+
 /// The thread that lands flights ([`relay`]): as soon as the card has run
 /// the first flights of the line it takes them, with what follows them,
 /// and does what they left to do ([`Host::relay_land`]); else it waits for

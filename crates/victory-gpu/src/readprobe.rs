@@ -117,13 +117,16 @@ fn ours() -> (usize, usize) {
 /// `page` (an address in it) of title memory: it is armed, if there is room.
 pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
     use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect};
+    // (Asked before the probe's lock: the classes' handler holds theirs
+    // and asks for this one.)
+    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !crate::classes::closed_page(p)).collect();
     if pages.is_empty() {
         return;
     }
     let mut probe = probe();
     let probe = probe.get_or_insert_with(|| Probe { armed: HashMap::new(), seen: HashMap::new(), ever: HashMap::new(), sites: HashMap::new(), blocks: Default::default() });
     let mut n = 0;
-    for &at in pages {
+    for &at in &pages {
         let page = at / PAGE * PAGE;
         if n == EACH || probe.armed.len() >= MOST {
             STATS[2].fetch_add(1, Ordering::Relaxed);
@@ -162,6 +165,32 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
     STATS[0].fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// What the probe saw of host copy `copy` (start, length) since the run
+/// began: pages armed, touches by the title. `None` before it saw any.
+pub(crate) fn seen_ever(copy: (u64, u64)) -> Option<(u64, u64)> {
+    let probe = probe();
+    let s = probe.as_ref()?.ever.get(&copy)?;
+    Some((s.armed, s.title_reads + s.title_writes))
+}
+
+/// The pages armed in `[from, to)` back as they were, for another hand to
+/// protect them (the memory classes).
+pub(crate) fn disarm(from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    let mut probe = probe();
+    let Some(probe) = probe.as_mut() else {
+        return;
+    };
+    let pages: Vec<usize> = probe.armed.keys().copied().filter(|&p| from <= p && p < to).collect();
+    for page in pages {
+        if let Some(armed) = probe.armed.remove(&page) {
+            let mut was = 0;
+            // SAFETY: a page we armed, back as it was.
+            unsafe { VirtualProtect(page as *const _, PAGE, armed.old, &mut was) };
+        }
+    }
+}
+
 /// The handler: a touch of an armed page gives it its protection back and
 /// goes on, counted.
 fn install() -> bool {
@@ -177,6 +206,8 @@ fn install() -> bool {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let page = r.ExceptionInformation[1] / PAGE * PAGE;
+        // (Before the probe's lock, as in `arm`.)
+        let theirs = crate::classes::closed_page(page);
         let mut probe = probe();
         let Some(probe) = probe.as_mut() else {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -188,7 +219,8 @@ fn install() -> bool {
             if open(page, r.ExceptionInformation[0] == 1) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            if probe.blocks.contains(&(page / BLOCK)) && no_access(page) {
+            // (Not a page the memory classes closed: theirs.)
+            if probe.blocks.contains(&(page / BLOCK)) && no_access(page) && !theirs {
                 let mut was = 0;
                 // SAFETY: title memory the guards left no-access by our arming.
                 unsafe { VirtualProtect(page as *const _, PAGE, PAGE_READWRITE, &mut was) };
