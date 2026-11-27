@@ -1150,6 +1150,22 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A list asks for a structure-builder write or copy-back once per
+    /// whole address: uses 8 GiB apart, or a byte apart, are not one
+    /// (after avatarmanz PR 236).
+    #[test]
+    fn builder_memory_uses_are_told_apart_by_the_whole_address() {
+        use crate::memory::BuilderMemoryUse::{Back, Write};
+        const A: u64 = 0x1_0001_0000;
+        const B: u64 = A + (8 << 30);
+        let mut d = super::Deferred::default();
+        for key in [Write(A), Write(B), Back(A), Back(B), Write(A + 1)] {
+            assert!(d.builder_memory.insert(key), "{key:?} taken for an earlier use");
+        }
+        assert!(!d.builder_memory.insert(Write(A)), "the same write asked twice");
+        assert!(!d.builder_memory.insert(Back(B)), "the same copy-back asked twice");
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -2737,6 +2753,11 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The structure builder's writes and small-buffer copy-backs asked
+    /// for since the reset, by their whole title address (after avatarmanz
+    /// PR 236: as keys of `textures` they kept 33 bits of it, and uses 8 GiB
+    /// apart were taken for one).
+    builder_memory: std::collections::HashSet<crate::memory::BuilderMemoryUse>,
     /// Last GPU source copied into each aliased host texture in this list.
     texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -7518,6 +7539,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.builder_memory.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
                 && deferred.texture_backs.is_empty())
@@ -7979,6 +8001,12 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether this is the first time since the reset that the list asks
+    /// for this builder write or copy-back at this address.
+    pub(crate) fn first_builder_memory_use(&self, key: crate::memory::BuilderMemoryUse) -> bool {
+        self.deferred().builder_memory.insert(key)
     }
 
     /// Whether `key` was asked about ([`HostList::first_use`]) since the
