@@ -13,9 +13,10 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::paths::{self, DISPLAY_NAME, InstallTargets};
 use crate::progress::{self, Progress};
-use crate::runner::{self, Event, VictoryInfo};
+use crate::runner::{self, Event, VictoryInfo, WarmWhat};
 use crate::settings::{
-    self, Channel, Console, FrameGen, Preset, Quality, Settings, Upscaler, help,
+    self, Channel, Console, FrameGen, Preset, Quality, Resolution, Settings, Upscaler, WarmMode,
+    help,
 };
 use crate::update::{self, Feed, Found, Offer, Release, Transfer};
 use crate::{Args, caches, install, win};
@@ -42,6 +43,8 @@ fn logo_picture() -> (image::RgbaImage, bool) {
 /// The commit limit (memory plus page file) below which a warning shows.
 const WANTED_COMMIT: u64 = 62 << 30;
 const TAIL_LINES: usize = 400;
+/// (How "another victory.exe runs" begins, to know the note again.)
+const ALREADY_RUNNING: &str = "is already running";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -75,6 +78,8 @@ impl Tab {
 #[derive(Debug, Clone, Default)]
 struct SysInfo {
     adapter: Option<win::Adapter>,
+    /// Every hardware card, in the system's order.
+    adapters: Vec<win::Adapter>,
     ram: u64,
     commit: u64,
     free_disk: Option<u64>,
@@ -93,27 +98,38 @@ enum Msg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepKind {
     Shaders,
-    Warm,
+    Warm(WarmWhat),
 }
 
 impl StepKind {
     fn title(self) -> &'static str {
         match self {
             StepKind::Shaders => "Preparing shaders",
-            StepKind::Warm => "Warming up pipelines",
+            StepKind::Warm(WarmWhat::Used) => "Compiling the pipelines earlier sessions used",
+            StepKind::Warm(WarmWhat::All) => "Compiling every pipeline the game has created",
         }
     }
 
     fn unit(self) -> &'static str {
         match self {
             StepKind::Shaders => "shaders",
-            StepKind::Warm => "pipelines",
+            StepKind::Warm(_) => "pipelines",
         }
     }
 }
 
+/// Why a step runs: the Shaders page's buttons, or Play's own steps around
+/// a session (`play.ps1`'s warm-ups).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Prepare,
+    BeforePlay,
+    AfterPlay,
+}
+
 struct ActiveStep {
     kind: StepKind,
+    purpose: Purpose,
     step: runner::Step,
     progress: Progress,
     tail: VecDeque<String>,
@@ -199,8 +215,21 @@ struct App {
     cache_scanning: bool,
     game: Option<runner::Game>,
     game_note: Option<(bool, String)>,
-    queue: VecDeque<StepKind>,
+    /// The log of the session that ended badly, and what it said last.
+    crash: Option<(PathBuf, Vec<String>)>,
+    /// `victory.exe` processes this window did not start (another window,
+    /// a script): (process id, name).
+    others: Vec<(u32, String)>,
+    others_looked: Option<Instant>,
+    queue: VecDeque<(StepKind, Purpose)>,
     active: Option<ActiveStep>,
+    /// Cancel was "Skip and play now": the game starts when the step ends.
+    skip_to_play: bool,
+    /// Play was pressed while a warm-up after a session was stopping:
+    /// (with shaders first) once it has.
+    pending_play: Option<bool>,
+    /// The Play button has been given the keyboard focus once.
+    focused: bool,
     /// How the last step (or run of steps) came out: (went well, words).
     step_note: Option<(bool, String)>,
     last_tail: VecDeque<String>,
@@ -261,6 +290,13 @@ pub fn run(args: Args, settings: Settings, notice: Option<String>, targets: Inst
     );
     if let Err(e) = result {
         crate::log(&format!("window: {e}"));
+        win::message_box(
+            &format!("{DISPLAY_NAME} launcher"),
+            &format!(
+                "The launcher's window could not be opened ({e}).\n\nIt draws with OpenGL: update the graphics driver, or start it on the PC itself rather than over Remote Desktop. This is noted in {}.",
+                paths::logs_dir().join("launcher.log").display()
+            ),
+        );
     }
 }
 
@@ -311,8 +347,14 @@ impl App {
             cache_scanning: false,
             game: None,
             game_note: None,
+            crash: None,
+            others: Vec::new(),
+            others_looked: None,
             queue: VecDeque::new(),
             active: None,
+            skip_to_play: false,
+            pending_play: None,
+            focused: false,
             step_note: None,
             last_tail: VecDeque::new(),
             play_after_steps: false,
@@ -387,8 +429,16 @@ impl App {
         let cache = self.settings.cache_path();
         self.spawn(ctx, move || {
             let (ram, commit) = win::memory().unwrap_or_default();
+            let adapters = win::adapters();
             Msg::Sys(SysInfo {
-                adapter: win::best_adapter(),
+                adapter: adapters.iter().cloned().reduce(|best, a| {
+                    if a.vram_bytes > best.vram_bytes {
+                        a
+                    } else {
+                        best
+                    }
+                }),
+                adapters,
                 ram,
                 commit,
                 free_disk: win::free_disk(&cache),
@@ -453,7 +503,60 @@ impl App {
         self.active.is_some() || !self.queue.is_empty()
     }
 
-    fn queue_steps(&mut self, ctx: &egui::Context, steps: &[StepKind]) {
+    /// Only the warm-up after a session runs: Play may stop it and start.
+    fn only_after_play(&self) -> bool {
+        self.queue.is_empty()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|a| a.purpose == Purpose::AfterPlay)
+    }
+
+    /// Looks (every two seconds at most) for `victory.exe` processes that
+    /// this window did not start: a game started from elsewhere.
+    fn look_for_others(&mut self) {
+        if self
+            .others_looked
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.others_looked = Some(Instant::now());
+        let Some(victory) = self.victory_info() else {
+            self.others.clear();
+            return;
+        };
+        let name = victory
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| paths::VICTORY_EXE.to_owned());
+        // (While a step or the game of this window runs, the processes it
+        // starts are its own; it is looked again before the next start.)
+        if self.game.is_some() || self.active.is_some() {
+            self.others.clear();
+            return;
+        }
+        self.others = win::processes_named(&[&name, runner::SMOOTH_MOTION_EXE]);
+        if self.others.is_empty() {
+            // What was said of them is over.
+            for n in [&mut self.game_note, &mut self.step_note] {
+                if n.as_ref().is_some_and(|(_, t)| t.contains(ALREADY_RUNNING)) {
+                    *n = None;
+                }
+            }
+        }
+    }
+
+    /// Why nothing that starts `victory.exe` may start now, if so.
+    fn others_running(&self) -> Option<String> {
+        let (pid, name) = self.others.first()?;
+        Some(format!(
+            "{name} {ALREADY_RUNNING} (process {pid}), started from somewhere else: the game, or a step of it, from another window or a script. Close it first; two at once do not work."
+        ))
+    }
+
+    fn queue_steps(&mut self, ctx: &egui::Context, steps: &[(StepKind, Purpose)]) {
         if self.busy() {
             return;
         }
@@ -462,8 +565,18 @@ impl App {
         self.start_next_step(ctx);
     }
 
+    /// The file a warm-up of `what` works from: without it there is
+    /// nothing to make yet.
+    fn warm_book(&self, what: WarmWhat) -> PathBuf {
+        let dir = self.settings.cache_path().join(caches::PIPELINES_DIR);
+        match what {
+            WarmWhat::Used => dir.join("early-pipelines.txt"),
+            WarmWhat::All => dir.join("known-pipelines.bin"),
+        }
+    }
+
     fn start_next_step(&mut self, ctx: &egui::Context) {
-        while let Some(kind) = self.queue.pop_front() {
+        while let Some((kind, purpose)) = self.queue.pop_front() {
             let Some(victory) = self.victory_info().cloned() else {
                 self.fail_steps(
                     "victory.exe is not available, so nothing can be prepared.".to_owned(),
@@ -474,20 +587,24 @@ impl App {
                 self.fail_steps(problem);
                 return;
             }
-            if kind == StepKind::Warm {
-                let book = self
-                    .settings
-                    .cache_path()
-                    .join(caches::PIPELINES_DIR)
-                    .join("early-pipelines.txt");
-                if std::fs::metadata(&book).map_or(0, |m| m.len()) == 0 {
+            self.others_looked = None;
+            self.look_for_others();
+            if let Some(why) = self.others_running() {
+                self.fail_steps(why);
+                return;
+            }
+            if let StepKind::Warm(what) = kind
+                && std::fs::metadata(self.warm_book(what)).map_or(0, |m| m.len()) == 0
+            {
+                // (Around a session that is no news: the first one has nothing yet.)
+                if purpose == Purpose::Prepare {
                     self.step_note = Some((
                         true,
-                        "Nothing to warm up yet: the game notes which pipelines it draws with while you play. Play once, then warm up."
+                        "Nothing to compile yet: the game notes which pipelines it makes while you play. Play once, then come back."
                             .to_owned(),
                     ));
-                    continue;
                 }
+                continue;
             }
             let home = paths::home();
             let (spec, name) = match kind {
@@ -500,8 +617,14 @@ impl App {
                     ),
                     "shaders",
                 ),
-                StepKind::Warm => (
-                    runner::warm_spec(&self.settings, &victory.path, &home, victory.progress_flag),
+                StepKind::Warm(what) => (
+                    runner::warm_spec(
+                        &self.settings,
+                        &victory.path,
+                        &home,
+                        what,
+                        victory.progress_flag,
+                    ),
                     "warm",
                 ),
             };
@@ -516,6 +639,7 @@ impl App {
                     self.last_tail.clear();
                     self.active = Some(ActiveStep {
                         kind,
+                        purpose,
                         step,
                         progress: Progress::default(),
                         tail: VecDeque::new(),
@@ -532,7 +656,7 @@ impl App {
         }
         self.scan_cache(ctx);
         if std::mem::take(&mut self.play_after_steps) {
-            self.start_game();
+            self.start_game(ctx);
         }
     }
 
@@ -570,8 +694,15 @@ impl App {
         let took = progress::clock(active.step.started.elapsed());
         self.last_tail = active.tail;
         if active.step.was_cancelled() {
-            self.fail_steps(format!("{} was cancelled after {took}. What was done so far is kept; it goes on from there next time.", active.kind.title()));
+            let play = std::mem::take(&mut self.skip_to_play);
+            self.fail_steps(format!(
+                "{} was stopped after {took}. What was done so far is kept; it goes on from there next time.",
+                active.kind.title()
+            ));
             self.scan_cache(ctx);
+            if play {
+                self.start_game(ctx);
+            }
             return;
         }
         if code != Some(0) {
@@ -583,13 +714,17 @@ impl App {
             } else {
                 format!(" It said: {}", active.last_line)
             };
+            let play = self.play_after_steps && active.purpose == Purpose::BeforePlay;
             self.fail_steps(format!(
-                "{} did not finish (exit code {}).{said} The command was: {}.{log}",
+                "{} did not finish ({}).{said}{log}",
                 active.kind.title(),
-                code.map_or("none".to_owned(), |c| c.to_string()),
-                active.step.command_line
+                runner::exit_words(code),
             ));
             self.scan_cache(ctx);
+            // (Compiling ahead is a help, not a condition: the game starts anyway.)
+            if play {
+                self.start_game(ctx);
+            }
             return;
         }
         if let Some(build) = self.victory_info().map(|v| v.build.clone()) {
@@ -600,7 +735,7 @@ impl App {
                     p.shaders_when = now_secs();
                     p.possibly_stale = false;
                 }
-                StepKind::Warm => {
+                StepKind::Warm(_) => {
                     p.pipelines_build = build;
                     p.pipelines_when = now_secs();
                 }
@@ -618,10 +753,52 @@ impl App {
         self.start_next_step(ctx);
     }
 
-    fn start_game(&mut self) {
+    /// Play, as `scripts/play.ps1` runs a session: the pipelines compiled
+    /// ahead (by the setting), then the game; what is compiled after it is
+    /// queued when it ends.
+    fn play(&mut self, ctx: &egui::Context, shaders_first: bool) {
         if self.game.is_some() {
             return;
         }
+        if self.only_after_play()
+            && let Some(active) = &self.active
+        {
+            // The warm-up after the last session gives way (it goes on next time).
+            active.step.cancel();
+            self.skip_to_play = false;
+            return self.play_when_idle(shaders_first);
+        }
+        if self.busy() {
+            return;
+        }
+        let mut steps = Vec::new();
+        if shaders_first {
+            steps.push((StepKind::Shaders, Purpose::BeforePlay));
+        }
+        if let (Some(what), _) = runner::warm_around(self.settings.warm) {
+            steps.push((StepKind::Warm(what), Purpose::BeforePlay));
+        }
+        if steps.is_empty() {
+            return self.start_game(ctx);
+        }
+        self.queue_steps(ctx, &steps);
+        self.play_after_steps = self.busy();
+        if !self.busy() && self.step_note.as_ref().is_none_or(|(ok, _)| *ok) {
+            self.start_game(ctx);
+        }
+    }
+
+    /// (Play pressed while the after-session warm-up ends: once it has.)
+    fn play_when_idle(&mut self, shaders_first: bool) {
+        self.pending_play = Some(shaders_first);
+    }
+
+    fn start_game(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
+        if self.game.is_some() {
+            return;
+        }
+        self.crash = None;
         if let Some(problem) = settings::game_folder_problem(&self.settings.game_dir) {
             self.game_note = Some((false, problem));
             return;
@@ -633,11 +810,23 @@ impl App {
             ));
             return;
         };
+        self.others_looked = None;
+        self.look_for_others();
+        if let Some(why) = self.others_running() {
+            self.game_note = Some((false, why));
+            return;
+        }
         for dir in [self.settings.cache_path(), self.settings.data_path()] {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 self.game_note = Some((false, format!("Could not create {}: {e}", dir.display())));
                 return;
             }
+        }
+        if self.settings.smooth_motion
+            && let Err(e) = runner::refresh_smooth_motion_copy(&victory.path)
+        {
+            self.game_note = Some((false, e));
+            return;
         }
         let spec = runner::play_spec(&self.settings, &victory.path, &paths::home());
         match runner::start_game(&spec, &paths::logs_dir()) {
@@ -646,6 +835,22 @@ impl App {
                 self.game = Some(game);
             }
             Err(e) => self.game_note = Some((false, e)),
+        }
+    }
+
+    /// The game has ended: say how, and compile the rest for next time.
+    fn game_ended(&mut self, ctx: &egui::Context, ended: runner::Ended) {
+        let Some(game) = self.game.take() else {
+            return;
+        };
+        if !ended.ok {
+            self.crash = Some((game.log.clone(), runner::log_tail(&game.log, 12)));
+            crate::log(&format!("game: {}", ended.text));
+        }
+        self.game_note = Some((ended.ok, ended.text));
+        self.scan_cache(ctx);
+        if let (_, Some(what)) = runner::warm_around(self.settings.warm) {
+            self.queue_steps(ctx, &[(StepKind::Warm(what), Purpose::AfterPlay)]);
         }
     }
 
@@ -691,10 +896,19 @@ impl App {
         if !self.auto_done && self.victory.is_some() {
             self.auto_done = true;
             match self.args.auto.as_deref() {
-                Some("prepare") => self.queue_steps(ctx, &[StepKind::Shaders, StepKind::Warm]),
-                Some("shaders") => self.queue_steps(ctx, &[StepKind::Shaders]),
+                Some("prepare") => self.queue_steps(
+                    ctx,
+                    &[
+                        (StepKind::Shaders, Purpose::Prepare),
+                        (StepKind::Warm(WarmWhat::Used), Purpose::Prepare),
+                    ],
+                ),
+                Some("shaders") => self.queue_steps(ctx, &[(StepKind::Shaders, Purpose::Prepare)]),
+                Some("warm-all") => {
+                    self.queue_steps(ctx, &[(StepKind::Warm(WarmWhat::All), Purpose::Prepare)])
+                }
                 Some("check-update" | "update") => self.check_update(ctx),
-                Some("play") => self.start_game(),
+                Some("play") => self.play(ctx, false),
                 _ => {}
             }
         }
@@ -837,13 +1051,27 @@ fn choice<T: Copy + PartialEq>(
     label: impl Fn(T) -> &'static str,
 ) {
     egui::ComboBox::from_id_salt(id)
-        .width(300.0)
+        .width(COMBO_WIDTH)
         .selected_text(label(*value))
         .show_ui(ui, |ui| {
             for &option in all {
                 ui.selectable_value(value, option, label(option));
             }
         });
+}
+
+/// The width of the drop-down lists.
+const COMBO_WIDTH: f32 = 430.0;
+
+/// `Half the picture: 540p (recommended)`, `720p`.
+fn resolution_label(r: Resolution, console: Console) -> String {
+    match r {
+        Resolution::Half => format!(
+            "Half the picture: {}p (recommended)",
+            console.output_height() / 2
+        ),
+        other => other.label().to_owned(),
+    }
 }
 
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
@@ -952,10 +1180,145 @@ impl App {
         }
     }
 
+    /// The running step: its bar, its numbers and its buttons; with
+    /// `output`, the lines it printed below. Returns (Cancel, Skip and play
+    /// now) as pressed.
+    fn step_view(&self, ui: &mut egui::Ui, output: bool) -> (bool, bool) {
+        let Some(active) = &self.active else {
+            return (false, false);
+        };
+        let (mut cancel, mut skip) = (false, false);
+        let p = &active.progress;
+        let elapsed = active.step.started.elapsed();
+        let after = match self.queue.len() {
+            0 => String::new(),
+            1 => " (then one more step)".to_owned(),
+            n => format!(" (then {n} more steps)"),
+        };
+        let why = match active.purpose {
+            Purpose::Prepare => "",
+            Purpose::BeforePlay => " before the game starts",
+            Purpose::AfterPlay => " for next time",
+        };
+        ui.label(RichText::new(format!("{}{why}{after}", active.kind.title())).strong());
+        match p.fraction() {
+            Some(fraction) => {
+                let total = p.total.unwrap_or(0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(format!(
+                            "{} of {} {}  ({:.0}%)",
+                            progress::grouped(p.done),
+                            progress::grouped(total),
+                            active.kind.unit(),
+                            fraction * 100.0
+                        ))
+                        .desired_height(22.0),
+                );
+            }
+            None => {
+                // No total is known: a moving bar and the count.
+                let sweep = (elapsed.as_secs_f32() * 0.35).fract();
+                let text = if p.done > 0 {
+                    format!(
+                        "{} {} so far",
+                        progress::grouped(p.done),
+                        active.kind.unit()
+                    )
+                } else {
+                    "Starting...".to_owned()
+                };
+                ui.add(
+                    egui::ProgressBar::new(sweep)
+                        .text(text)
+                        .animate(true)
+                        .desired_height(22.0),
+                );
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            let mut parts = vec![format!("Elapsed {}", progress::clock(elapsed))];
+            if let Some(rate) = p.rate() {
+                parts.push(format!(
+                    "{} {} a second",
+                    progress::grouped(rate.round() as u64),
+                    active.kind.unit()
+                ));
+            }
+            match p.eta() {
+                Some(eta) if !p.finished => {
+                    parts.push(format!("about {} left", progress::clock(eta)))
+                }
+                None if p.total.is_some_and(|t| t > p.done) => {
+                    parts.push("estimating the time left...".to_owned())
+                }
+                _ => {}
+            }
+            ui.label(parts.join("   |   "));
+        });
+        ui.horizontal(|ui| {
+            let stop = match active.purpose {
+                Purpose::AfterPlay => "Stop (it goes on next time)",
+                _ => "Cancel",
+            };
+            cancel = ui
+                .button(stop)
+                .on_hover_text("What is done so far is kept; it goes on from there next time.")
+                .clicked();
+            if active.purpose == Purpose::BeforePlay && self.play_after_steps {
+                skip = ui
+                    .button("Skip and play now")
+                    .on_hover_text("The game starts at once; what is not compiled yet is compiled while it runs (it may stutter).")
+                    .clicked();
+            }
+            ui.label(
+                RichText::new("Runs at low priority, so the PC stays usable.")
+                    .weak()
+                    .small(),
+            );
+        });
+        if output {
+            if p.total.is_none() && !active.last_line.is_empty() {
+                ui.label(RichText::new(&active.last_line).monospace().small());
+            }
+            let height = (ui.available_height() - 16.0).clamp(80.0, 260.0);
+            tail_view(ui, "tail", &active.tail, height);
+        }
+        (cancel, skip)
+    }
+
+    /// Acts on what [`Self::step_view`] returned.
+    fn step_buttons(&mut self, (cancel, skip): (bool, bool)) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        if skip {
+            self.skip_to_play = true;
+            active.step.cancel();
+        } else if cancel {
+            self.play_after_steps = false;
+            active.step.cancel();
+        }
+    }
+
+    /// Opens a file or folder in Explorer; a failure is said on the Play page.
+    fn open(&mut self, target: &Path) {
+        if let Some(dir) = target.parent().filter(|_| !target.exists()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if target == paths::logs_dir() {
+            let _ = std::fs::create_dir_all(target);
+        }
+        if let Err(e) = win::open_in_shell(target) {
+            self.game_note = Some((false, e));
+        }
+    }
+
     fn page_play(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let game_problem = settings::game_folder_problem(&self.settings.game_dir);
         let fresh = self.shader_freshness();
+        let others = self.others_running();
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             self.logo_tile(ui, 120.0);
@@ -963,40 +1326,130 @@ impl App {
             ui.vertical(|ui| {
                 ui.add_space(8.0);
                 let running = self.game.is_some();
-                let can_play = game_problem.is_none() && self.victory_info().is_some() && !running && !self.busy();
-                let label = if running { "Running" } else { "Play" };
-                let mut button = egui::Button::new(RichText::new(label).size(34.0).strong().color(Color32::WHITE));
+                let starting = self.busy() && !self.only_after_play();
+                let can_play = game_problem.is_none()
+                    && self.victory_info().is_some()
+                    && others.is_none()
+                    && !running
+                    && !starting
+                    && self.pending_play.is_none();
+                let label = if running {
+                    "Running"
+                } else if starting && self.play_after_steps {
+                    "Starting..."
+                } else {
+                    "Play"
+                };
+                let mut button = egui::Button::new(
+                    RichText::new(label)
+                        .size(34.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
                 if can_play {
                     button = button.fill(Color32::from_rgb(28, 132, 72));
                 }
-                if ui.add_enabled_ui(can_play, |ui| ui.add_sized([260.0, 76.0], button)).inner.clicked() {
+                let response = ui
+                    .add_enabled_ui(can_play, |ui| ui.add_sized([260.0, 76.0], button))
+                    .inner;
+                if can_play && !self.focused {
+                    // (Enter or Space plays: the button has the keyboard focus.)
+                    self.focused = true;
+                    response.request_focus();
+                }
+                if response.clicked() {
                     if matches!(fresh, Freshness::Ready | Freshness::Unknown) {
-                        self.start_game();
+                        self.play(&ctx, false);
                     } else {
                         self.confirm = Some(Confirm::PrepareBeforePlay);
                     }
                 }
                 ui.add_space(4.0);
                 if let Some(game) = &self.game {
-                    ui.label(format!("The game is running (process {}, started {} ago). Close it from its own window.", game.pid, progress::clock(game.started.elapsed())));
-                } else if self.busy() {
-                    ui.label("Shaders are being prepared; Play is available when that is done (see the Shaders tab).");
+                    ui.label(format!(
+                        "The game is running (started {} ago). Close it from its own window.",
+                        progress::clock(game.started.elapsed())
+                    ));
+                } else if starting {
+                    ui.label("Getting ready; the game starts by itself when this is done.");
                 } else {
-                    ui.label(format!("{}, {} settings", self.settings.console.label(), self.settings.preset.label()));
+                    ui.label(settings::describe(&self.settings));
+                    hint(
+                        ui,
+                        &format!(
+                            "{} settings. Change them on the Settings tab.",
+                            self.settings.preset.label()
+                        ),
+                    );
                 }
             });
         });
-        ui.add_space(12.0);
+        ui.add_space(10.0);
+        if self.active.is_some()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|a| a.purpose != Purpose::Prepare)
+        {
+            let pressed = egui::Frame::group(ui.style())
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.step_view(ui, false)
+                })
+                .inner;
+            self.step_buttons(pressed);
+            ui.add_space(6.0);
+        } else if self.busy() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Shaders are being prepared (Shaders tab); Play is available when that is done.");
+            });
+        }
         if let Some(n) = &self.game_note {
             note(ui, n);
-            ui.add_space(6.0);
         }
+        if self.game.is_none()
+            && let Some((ok, text)) = &self.step_note
+            && !ok
+            && self.active.is_none()
+        {
+            warn_text(ui, text);
+        }
+        let mut open = None;
+        if let Some((log, tail)) = &self.crash {
+            if !tail.is_empty() {
+                let lines: VecDeque<String> = tail.iter().cloned().collect();
+                tail_view(ui, "crash-tail", &lines, 150.0);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Open this log").clicked() {
+                    open = Some(log.clone());
+                }
+                if ui.button("Open the logs folder").clicked() {
+                    open = Some(paths::logs_dir());
+                }
+                hint(
+                    ui,
+                    "Try the Safe preset (Settings) if it happens again, and keep the log for a report.",
+                );
+            });
+        }
+        if let Some(target) = open {
+            self.open(&target);
+        }
+        if let Some(why) = &others {
+            let said = |n: &Option<(bool, String)>| n.as_ref().is_some_and(|(_, t)| t == why);
+            if !said(&self.game_note) && !said(&self.step_note) {
+                warn_text(ui, why);
+            }
+        }
+        ui.add_space(6.0);
         section(ui, "Ready to play?", |ui| {
             match &game_problem {
                 None => check_line(
                     ui,
                     true,
-                    &format!("Game folder: {}", self.settings.game_dir.trim()),
+                    &format!("Game folder: {}", settings::folder(&self.settings.game_dir)),
                 ),
                 Some(problem) => {
                     check_line(ui, false, problem);
@@ -1007,7 +1460,7 @@ impl App {
             }
             match &self.victory {
                 None => check_line(ui, false, "Looking at victory.exe..."),
-                Some(Ok(v)) => check_line(ui, true, &format!("Program: {}", v.build)),
+                Some(Ok(v)) => check_line(ui, true, &format!("Program: {}", v.version)),
                 Some(Err(e)) => check_line(ui, false, e),
             }
             let (ok, text) = match &fresh {
@@ -1026,8 +1479,24 @@ impl App {
                 && ui.button("Prepare shaders now").clicked()
             {
                 self.tab = Tab::Shaders;
-                self.queue_steps(&ctx, &[StepKind::Shaders, StepKind::Warm]);
+                self.queue_steps(
+                    &ctx,
+                    &[
+                        (StepKind::Shaders, Purpose::Prepare),
+                        (StepKind::Warm(WarmWhat::Used), Purpose::Prepare),
+                    ],
+                );
             }
+            let warm = match self.settings.warm {
+                WarmMode::Used => {
+                    "Pipelines: those earlier sessions used are compiled before each start, the rest after the game closes."
+                }
+                WarmMode::All => {
+                    "Pipelines: every one the game has created is compiled before each start."
+                }
+                WarmMode::Off => "Pipelines: not compiled ahead (Settings); the game may stutter.",
+            };
+            check_line(ui, self.settings.warm != WarmMode::Off, warm);
             if let Some(sys) = &self.sys
                 && sys.commit > 0
                 && sys.commit < WANTED_COMMIT
@@ -1043,13 +1512,10 @@ impl App {
             }
         });
         ui.add_space(8.0);
+        let mut open = None;
         ui.horizontal(|ui| {
-            if ui.button("Open log folder").clicked() {
-                let logs = paths::logs_dir();
-                let _ = std::fs::create_dir_all(&logs);
-                if let Err(e) = win::open_in_shell(&logs) {
-                    self.game_note = Some((false, e));
-                }
+            if self.crash.is_none() && ui.button("Open the logs folder").clicked() {
+                open = Some(paths::logs_dir());
             }
             if let Some(game) = &self.game {
                 ui.label(
@@ -1059,11 +1525,20 @@ impl App {
                 );
             }
         });
+        if let Some(target) = open {
+            self.open(&target);
+        }
     }
 
     fn page_setup(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.heading("Setup");
+        if !self.settings.setup_done {
+            ui.label(format!(
+                "Welcome to {DISPLAY_NAME}. Choose the folder of your own copy of the game below and press Done; everything else can stay as it is."
+            ));
+        }
+        let mut done = false;
         section(ui, "1. Your copy of the game", |ui| {
             hint(ui, help::GAME_DIR);
             folder_row(
@@ -1078,9 +1553,29 @@ impl App {
                     true,
                     "This folder has the game's program and its shader archive.",
                 ),
-                Some(problem) => check_line(ui, false, &problem),
+                Some(problem) => {
+                    check_line(ui, false, &problem);
+                    let typed = settings::folder(&self.settings.game_dir);
+                    if problem.contains("It seems to be in")
+                        && let Some(found) = settings::game_folder_below(Path::new(typed))
+                        && ui.button(format!("Use {}", found.display())).clicked()
+                    {
+                        self.settings.game_dir = found.display().to_string();
+                    }
+                }
             }
         });
+        if !self.settings.setup_done
+            && settings::game_folder_problem(&self.settings.game_dir).is_none()
+        {
+            ui.add_space(4.0);
+            done |= ui
+                .add_sized(
+                    [200.0, 34.0],
+                    egui::Button::new(RichText::new("Done, on to Play").size(17.0).strong()),
+                )
+                .clicked();
+        }
         section(ui, "2. This PC", |ui| {
             match &self.sys {
                 None => {
@@ -1200,16 +1695,16 @@ impl App {
         });
         ui.add_space(8.0);
         let ready = settings::game_folder_problem(&self.settings.game_dir).is_none();
-        if ui
+        done |= ui
             .add_enabled_ui(ready, |ui| {
                 ui.add_sized(
-                    [140.0, 36.0],
-                    egui::Button::new(RichText::new("Done").size(18.0)),
+                    [200.0, 34.0],
+                    egui::Button::new(RichText::new("Done, on to Play").size(17.0)),
                 )
             })
             .inner
-            .clicked()
-        {
+            .clicked();
+        if done {
             self.settings.setup_done = true;
             self.tab = Tab::Play;
             self.scan_cache(&ctx);
@@ -1221,10 +1716,21 @@ impl App {
         hint(
             ui,
             &format!(
-                "Saved as you change them, in {}",
+                "Saved as you change them, in {}. They apply from the next start of the game.",
                 paths::settings_file().display()
             ),
         );
+        let adapters = self
+            .sys
+            .as_ref()
+            .map(|s| s.adapters.clone())
+            .unwrap_or_default();
+        let nvidia = self
+            .sys
+            .as_ref()
+            .and_then(|s| s.adapter.as_ref())
+            .is_some_and(|a| a.vendor_id == 0x10DE);
+        let defaults = Settings::default();
         let s = &mut self.settings;
         section(ui, "Game", |ui| {
             ui.label("Game folder");
@@ -1239,10 +1745,6 @@ impl App {
                 warn_text(ui, &problem);
             }
             ui.add_space(4.0);
-            ui.label("Console");
-            hint(ui, help::CONSOLE);
-            choice(ui, "console", &mut s.console, Console::ALL, Console::label);
-            ui.add_space(4.0);
             ui.label("Preset");
             hint(ui, help::PRESET);
             ui.horizontal(|ui| {
@@ -1251,7 +1753,46 @@ impl App {
                 }
             });
         });
-        section(ui, "Picture", |ui| {
+        section(ui, "Picture and speed", |ui| {
+            ui.label("Console");
+            hint(ui, help::CONSOLE);
+            choice(ui, "console", &mut s.console, Console::ALL, Console::label);
+            ui.add_space(4.0);
+            ui.label("World drawn at");
+            hint(ui, help::RESOLUTION);
+            let console = s.console;
+            let fitting: Vec<Resolution> = Resolution::ALL
+                .iter()
+                .copied()
+                .filter(|r| r.fits(console))
+                .collect();
+            egui::ComboBox::from_id_salt("resolution")
+                .width(COMBO_WIDTH)
+                .selected_text(resolution_label(s.resolution, console))
+                .show_ui(ui, |ui| {
+                    for option in fitting {
+                        ui.selectable_value(
+                            &mut s.resolution,
+                            option,
+                            resolution_label(option, console),
+                        );
+                    }
+                });
+            if !s.resolution.fits(console) {
+                warn_text(
+                    ui,
+                    &format!(
+                        "{} cannot be drawn at {} here, so half the picture ({}p) is used.",
+                        console.short(),
+                        s.resolution.label(),
+                        s.resolution.drawn_height(console)
+                    ),
+                );
+            }
+            ui.add_space(4.0);
+            ui.checkbox(&mut s.ray_tracing, "Ray tracing");
+            hint(ui, help::RAY_TRACING);
+            ui.add_space(4.0);
             ui.label("Ambient light");
             hint(ui, help::AMBIENT);
             ui.add_enabled(
@@ -1264,11 +1805,60 @@ impl App {
                     "With the Custom preset, set VICTORY_AMBIENT under Advanced instead.",
                 );
             }
+            if adapters.len() > 1 || !s.adapter.trim().is_empty() {
+                ui.add_space(4.0);
+                ui.label("Graphics card");
+                hint(ui, help::ADAPTER);
+                let shown = if s.adapter.trim().is_empty() {
+                    "The system's first".to_owned()
+                } else {
+                    s.adapter.clone()
+                };
+                egui::ComboBox::from_id_salt("adapter")
+                    .width(COMBO_WIDTH)
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.adapter, String::new(), "The system's first");
+                        for a in &adapters {
+                            ui.selectable_value(&mut s.adapter, a.name.clone(), &a.name);
+                        }
+                    });
+            }
+            if nvidia || s.smooth_motion {
+                ui.add_space(4.0);
+                ui.checkbox(&mut s.smooth_motion, "NVIDIA Smooth Motion");
+                hint(ui, help::SMOOTH_MOTION);
+            }
+            ui.add_space(4.0);
+            let changed = s.console != defaults.console
+                || s.resolution != defaults.resolution
+                || s.ray_tracing != defaults.ray_tracing
+                || (s.ambient - defaults.ambient).abs() > 0.001
+                || s.preset != defaults.preset;
+            if ui
+                .add_enabled(
+                    changed,
+                    egui::Button::new("Back to the recommended settings"),
+                )
+                .clicked()
+            {
+                s.console = defaults.console;
+                s.resolution = defaults.resolution;
+                s.ray_tracing = defaults.ray_tracing;
+                s.ambient = defaults.ambient;
+                s.preset = defaults.preset;
+            }
+        });
+        section(ui, "Compiling pipelines ahead", |ui| {
+            hint(ui, help::WARM);
+            for &mode in WarmMode::ALL {
+                ui.radio_value(&mut s.warm, mode, mode.label());
+            }
         });
         section(ui, "Upscaling (experimental)", |ui| {
             hint(
                 ui,
-                "Still being built: a version of the program that does not know these switches ignores them.",
+                "Still being built. With a vendor's upscaler the quality mode sets the size the world is drawn at, instead of the choice above.",
             );
             ui.label("Upscaler");
             hint(ui, help::UPSCALER);
@@ -1307,7 +1897,7 @@ impl App {
                     "Choose the folder with NVIDIA's DLSS files",
                     None,
                 );
-                if s.dlss_dir.trim().is_empty() {
+                if settings::folder(&s.dlss_dir).is_empty() {
                     warn_text(
                         ui,
                         "DLSS needs this folder; without it the game's own upscaler runs.",
@@ -1323,22 +1913,6 @@ impl App {
                     &mut s.fidelityfx_dir,
                     "Choose the folder with AMD's FidelityFX files",
                     None,
-                );
-            }
-            ui.add_space(4.0);
-            let mut fixed = s.render_scale > 0.0;
-            if ui
-                .checkbox(&mut fixed, "Set the render scale myself")
-                .changed()
-            {
-                s.render_scale = if fixed { 0.67 } else { 0.0 };
-            }
-            hint(ui, help::RENDER_SCALE);
-            if fixed {
-                ui.add(
-                    egui::Slider::new(&mut s.render_scale, 0.2..=1.0)
-                        .step_by(0.01)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                 );
             }
         });
@@ -1357,7 +1931,15 @@ impl App {
             }
             ui.collapsing("What the game is started with", |ui| {
                 for (name, value) in settings::build_env(s) {
-                    ui.label(RichText::new(format!("{name}={value}")).monospace().small());
+                    let mut line = format!("{name}={value}");
+                    if line.chars().count() > 140 {
+                        line = format!(
+                            "{}... ({} characters)",
+                            line.chars().take(120).collect::<String>(),
+                            line.len()
+                        );
+                    }
+                    ui.label(RichText::new(line).monospace().small());
                 }
             });
         });
@@ -1407,7 +1989,7 @@ impl App {
                     ui.label(RichText::new("Pipelines").strong());
                     match &self.cache {
                         Some(c) => ui.label(format!(
-                            "{} on disk; {} used in play, {} warmed up{}",
+                            "{} on disk; {} used in play, {} compiled{}",
                             progress::bytes(c.pipeline_bytes),
                             progress::grouped(c.used),
                             progress::grouped(c.warmed),
@@ -1422,15 +2004,16 @@ impl App {
                     ui.label(
                         match freshness(&p.pipelines_build, p.possibly_stale, current.as_deref()) {
                             Freshness::Unknown => "".to_owned(),
-                            Freshness::Never => "not warmed up by this launcher yet".to_owned(),
+                            Freshness::Never => "not compiled by this launcher yet".to_owned(),
                             Freshness::OtherBuild(old) => {
-                                format!("warmed up for another version: {old}")
+                                format!("compiled for another version: {old}")
                             }
                             Freshness::AfterUpdate => {
-                                "warmed up before the last update: warm up again".to_owned()
+                                "compiled before the last update: they are compiled again"
+                                    .to_owned()
                             }
                             Freshness::Ready => {
-                                format!("warmed up for this version, {}", ago(p.pipelines_when))
+                                format!("compiled for this version, {}", ago(p.pipelines_when))
                             }
                         },
                     );
@@ -1440,9 +2023,12 @@ impl App {
         });
         ui.add_space(8.0);
         let idle = !self.busy() && self.game.is_none();
+        let others = self.others_running();
         let can_run = idle
+            && others.is_none()
             && self.victory_info().is_some()
             && settings::game_folder_problem(&self.settings.game_dir).is_none();
+        let mut queue: Option<Vec<(StepKind, Purpose)>> = None;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
@@ -1450,31 +2036,44 @@ impl App {
                     egui::Button::new(RichText::new("Prepare everything").strong())
                         .min_size(egui::vec2(160.0, 30.0)),
                 )
+                .on_hover_text("Translates the shaders, then compiles the pipelines earlier sessions used.")
                 .clicked()
             {
-                self.queue_steps(&ctx, &[StepKind::Shaders, StepKind::Warm]);
+                queue = Some(vec![
+                    (StepKind::Shaders, Purpose::Prepare),
+                    (StepKind::Warm(WarmWhat::Used), Purpose::Prepare),
+                ]);
             }
             if ui
                 .add_enabled(can_run, egui::Button::new("Prepare shaders"))
                 .clicked()
             {
-                self.queue_steps(&ctx, &[StepKind::Shaders]);
+                queue = Some(vec![(StepKind::Shaders, Purpose::Prepare)]);
             }
             if ui
-                .add_enabled(can_run, egui::Button::new("Warm up pipelines"))
+                .add_enabled(can_run, egui::Button::new("Compile used pipelines"))
+                .on_hover_text("Those earlier sessions drew with: quick, and what matters most.")
                 .clicked()
             {
-                self.queue_steps(&ctx, &[StepKind::Warm]);
+                queue = Some(vec![(StepKind::Warm(WarmWhat::Used), Purpose::Prepare)]);
             }
-            ui.separator();
             if ui
-                .add_enabled(idle, egui::Button::new("Clear shader cache"))
+                .add_enabled(can_run, egui::Button::new("Compile all pipelines"))
+                .on_hover_text("Every pipeline the game has created: long the first time (tens of thousands), then only new ones.")
+                .clicked()
+            {
+                queue = Some(vec![(StepKind::Warm(WarmWhat::All), Purpose::Prepare)]);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(idle, egui::Button::new("Clear shader cache..."))
                 .clicked()
             {
                 self.confirm = Some(Confirm::ClearShaders);
             }
             if ui
-                .add_enabled(idle, egui::Button::new("Clear pipeline cache"))
+                .add_enabled(idle, egui::Button::new("Clear pipeline cache..."))
                 .clicked()
             {
                 self.confirm = Some(Confirm::ClearPipelines { forget: false });
@@ -1486,92 +2085,31 @@ impl App {
                 self.scan_cache(&ctx);
             }
         });
+        if let Some(steps) = queue {
+            self.queue_steps(&ctx, &steps);
+        }
         if self.game.is_some() {
             hint(
                 ui,
                 "The game is running: preparing and clearing wait until it is closed.",
             );
+        } else if let Some(why) = &others {
+            warn_text(ui, why);
         } else if let Some(problem) = settings::game_folder_problem(&self.settings.game_dir) {
             warn_text(ui, &problem);
         } else if let Some(Err(e)) = &self.victory {
             error_text(ui, e);
         }
         ui.add_space(8.0);
-        let mut cancel = false;
-        if let Some(active) = &self.active {
-            let p = &active.progress;
-            let elapsed = active.step.started.elapsed();
-            let after = match self.queue.len() {
-                0 => String::new(),
-                n => format!(" (then {n} more step)"),
-            };
-            ui.label(RichText::new(format!("{}{after}", active.kind.title())).strong());
-            match p.fraction() {
-                Some(fraction) => {
-                    let total = p.total.unwrap_or(0);
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .text(format!(
-                                "{} / {}  ({:.0}%)",
-                                progress::grouped(p.done),
-                                progress::grouped(total),
-                                fraction * 100.0
-                            ))
-                            .desired_height(22.0),
-                    );
-                }
-                None => {
-                    // No total is known: a moving bar and the count.
-                    let sweep = (elapsed.as_secs_f32() * 0.35).fract();
-                    let text = if p.done > 0 {
-                        format!(
-                            "{} {} so far",
-                            progress::grouped(p.done),
-                            active.kind.unit()
-                        )
-                    } else {
-                        "working...".to_owned()
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(sweep)
-                            .text(text)
-                            .animate(true)
-                            .desired_height(22.0),
-                    );
-                }
-            }
-            ui.horizontal(|ui| {
-                let mut parts = vec![format!("Elapsed {}", progress::clock(elapsed))];
-                if let Some(rate) = p.rate() {
-                    parts.push(format!(
-                        "{} {} a second",
-                        progress::grouped(rate.round() as u64),
-                        active.kind.unit()
-                    ));
-                }
-                if let Some(eta) = p.eta()
-                    && !p.finished
-                {
-                    parts.push(format!("about {} left", progress::clock(eta)));
-                }
-                ui.label(parts.join("   |   "));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    cancel = ui.button("Cancel").clicked();
-                    ui.label(
-                        RichText::new("Runs at low priority so the PC stays usable")
-                            .weak()
-                            .small(),
-                    );
-                });
-            });
-            if p.total.is_none() && !active.last_line.is_empty() {
-                ui.label(RichText::new(&active.last_line).monospace().small());
-            }
-            let height = (ui.available_height() - 16.0).clamp(80.0, 260.0);
-            tail_view(ui, "tail", &active.tail, height);
+        if self.active.is_some() {
+            let pressed = self.step_view(ui, true);
+            self.step_buttons(pressed);
         } else {
             if let Some(n) = &self.step_note {
                 note(ui, n);
+                if !n.0 && ui.button("Open the logs folder").clicked() {
+                    self.open(&paths::logs_dir());
+                }
             }
             if !self.last_tail.is_empty() {
                 ui.add_space(4.0);
@@ -1579,9 +2117,6 @@ impl App {
                 let height = (ui.available_height() - 16.0).clamp(80.0, 200.0);
                 tail_view(ui, "last-tail", &self.last_tail, height);
             }
-        }
-        if cancel && let Some(active) = &self.active {
-            active.step.cancel();
         }
     }
 
@@ -1978,9 +2513,9 @@ impl App {
                 Confirm::ClearPipelines { forget } => {
                     ui.heading("Clear the pipeline cache?");
                     ui.label(format!("This deletes the built pipelines in {} and nothing else.", cache.join(caches::PIPELINES_DIR).display()));
-                    ui.label("A warm-up builds them again.");
+                    ui.label("Compiling ahead builds them again.");
                     ui.checkbox(forget, "Also forget which pipelines the game uses");
-                    hint(ui, "Then a warm-up has nothing to do until you have played again. Leave this off unless told otherwise.");
+                    hint(ui, "Then there is nothing to compile ahead until you have played again. Leave this off unless told otherwise.");
                 }
                 Confirm::BackToStable(release) => {
                     ui.heading("Go back to the stable release?");
@@ -1993,6 +2528,7 @@ impl App {
                 Confirm::PrepareBeforePlay => {
                     ui.heading("Prepare shaders first?");
                     ui.label("The shaders have not been prepared for this version. Preparing takes several minutes, once; without it the game stutters badly while it translates them during play.");
+                    hint(ui, "Progress shows on the Play page; it can be stopped there and goes on next time.");
                 }
             }
             ui.add_space(10.0);
@@ -2071,12 +2607,8 @@ impl App {
                 self.last_tail.clear();
                 self.scan_cache(ctx);
             }
-            Confirm::PrepareBeforePlay if chosen == 1 => {
-                self.tab = Tab::Shaders;
-                self.queue_steps(ctx, &[StepKind::Shaders, StepKind::Warm]);
-                self.play_after_steps = self.busy();
-            }
-            Confirm::PrepareBeforePlay => self.start_game(),
+            Confirm::PrepareBeforePlay if chosen == 1 => self.play(ctx, true),
+            Confirm::PrepareBeforePlay => self.play(ctx, false),
             Confirm::BackToStable(release) => self.download_update(ctx, *release),
         }
     }
@@ -2091,10 +2623,17 @@ impl eframe::App for App {
         if let Some(game) = &mut self.game
             && let Some(ended) = game.ended()
         {
-            let good = ended == "The game was closed.";
-            self.game_note = Some((good, ended));
-            self.game = None;
-            self.scan_cache(ctx);
+            self.game_ended(ctx, ended);
+        }
+        if !self.busy()
+            && let Some(shaders_first) = self.pending_play.take()
+        {
+            self.play(ctx, shaders_first);
+        }
+        self.look_for_others();
+        if !self.others.is_empty() {
+            // (Looked at again until it has gone.)
+            ctx.request_repaint_after(Duration::from_secs(2));
         }
         if self.settings != self.saved {
             match self.settings.save(&paths::settings_file()) {
@@ -2145,6 +2684,32 @@ impl eframe::App for App {
                 });
             });
             ui.add_space(2.0);
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let build = update::describe_build(
+                    update::current_version(),
+                    update::current_commit(),
+                    update::current_date(),
+                );
+                let place = if self.running_installed {
+                    "installed"
+                } else if self.carries_victory {
+                    "setup program"
+                } else {
+                    "not the installed copy"
+                };
+                ui.label(RichText::new(format!("{build}, {place}")).small().weak())
+                    .on_hover_text(format!("Commit {}", update::current_commit()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let text = if self.game.is_some() {
+                        "The game is running".to_owned()
+                    } else {
+                        settings::describe(&self.settings)
+                    };
+                    ui.label(RichText::new(text).small().weak());
+                });
+            });
         });
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(text) = self.notice.clone() {

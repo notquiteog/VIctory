@@ -85,6 +85,12 @@ fn main() {
         "run" => {
             println!("stub: the game would run now");
             std::thread::sleep(Duration::from_secs(number("VICTORY_STUB_SECONDS", 4)));
+            // `VICTORY_STUB_CRASH=1`: ends as a crash does (an access violation).
+            if number("VICTORY_STUB_CRASH", 0) == 1 {
+                eprintln!("ERROR victory_gpu: device removed (stub)");
+                eprintln!("stub: the game crashed");
+                std::process::exit(0xC000_0005_u32 as i32);
+            }
             println!("stub: the game was closed");
         }
         other => {

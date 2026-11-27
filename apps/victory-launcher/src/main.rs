@@ -193,12 +193,16 @@ fn headless_install(args: &Args, settings: &Settings) -> i32 {
     }
 }
 
-/// The Play command and environment, as text.
-pub fn describe_play(settings: &Settings, victory: &Path) -> String {
-    let spec = runner::play_spec(settings, victory, &paths::home());
-    let mut text = format!("{}\n", spec.command_line());
-    for (name, value) in &spec.env {
-        text.push_str(&format!("{name}={value}\n"));
+/// What Play runs, step by step, as text: for each step a `#` line with
+/// the command, a `==` line with its arguments (as `victory-stub` prints
+/// them) and its `VICTORY_*` environment.
+pub fn describe_play(settings: &Settings, victory: &Path, progress_flag: bool) -> String {
+    let mut text = format!("# {}\n", settings::describe(settings));
+    for spec in runner::session(settings, victory, &paths::home(), progress_flag) {
+        text.push_str(&format!("# {}\n== {:?}\n", spec.command_line(), spec.args));
+        for (name, value) in &spec.env {
+            text.push_str(&format!("{name}={value}\n"));
+        }
     }
     text
 }
@@ -234,7 +238,25 @@ fn finish_update(targets: &paths::InstallTargets, settings: &mut Settings) -> Re
         })
 }
 
+/// A panic is written to the log and shown, not lost with the window.
+fn report_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let text = format!("{info}");
+        log(&format!("panic: {text}"));
+        win::message_box(
+            &format!("{} launcher", paths::DISPLAY_NAME),
+            &format!(
+                "The launcher ran into a problem it cannot go on from and will close:\n\n{text}\n\nThis is noted in {}. Starting the launcher again usually helps; if it does not, please report it with that file.",
+                paths::logs_dir().join("launcher.log").display()
+            ),
+        );
+        default(info);
+    }));
+}
+
 fn main() {
+    report_panics();
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(e) => {
@@ -274,7 +296,8 @@ fn main() {
         let victory =
             install::find_victory(args.victory_exe.as_deref(), &settings.developer.victory_exe)
                 .unwrap_or_else(|| paths::exe_dir().join(paths::VICTORY_EXE));
-        let written = std::fs::write(file, describe_play(&settings, &victory));
+        let progress = runner::inspect_victory(&victory).is_ok_and(|v| v.progress_flag);
+        let written = std::fs::write(file, describe_play(&settings, &victory, progress));
         std::process::exit(i32::from(written.is_err()));
     }
     let targets = paths::install_targets();
@@ -330,11 +353,22 @@ mod tests {
             game_dir: r"D:\Games\Mine".into(),
             ..Settings::default()
         };
-        let text = describe_play(&s, Path::new(r"C:\p\victory.exe"));
-        let mut lines = text.lines();
+        let text = describe_play(&s, Path::new(r"C:\p\victory.exe"), true);
+        let heads: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with('#') || l.starts_with("=="))
+            .collect();
         assert_eq!(
-            lines.next().unwrap(),
-            r"C:\p\victory.exe run D:\Games\Mine\game_scarlett_master.exe --execute --console series-x"
+            heads,
+            [
+                "# Series S, the world drawn at 540p, ray tracing on",
+                r"# C:\p\victory.exe warm --used --progress",
+                r#"== ["warm", "--used", "--progress"]"#,
+                r"# C:\p\victory.exe run D:\Games\Mine\game_scarlett_master.exe --execute --console series-s",
+                r#"== ["run", "D:\\Games\\Mine\\game_scarlett_master.exe", "--execute", "--console", "series-s"]"#,
+                r"# C:\p\victory.exe warm --progress",
+                r#"== ["warm", "--progress"]"#,
+            ]
         );
         assert!(
             text.contains("\nVICTORY_THIN=1\n")

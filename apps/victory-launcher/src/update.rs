@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::paths;
 use crate::settings::Channel;
 
-pub const REPO: &str = "notquiteog/victory-nvidia";
+pub const REPO: &str = "notquiteog/VIctory";
 /// Another place to look, for tests: a URL that answers with release JSON,
 /// or a folder holding `latest.json` and the files it names.
 pub const FEED_ENV: &str = "VICTORY_UPDATE_FEED";
@@ -343,12 +343,19 @@ pub fn fetch_latest(feed: &Feed, channel: Channel) -> Result<Found, String> {
                 }
                 Err(e) => {
                     return Err(format!(
-                        "Could not reach {url} ({e}). Check the internet connection."
+                        "Could not reach {url} ({e}). Check the internet connection and try again later; playing does not need it."
                     ));
                 }
             }
         }
         Feed::Folder(dir) => {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "The update folder {} was not found ({}).",
+                    dir.display(),
+                    FEED_ENV
+                ));
+            }
             let file = dir.join(match channel {
                 Channel::Stable => "latest.json",
                 Channel::Nightly => "nightly.json",
@@ -744,15 +751,12 @@ pub(crate) mod tests {
         let s = Channel::Stable;
         assert_eq!(
             Feed::choose(None, "", s),
-            Feed::Url(
-                "https://api.github.com/repos/notquiteog/victory-nvidia/releases/latest".into()
-            )
+            Feed::Url("https://api.github.com/repos/notquiteog/VIctory/releases/latest".into())
         );
         assert_eq!(
             Feed::choose(None, "", Channel::Nightly),
             Feed::Url(
-                "https://api.github.com/repos/notquiteog/victory-nvidia/releases/tags/nightly"
-                    .into()
+                "https://api.github.com/repos/notquiteog/VIctory/releases/tags/nightly".into()
             )
         );
         assert_eq!(
@@ -1056,10 +1060,16 @@ pub(crate) mod tests {
             None,
         );
         let feed = Feed::Folder(feed_dir);
+        // A folder without a release: nothing published. No folder: said so.
+        std::fs::create_dir_all(dir.path().join("empty")).unwrap();
         assert_eq!(
             fetch_latest(&Feed::Folder(dir.path().join("empty")), Channel::Stable),
             Ok(Found::Nothing)
         );
+        let Err(e) = fetch_latest(&Feed::Folder(dir.path().join("gone")), Channel::Stable) else {
+            panic!()
+        };
+        assert!(e.contains("was not found") && e.contains("gone"), "{e}");
         let Found::Release(release) = fetch_latest(&feed, Channel::Stable).unwrap() else {
             panic!()
         };

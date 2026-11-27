@@ -136,7 +136,7 @@ pub fn payload(exe: &Path) -> Option<(u64, u64)> {
     let mut tail = [0u8; 16];
     file.read_exact(&mut tail).ok()?;
     let packed = u64::from_le_bytes(tail[..8].try_into().ok()?);
-    (&tail[8..] == SETUP_MARK && packed > 0 && packed + 16 < len)
+    (&tail[8..] == SETUP_MARK && packed > 0 && packed.checked_add(16)? < len)
         .then(|| (len - 16 - packed, packed))
 }
 
@@ -400,6 +400,8 @@ pub fn uninstall(t: &InstallTargets, remove_data: Option<(&Settings, &Path)>) ->
         paths::VICTORY_EXE,
         paths::ICON_FILE,
         paths::MANIFEST_FILE,
+        // (Made beside victory.exe when Smooth Motion is on.)
+        crate::runner::SMOOTH_MOTION_EXE,
     ]);
     for name in names {
         // Only names below the program folder: a manifest is a text file anyone can edit.

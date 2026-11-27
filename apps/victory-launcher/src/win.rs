@@ -15,6 +15,9 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoTaskMemFree, IPersistFile,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -31,7 +34,7 @@ use windows::Win32::UI::Shell::{
     FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, IShellLinkW, KF_FLAG_DEFAULT,
     SHCreateItemFromParsingName, SHGetKnownFolderPath, SIGDN_FILESYSPATH, ShellExecuteW, ShellLink,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL};
 use windows::core::{GUID, HSTRING, Interface, PCWSTR, PWSTR};
 
 /// `CREATE_NO_WINDOW`: a console program started without a console window.
@@ -448,12 +451,15 @@ impl Adapter {
     }
 }
 
-/// The hardware adapter with the most memory of its own.
-pub fn best_adapter() -> Option<Adapter> {
+/// The hardware adapters, in the system's order (what
+/// `VICTORY_D3D12_ADAPTER`'s index counts).
+pub fn adapters() -> Vec<Adapter> {
+    let mut found = Vec::new();
     // SAFETY: plain DXGI enumeration; descriptions are copied out.
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let mut best: Option<Adapter> = None;
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return found;
+        };
         let mut n = 0;
         while let Ok(adapter) = factory.EnumAdapters1(n) {
             n += 1;
@@ -468,21 +474,60 @@ pub fn best_adapter() -> Option<Adapter> {
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(desc.Description.len());
-            let found = Adapter {
+            found.push(Adapter {
                 name: String::from_utf16_lossy(&desc.Description[..len])
                     .trim()
                     .to_owned(),
                 vendor_id: desc.VendorId,
                 vram_bytes: desc.DedicatedVideoMemory as u64,
-            };
-            if best
-                .as_ref()
-                .is_none_or(|b| found.vram_bytes > b.vram_bytes)
-            {
-                best = Some(found);
-            }
+            });
         }
-        best
+    }
+    found
+}
+
+/// The running processes whose program file is one of `names` (compared
+/// without case): (process id, name).
+pub fn processes_named(names: &[&str]) -> Vec<(u32, String)> {
+    let mut found = Vec::new();
+    // SAFETY: a snapshot walked with a correctly sized entry, then closed.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return found;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                found.push((entry.th32ProcessID, name));
+            }
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    found
+}
+
+/// A message in a window of its own, for what happens before (or instead
+/// of) the launcher's window.
+pub fn message_box(title: &str, text: &str) {
+    // SAFETY: both strings outlive the call.
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from(title),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }
 

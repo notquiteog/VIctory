@@ -24,7 +24,7 @@ param(
     [int]$Jobs = 0,
     [switch]$SkipBuild,
     [switch]$Plain,
-    [string]$Repo = 'notquiteog/victory-nvidia'
+    [string]$Repo = 'notquiteog/VIctory'
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
