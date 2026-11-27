@@ -53,7 +53,7 @@ captures in `captures\rt-on1`, `rt-on2`, `rt-off1` (not in the repository):
   around it; not explained yet.
 
 What the skip list should become: nothing for ray tracing. `rt_off_hashes.txt`
-is for `VICTORY_BVH_BUILDER=0` only (scripts\play-nvidia.ps1 `-NoRayTracing`
+is for `VICTORY_BVH_BUILDER=0` only (scripts\play.ps1 `-NoRayTracing`
 gives both); with the builder on it would drop the passes that use the
 structures it builds.
 

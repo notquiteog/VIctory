@@ -6,10 +6,16 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory), which runs an Xbox Ser
 
 ## Status
 
-- Native ray tracing is **on by default**. To turn it off, use `-NoRayTracing`.
-- Walking outdoors as Series S at half resolution, frames take about 50–90 ms (11–20 fps), and the CPU is the limit.
+Measured walking outdoors on an NVIDIA card, Series S profile at half resolution (the defaults):
+
+| | Frame time |
+|---|---|
+| Ray tracing on (default) | about 67–85 ms (12–15 fps); the GPU's ray-tracing structure builder is the main cost |
+| Ray tracing off (`-NoRayTracing`) | about 45–58 ms (17–22 fps); the CPU is the main cost |
+
+- Ray tracing is the title's own: real bounced light, reflections and clouds. A tree canopy sometimes shows as dark squares for a few seconds.
 - You need 64 GB of RAM: the game uses 25–45 GB.
-- The first run after a new driver or build stutters while shaders are compiled. `victory warm` compiles them ahead of time.
+- The first run after a new driver or build stutters while shaders are compiled. `target\diag\victory.exe warm --used` compiles the ones earlier runs used ahead of time.
 
 ## Run it
 
@@ -22,22 +28,24 @@ You need:
 - your own dump of the title
 
 ```powershell
-git clone https://github.com/notquiteog/victory-nvidia
-cd victory-nvidia
+git clone https://github.com/notquiteog/VIctory
+cd VIctory
 copy victory.example.toml victory.toml   # set your paths
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <shader archives>   # once, takes minutes
-scripts\play-nvidia.ps1 -Exe <your copy's executable>   # NVIDIA
-scripts\play.ps1 -Exe <your copy's executable>          # AMD
+scripts\play.ps1 -Exe <your copy's executable>
 ```
 
-Useful flags for `play-nvidia.ps1` (`play.ps1` also takes `-NoRayTracing`):
+`scripts\play.ps1` works on AMD and NVIDIA cards. Its flags:
 
 | Flag | What it does |
 |---|---|
 | `-SeriesX` | Uses the Series X profile: sharper, about half the speed. |
-| `-Resolution 720` | Sets the internal render height. |
+| `-Resolution 720` | Sets the internal render height (default: half the output, 540 on Series S). |
 | `-NoRayTracing` | Uses the ambient stand-in for indirect light instead of ray tracing. |
+| `-Safe` | Turns off the newer submission paths. Try it first if something breaks. |
+| `-Adapter <name>` | Picks a card on a PC with more than one. |
+| `-SmoothMotion` | NVIDIA only: starts a copy named `victory_sm.exe`, so a Smooth Motion profile you set for that name in the NVIDIA App applies. |
 
 Every `VICTORY_*` setting is documented where the code reads it.
 
@@ -45,7 +53,6 @@ Every `VICTORY_*` setting is documented where the code reads it.
 
 - [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): how ray tracing works here, and its switches.
 - [docs/findings.md](docs/findings.md): performance work and measurements.
-- [docs/nvidia-rtx5060.md](docs/nvidia-rtx5060.md): settings for NVIDIA cards.
 - [docs/replay.md](docs/replay.md): recording and replaying frames.
 - [docs/README-fxceless.md](docs/README-fxceless.md): commands and debugging.
 
