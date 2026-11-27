@@ -5178,10 +5178,24 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        // (Class G copies, `crate::classes`: not followed.)
+        // (Class G copies, `crate::classes`: only the pages at their ends
+        // are followed.)
         let gpu_only = |shadow: &Arc<crate::shadow::Shadow>| shadow.class().is_some_and(|c| c.skips());
-        let declared: Vec<Declared> =
-            declared.iter().filter(|(shadow, _)| shadow.carded() && !gpu_only(shadow)).cloned().collect();
+        let declared: Vec<Declared> = declared
+            .iter()
+            .filter(|(shadow, _)| shadow.carded())
+            .filter_map(|(shadow, ranges)| match shadow.class().filter(|c| c.skips()) {
+                None => Some((shadow.clone(), ranges.clone())),
+                Some(class) => {
+                    let ends: Vec<(usize, usize)> = ranges
+                        .iter()
+                        .flat_map(|&(from, to)| class.outside(from, to))
+                        .filter(|(from, to)| from < to)
+                        .collect();
+                    (!ends.is_empty()).then(|| (shadow.clone(), ends))
+                }
+            })
+            .collect();
         let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> = picked
@@ -5199,11 +5213,20 @@ impl Host {
             }
             None => 0,
         };
+        // Copies owed to title memory: their whole span, not compared (what
+        // the card wrote while they were closed came in earlier flights).
+        let mut owed: Vec<usize> = Vec::new();
         if crate::classes::mode() != crate::classes::Mode::Off {
             crate::classes::consider(declared.iter().map(|d| &d.0), sent_as);
             // Copies widened since: their whole span, fetched and landed
             // behind this submission.
-            declared.extend(crate::classes::owed(sent_as));
+            for (shadow, span) in crate::classes::owed(sent_as) {
+                owed.push(Arc::as_ptr(&shadow) as usize);
+                match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &shadow)) {
+                    Some((_, ranges)) => ranges.extend(span),
+                    None => declared.push((shadow, span)),
+                }
+            }
         }
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
@@ -5388,7 +5411,9 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let compared = twin
+                    && u64::from(at + span.pieces) * 4 <= work.differs.2
+                    && !owed.contains(&(Arc::as_ptr(shadow) as usize));
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),

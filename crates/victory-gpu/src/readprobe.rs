@@ -116,7 +116,7 @@ fn ours() -> (usize, usize) {
 /// New bytes of host copy `copy` (start, length) landed in the page at
 /// `page` (an address in it) of title memory: it is armed, if there is room.
 pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
-    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect};
     if pages.is_empty() {
         return;
     }
@@ -144,7 +144,8 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
             probe.armed.remove(&page);
             continue;
         }
-        if !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        // (Read-only is the write guards' own: theirs to undo.)
+        if old != PAGE_READWRITE {
             // Something else of its own (a guard page, write-copy): left so.
             let mut was = 0;
             // SAFETY: as above, back as it was.
@@ -196,6 +197,15 @@ fn install() -> bool {
             }
             return EXCEPTION_CONTINUE_SEARCH;
         };
+        if !no_access(page) {
+            // Protected again since by another hand (the write guards, a
+            // block at once): theirs now.
+            return if open(page, r.ExceptionInformation[0] == 1) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
+        }
         let mut was = 0;
         // SAFETY: the page we armed, back as it was.
         unsafe { VirtualProtect(page as *const _, PAGE, armed.old, &mut was) };

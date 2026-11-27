@@ -102,6 +102,10 @@ pub(crate) struct Class {
     /// With [`CLOSING`]: the submission number it was classed at. With
     /// [`OWED`]: the one whose plan carries its whole span (0: none yet).
     at: AtomicU64,
+    /// The whole pages of its title memory that are closed, as title
+    /// addresses: from, to. Bytes of the copy in the pages at either end,
+    /// which other memory may share, are followed as before.
+    inner: [AtomicU64; 2],
 }
 
 impl Class {
@@ -120,6 +124,16 @@ impl Class {
         self.state() == G
     }
 
+    /// The parts of `[from, to)` (title addresses) outside the closed pages:
+    /// all of it unless the copy [`Class::skips`]. Empty parts are `(x, x)`.
+    pub(crate) fn outside(&self, from: usize, to: usize) -> [(usize, usize); 2] {
+        if !self.skips() {
+            return [(from, to), (to, to)];
+        }
+        let (a, b) = (self.inner[0].load(Ordering::Relaxed) as usize, self.inner[1].load(Ordering::Relaxed) as usize);
+        cut(from, to, a, b)
+    }
+
     /// Shaders of a submission are declared to write the copy.
     pub(crate) fn writing(&self) {
         if self.written.load(Ordering::Relaxed) == 0 {
@@ -132,6 +146,24 @@ impl Class {
         self.up.store(crate::frame::current() + 1, Ordering::Relaxed);
     }
 }
+
+/// `[from, to)` outside `[a, b)`: below it and above it.
+fn cut(from: usize, to: usize, a: usize, b: usize) -> [(usize, usize); 2] {
+    let below = (from, to.min(a).max(from));
+    let above = (from.max(b).min(to), to);
+    [below, above]
+}
+
+/// The whole pages of `[start, start + len)`, if there are [`LEAST_PAGES`]
+/// or more: first, end.
+fn interior(start: usize, len: usize) -> Option<(usize, usize)> {
+    let (first, end) = (start.div_ceil(PAGE), (start + len) / PAGE);
+    (end >= first + LEAST_PAGES).then_some((first, end))
+}
+
+/// The fewest whole pages a copy closes: smaller copies share their pages
+/// with other memory, mostly.
+const LEAST_PAGES: usize = 16;
 
 /// Whether a copy may be classed G now, `frame` being the current frame:
 /// written long enough ago, nothing sent up since.
@@ -213,7 +245,10 @@ pub(crate) fn consider<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>, sent_a
         }
         let (start, len) = copy.span();
         let (start, len) = (start as usize, len as usize);
-        let pages = (start / PAGE, (start + len).div_ceil(PAGE));
+        let Some(pages) = interior(start, len) else {
+            class.state.store(WIDE, Ordering::Release);
+            continue;
+        };
         if mode == Mode::Learn {
             // Logged once.
             class.state.store(WIDE, Ordering::Release);
@@ -227,6 +262,8 @@ pub(crate) fn consider<'a>(copies: impl Iterator<Item = &'a Arc<Shadow>>, sent_a
         let mut table = table();
         let table = table.get_or_insert_with(Table::default);
         class.at.store(sent_as, Ordering::Relaxed);
+        class.inner[0].store((pages.0 * PAGE) as u64, Ordering::Relaxed);
+        class.inner[1].store((pages.1 * PAGE) as u64, Ordering::Relaxed);
         class.state.store(CLOSING, Ordering::Release);
         table.copies.insert(
             copy.id(),
@@ -590,6 +627,25 @@ mod tests {
         assert!(due(600, 650, 1000, 300));
         // Sent up before shaders first wrote it (its first upload): yes.
         assert!(due(600, 500, 1000, 300));
+    }
+
+    #[test]
+    fn only_whole_pages_are_closed_and_the_ends_are_followed() {
+        // Shares its first and last pages: those stay open.
+        assert_eq!(interior(0x1100, 17 * PAGE), Some((2, 18)));
+        // Too small once its shared pages are left out.
+        assert_eq!(interior(0x1100, 16 * PAGE), None);
+        assert_eq!(interior(0x1000, 16 * PAGE), Some((1, 17)));
+        // A range across the closed pages: its two ends.
+        assert_eq!(cut(0x1100, 0x13000, 0x2000, 0x12000), [(0x1100, 0x2000), (0x12000, 0x13000)]);
+        // Inside: nothing.
+        let [below, above] = cut(0x3000, 0x4000, 0x2000, 0x12000);
+        assert!(below.0 >= below.1 && above.0 >= above.1);
+        // Below: all of it.
+        assert_eq!(cut(0x100, 0x800, 0x2000, 0x12000)[0], (0x100, 0x800));
+        assert_eq!(cut(0x100, 0x800, 0x2000, 0x12000)[1].0, 0x800);
+        // Above: all of it.
+        assert_eq!(cut(0x13000, 0x14000, 0x2000, 0x12000)[1], (0x13000, 0x14000));
     }
 
     #[test]

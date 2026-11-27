@@ -3393,11 +3393,22 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        // Class G: the card's copy is the only home of what shaders write.
+        // Class G: the card's copy is the only home of what shaders write
+        // in its closed pages; the pages at its ends are followed.
         if self.class.skips() {
+            for (from, to) in self.class.outside(address, address + len) {
+                if from < to {
+                    self.writing_in(from, to - from);
+                }
+            }
             return;
         }
         self.class.writing();
+        self.writing_in(address, len);
+    }
+
+    /// [`Shadow::writing`] of a range the copy's class follows.
+    fn writing_in(&self, address: usize, len: usize) {
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -4040,13 +4051,28 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        #[cfg(feature = "diagnostics")]
-        let _timed = BigTimer::new(self, crate::heapstat::refreshed);
-        // In place: the card reads title memory itself. Closed (class G):
-        // nothing in title memory is newer than the copy.
-        if self.place.is_some() || self.class.closed() {
+        // In place: the card reads title memory itself.
+        if self.place.is_some() {
             return 0;
         }
+        // Closed (class G): nothing in its closed pages is newer than the
+        // copy; the pages at its ends are looked at as before.
+        if self.class.closed() {
+            return self
+                .class
+                .outside(address, address + len)
+                .into_iter()
+                .filter(|(from, to)| from < to)
+                .map(|(from, to)| self.update_in(from, to - from))
+                .sum();
+        }
+        self.update_in(address, len)
+    }
+
+    /// [`Shadow::update`] of a range the copy's class follows.
+    fn update_in(&self, address: usize, len: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = BigTimer::new(self, crate::heapstat::refreshed);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4084,9 +4110,21 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() || self.class.closed() {
+        if self.place.is_some() {
             return true;
         }
+        if self.class.closed() {
+            return self
+                .class
+                .outside(address, address + len)
+                .into_iter()
+                .all(|(from, to)| from >= to || self.nothing_new_in(from, to - from));
+        }
+        self.nothing_new_in(address, len)
+    }
+
+    /// [`Shadow::nothing_new`] of a range the copy's class follows.
+    fn nothing_new_in(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
