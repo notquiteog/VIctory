@@ -329,6 +329,37 @@ fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     );
 }
 
+/// A scalar a per-lane branch writes is the wave's after the join: `s38`
+/// is 0x5555, the lanes above `from` run `v_readlane_b32 s38, v0, 25`, and
+/// after `s_or_b32 exec` lane 0, which skipped the branch, stores `s38`. On
+/// the console the wave ran the branch if any lane took it, so every lane
+/// reads 25. With no lane in the branch (`from` 31), it keeps 0x5555.
+#[test]
+fn a_scalar_a_lane_branch_writes_is_the_waves_after_the_join() {
+    for (from, want) in [(19u32, 25u32), (31, 0x5555)] {
+        let shader = build_cs(
+            &[
+                0xBEA6_03FF,
+                0x0000_5555,                             // s_mov_b32 s38, 0x5555
+                0x7C00_0000 | 0xC1 << 17 | (128 + from), // v_cmp_lt_u32 vcc_lo, from, v0
+                0xBEA2_3C6A,                             // s_and_saveexec_b32 s34, vcc_lo
+                0xBF88_0002,                             // s_cbranch_execz over the read
+                0xD760_0026,
+                256 | (128 + 25) << 9,   // v_readlane_b32 s38, v0, 25
+                0x887E_227E,             // s_or_b32 exec_lo, exec_lo, s34
+                0xBEFE_0381,             // s_mov_b32 exec_lo, 1
+                vop1(0x001, 0, sgpr(38)), // v_mov_b32 v0, s38
+            ],
+            32,
+            0,
+        );
+        // (WARP's waves are narrower than 32 lanes: no pipeline there.)
+        run_cases_on(&shader, &[[0; 4]], &[("hardware", false)], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: lanes above {from} branch: got {got:#x}");
+        });
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;

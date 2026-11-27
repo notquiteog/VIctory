@@ -35,6 +35,11 @@ use group_wide::{all_group_blocks, lane_regions};
 #[path = "halves.rs"]
 mod halves;
 
+/// Scalars at per-lane joins: the console wave's value in every lane, a
+/// child module so it shares the emitter's state.
+#[path = "joins.rs"]
+mod joins;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -305,6 +310,10 @@ struct Lower<'a> {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// At joins a console wave reaches along several edges at once: each
+    /// lane's edge, as the rank of its predecessor in code order
+    /// ([`Lower::wave_scalars`]), filled with the phis.
+    edge_ranks: Vec<(V, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -2278,6 +2287,7 @@ impl<'a> Lower<'a> {
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
+            edge_ranks: Vec::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
             coherent: HashSet::new(),
@@ -3094,6 +3104,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.wave_scalars(b);
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -14642,6 +14653,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
+        self.fill_edge_ranks();
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
