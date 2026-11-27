@@ -1060,6 +1060,47 @@ fn choice<T: Copy + PartialEq>(
         });
 }
 
+/// Release notes (Markdown) as lines to read: headings marked, the
+/// emphasis, code marks and link targets taken out.
+fn readable_notes(notes: &str) -> Vec<(bool, String)> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for line in notes.lines() {
+        let line = line.trim_end();
+        let heading = line.starts_with('#');
+        let mut text = line
+            .trim_start_matches('#')
+            .trim()
+            .replace("**", "")
+            .replace('`', "");
+        // `[words](https://...)` -> `words`
+        while let (Some(open), Some(mid)) = (text.find('['), text.find("](")) {
+            let Some(close) = text[mid..].find(')').map(|c| mid + c) else {
+                break;
+            };
+            if open > mid {
+                break;
+            }
+            text = format!(
+                "{}{}{}",
+                &text[..open],
+                &text[open + 1..mid],
+                &text[close + 1..]
+            );
+        }
+        if let Some(rest) = text.strip_prefix("- ").or_else(|| text.strip_prefix("* ")) {
+            text = format!("\u{2022} {rest}");
+        }
+        if text.is_empty() && out.last().is_none_or(|(_, l)| l.is_empty()) {
+            continue;
+        }
+        out.push((heading, text));
+    }
+    while out.last().is_some_and(|(_, l)| l.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
 /// The width of the drop-down lists.
 const COMBO_WIDTH: f32 = 430.0;
 
@@ -2132,39 +2173,32 @@ impl App {
             )
         ));
         hint(ui, NOTICE);
-        ui.add_space(4.0);
-        ui.label("Update channel");
-        hint(ui, help::CHANNEL);
         let before = self.settings.updates.channel;
         let downloading = matches!(self.update, UpdateState::Downloading(..));
-        ui.add_enabled_ui(!downloading, |ui| {
-            choice(
+        let feed = self.feed().describe();
+        let s = &mut self.settings.updates;
+        section(ui, "Where updates come from", |ui| {
+            ui.label("Update channel");
+            hint(ui, help::CHANNEL);
+            ui.add_enabled_ui(!downloading, |ui| {
+                choice(ui, "channel", &mut s.channel, Channel::ALL, Channel::label)
+            });
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut s.check_on_start,
+                "Look for a new version when the launcher starts",
+            );
+            hint(ui, help::CHECK_UPDATES);
+            hint(
                 ui,
-                "channel",
-                &mut self.settings.updates.channel,
-                Channel::ALL,
-                Channel::label,
-            )
+                &format!("Last looked: {}. Asked: {feed}", ago(s.last_check)),
+            );
         });
         if self.settings.updates.channel != before {
             // What was found (or staged) is of the other channel.
             let _ = std::fs::remove_file(paths::updates_dir().join("pending.txt"));
             self.check_update(&ctx);
         }
-        ui.add_space(4.0);
-        ui.checkbox(
-            &mut self.settings.updates.check_on_start,
-            "Look for a new version when the launcher starts",
-        );
-        hint(ui, help::CHECK_UPDATES);
-        hint(
-            ui,
-            &format!(
-                "Last looked: {}. Asked: {}",
-                ago(self.settings.updates.last_check),
-                self.feed().describe()
-            ),
-        );
         ui.add_space(8.0);
         let checking = matches!(
             self.update,
@@ -2258,11 +2292,16 @@ impl App {
                         .id_salt("notes")
                         .max_height(220.0)
                         .show(ui, |ui| {
-                            ui.label(if release.notes.trim().is_empty() {
-                                "(The release has no notes.)"
-                            } else {
-                                release.notes.trim()
-                            });
+                            if release.notes.trim().is_empty() {
+                                ui.label("(The release has no notes.)");
+                            }
+                            for (heading, line) in readable_notes(&release.notes) {
+                                if heading {
+                                    ui.label(RichText::new(line).strong());
+                                } else {
+                                    ui.label(line);
+                                }
+                            }
                         });
                 });
             }
@@ -2888,6 +2927,24 @@ mod tests {
         assert_eq!(
             freshness("victory 0.1.0 (abc)", false, Some("victory 0.1.0 (def)")),
             Freshness::OtherBuild("victory 0.1.0 (abc)".to_owned())
+        );
+    }
+
+    #[test]
+    fn release_notes_are_made_readable() {
+        let notes = "> VI is unofficial.\n\n## VI 0.1.0 \u{2014} early preview\n\n\n- **`VI-Setup.exe`** one file. See [the README](https://example.org/r).\n";
+        assert_eq!(
+            readable_notes(notes),
+            [
+                (false, "> VI is unofficial.".to_owned()),
+                (false, String::new()),
+                (true, "VI 0.1.0 \u{2014} early preview".to_owned()),
+                (false, String::new()),
+                (
+                    false,
+                    "\u{2022} VI-Setup.exe one file. See the README.".to_owned()
+                ),
+            ]
         );
     }
 
