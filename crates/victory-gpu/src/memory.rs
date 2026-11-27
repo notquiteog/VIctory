@@ -242,6 +242,17 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The title released the view heap whose host heap is `heap`: its run of
+/// by-address slots goes with it, so a heap made later at the same address
+/// reserves its own (a stale entry skipped that and wrote past a smaller
+/// heap's slots).
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
