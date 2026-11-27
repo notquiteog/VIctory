@@ -66,6 +66,32 @@ unsafe impl Sync for Host {}
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
 static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+/// [`RETIRED`] in shards by thread ([`retire_shards`]): eight recording
+/// threads letting go of what their tables' slots viewed stood in one lock.
+static RETIRED_SHARDS: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; 16];
+
+/// Whether [`retire`] puts objects in the calling thread's shard of
+/// [`RETIRED_SHARDS`] in place of the one [`RETIRED`]
+/// (`VICTORY_RETIRE_SHARDS=0`: the one queue). [`bury`] drains them all;
+/// within a shard the numbers come in order as in the one queue.
+fn retire_shards() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RETIRE_SHARDS").is_none_or(|v| v != "0");
+        tracing::info!(on, "objects let go are queued by thread (VICTORY_RETIRE_SHARDS)");
+        on
+    })
+}
+
+/// The queue [`retire`] puts an object let go on.
+fn retired_queue() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    if !retire_shards() {
+        return &RETIRED;
+    }
+    thread_local! { static SHARD: usize = { static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0); NEXT.fetch_add(1, Ordering::Relaxed) % 16 }; }
+    &RETIRED_SHARDS[SHARD.with(|s| *s)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -574,7 +600,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired_queue()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -590,7 +616,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retired_queue().lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
 /// A landing gives the line back (the waiters for flights to land go on)
@@ -625,15 +651,17 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let drain = |queue: &Mutex<std::collections::VecDeque<(u64, Retired)>>| -> Vec<(u64, Retired)> {
+        let mut retired = queue.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
         retired.drain(..n).collect()
     };
-    drop(done);
+    drop(drain(&RETIRED));
+    if retire_shards() {
+        for shard in &RETIRED_SHARDS {
+            drop(drain(shard));
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -1826,12 +1854,285 @@ fn record_plane_pass(
     }
 }
 
+/// Whether the stencil plane of a depth texture goes into its twin by a
+/// compute pass reading the plane ([`stencil_pass`]) in place of the copy
+/// through the twin's buffer (`VICTORY_STENCIL_PASS=1`, off by default).
+/// The copy out of the plane of the 1920x1080 depth-stencil texture
+/// (R24G8) made the driver wait for the card while it was recorded: 0.5
+/// to 4 ms a copy, about 10 a frame, 25 to 150 ms in 5 s and up to 1.6 s
+/// in the card's slow state (runs rs-*, `twin_copy_line`); 39 ms a frame
+/// of the submitting thread in profile rc-prof2.
+fn stencil_pass_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_STENCIL_PASS").is_some_and(|v| v == "1");
+        tracing::info!(on, "stencil planes go into their twins by a compute pass (VICTORY_STENCIL_PASS)");
+        on
+    })
+}
+
+const STENCIL_PASS: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+Texture2DArray<uint2> plane : register(t0);
+RWTexture2DArray<uint> twin : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void stencil(uint3 id : SV_DispatchThreadID) {
+    uint w, h, n;
+    twin.GetDimensions(w, h, n);
+    if (id.x < w && id.y < h) {
+        twin[id] = plane.Load(int4(id, 0)).y;
+    }
+}
+"#;
+
+/// Views the stencil pass reads and writes (two a pass), in a heap of ours
+/// used as a ring. shortcut: as [`PLANE_VIEWS`], a view must last until its
+/// list has run; at ten passes a frame the ring comes round in 25 frames.
+const STENCIL_VIEWS: u32 = 512;
+
+/// The stencil pass's heap and pipeline.
+struct StencilPass {
+    views: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    next: AtomicU32,
+    root: ID3D12RootSignature,
+    pipeline: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for StencilPass {}
+// SAFETY: as above.
+unsafe impl Sync for StencilPass {}
+
+/// The stencil pass, made when first needed (`None`: the host refused).
+fn stencil_pass_made() -> Option<&'static StencilPass> {
+    static PASS: OnceLock<Option<StencilPass>> = OnceLock::new();
+    PASS.get_or_init(|| {
+        let host = host()?;
+        let made = (|| -> windows::core::Result<StencilPass> {
+            let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            let cs = compile(STENCIL_PASS, windows::core::s!("stencil"), windows::core::s!("cs_5_1"))?;
+            // SAFETY: plain creation and queries; the root signature is
+            // inside the shader; the description's pointers live through
+            // the call.
+            unsafe {
+                let views: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: STENCIL_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &cs[..])?;
+                let pipeline: ID3D12PipelineState =
+                    host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: cs.as_ptr().cast(),
+                            BytecodeLength: cs.len(),
+                        },
+                        ..Default::default()
+                    })?;
+                Ok(StencilPass {
+                    cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
+                    gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
+                    step: host.device.GetDescriptorHandleIncrementSize(kind),
+                    views,
+                    next: AtomicU32::new(0),
+                    root,
+                    pipeline,
+                })
+            }
+        })();
+        match made {
+            Ok(pass) => Some(pass),
+            Err(e) => {
+                tracing::warn!(error = %e, "no stencil pass: stencil planes are copied into their twins through buffers");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Records into `list` (a list of ours with nothing of the title's after
+/// it: the pass sets its heap, compute root signature and pipeline and
+/// puts none back) the stencil plane of `depth` going into its twin by
+/// a compute pass, `depth` in the copy source state and the twin in the
+/// copy destination one before and after, as for [`record_twin_copy`].
+/// Whether it was recorded ([`stencil_pass_on`], a stencil twin, a host
+/// that made the pass, a depth texture shaders may read); if not, nothing
+/// was.
+fn stencil_pass(list: &ID3D12GraphicsCommandList, depth: &ID3D12Resource, twin: &crate::resource::Twin) -> bool {
+    if !stencil_pass_on() || twin.through.is_none() {
+        return false;
+    }
+    let (Some(host), Some(pass)) = (host(), stencil_pass_made()) else {
+        return false;
+    };
+    let colour = &twin.colour.texture;
+    // SAFETY: live textures.
+    let (of, to) = unsafe { (depth.GetDesc(), colour.GetDesc()) };
+    // The plane as an unsigned integer second channel: R24G8 (44) as
+    // X24_TYPELESS_G8_UINT (47), R32G8X24 (19) as X32_TYPELESS_G8X24_UINT
+    // (22); the twin as R8_UINT (62).
+    let format = match of.Format.0 {
+        44 | 45 => 47,
+        19 | 20 => 22,
+        _ => return false,
+    };
+    if of.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0
+        || to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+        || of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || of.SampleDesc.Count != 1
+        || to.MipLevels != of.MipLevels
+        || to.DepthOrArraySize != of.DepthOrArraySize
+    {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let (source, dest, read, unordered) = (
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+    let slices = u32::from(of.DepthOrArraySize);
+    // SAFETY: an open list; slots of our heap; live resources and objects
+    // (the pass's own live as long as the process).
+    unsafe {
+        list.ResourceBarrier(&[transition(depth, source, read), transition(colour, dest, unordered)]);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetComputeRootSignature(&pass.root);
+        list.SetPipelineState(&pass.pipeline);
+        for mip in 0..u32::from(of.MipLevels) {
+            let slot = pass.next.fetch_add(2, Ordering::Relaxed) % STENCIL_VIEWS;
+            let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: pass.cpu + ((slot + i) * pass.step) as usize,
+            };
+            host.device.CreateShaderResourceView(
+                depth,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(format),
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: mip,
+                            MipLevels: 1,
+                            FirstArraySlice: 0,
+                            ArraySize: slices,
+                            PlaneSlice: 1,
+                            ResourceMinLODClamp: 0.0,
+                        },
+                    },
+                }),
+                at(0),
+            );
+            host.device.CreateUnorderedAccessView(
+                colour,
+                None::<&ID3D12Resource>,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT(62),
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                            MipSlice: mip,
+                            FirstArraySlice: 0,
+                            ArraySize: slices,
+                            PlaneSlice: 0,
+                        },
+                    },
+                }),
+                at(1),
+            );
+            list.SetComputeRootDescriptorTable(
+                0,
+                D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: pass.gpu + u64::from(slot * pass.step),
+                },
+            );
+            let (width, height) = ((to.Width >> mip).max(1) as u32, (to.Height >> mip).max(1));
+            list.Dispatch(width.div_ceil(8), height.div_ceil(8), slices);
+        }
+        list.ResourceBarrier(&[transition(depth, read, source), transition(colour, unordered, dest)]);
+    }
+    crate::resource::TWINS[3].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        STENCIL_PASSES[0].fetch_add(1, Ordering::Relaxed);
+        STENCIL_PASSES[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    true
+}
+
+/// Stencil passes recorded and their microseconds (diagnostics).
+#[cfg(feature = "diagnostics")]
+static STENCIL_PASSES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Records into `list` the copy of a depth texture into its colour twin
 /// (`colour`) or of the twin into the depth texture, both already in their
 /// copy states: whole textures of one size in one format family, which the
 /// host copies as they are; or, for the twin of a stencil plane, that plane
 /// alone, through the twin's buffer.
 fn record_twin_copy(
+    list: &ID3D12GraphicsCommandList,
+    depth: &ID3D12Resource,
+    twin: &crate::resource::Twin,
+    colour: bool,
+) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    record_twin_copy_now(list, depth, twin, colour);
+    #[cfg(feature = "diagnostics")]
+    twin_copy_time(depth, twin, colour, began.elapsed());
+}
+
+/// Twin copies by way (into the twin, into the depth texture) and by
+/// whether through a buffer: copies and microseconds (diagnostics).
+#[cfg(feature = "diagnostics")]
+static TWIN_COPY_TIME: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Counts a twin copy's recording time; says a slow one (over 1 ms: the
+/// driver waits for the card while it records some) with its texture, the
+/// first 24 times.
+#[cfg(feature = "diagnostics")]
+fn twin_copy_time(depth: &ID3D12Resource, twin: &crate::resource::Twin, colour: bool, took: std::time::Duration) {
+    let i = 2 * (2 * usize::from(colour) + usize::from(twin.through.is_some()));
+    TWIN_COPY_TIME[i].fetch_add(1, Ordering::Relaxed);
+    TWIN_COPY_TIME[i + 1].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if took.as_micros() > 1000 && SAID.fetch_add(1, Ordering::Relaxed) < 24 {
+        // SAFETY: live textures.
+        let (d, c) = unsafe { (depth.GetDesc(), twin.colour.texture.GetDesc()) };
+        tracing::info!(
+            us = took.as_micros() as u64,
+            colour,
+            through = twin.through.is_some(),
+            depth = format_args!("{}x{}x{} fmt {} mips {} flags {:#x}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Flags.0),
+            twin = format_args!("{}x{} fmt {} flags {:#x}", c.Width, c.Height, c.Format.0, c.Flags.0),
+            "a slow twin copy"
+        );
+    }
+}
+
+/// The twin copy times of [`TWIN_COPY_TIME`] since the last call: by way
+/// and path, copies and ms (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn twin_copy_line() -> String {
+    let t: Vec<u64> = TWIN_COPY_TIME.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+    format!(
+        "into depth {} in {:.1} ms, through a buffer {} in {:.1} ms; into twins {} in {:.1} ms, through a buffer {} in {:.1} ms; stencil passes {} in {:.1} ms",
+        t[0], t[1] as f64 / 1e3, t[2], t[3] as f64 / 1e3, t[4], t[5] as f64 / 1e3, t[6], t[7] as f64 / 1e3,
+        STENCIL_PASSES[0].swap(0, Ordering::Relaxed),
+        STENCIL_PASSES[1].swap(0, Ordering::Relaxed) as f64 / 1e3
+    )
+}
+
+fn record_twin_copy_now(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
     twin: &crate::resource::Twin,
@@ -7469,7 +7770,11 @@ impl HostList {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
+                    // (A list of ours that records nothing of the title's
+                    // after: a pass may set its heap and pipeline.)
+                    if !(*colour && stencil_pass(list, &depth.texture, twin)) {
+                        record_twin_copy(list, &depth.texture, twin, *colour);
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -9981,6 +10286,7 @@ impl Meter {
                         put[3]
                     );
                     traffic::line(copy_stats_frames);
+                    tracing::info!("twin copies recorded, the last 5 s: {}", twin_copy_line());
                     crate::copystat::log(copy_stats_frames);
                     for (why, n) in drops.iter().take(40) {
                         tracing::info!(
