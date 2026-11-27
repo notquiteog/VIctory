@@ -1334,7 +1334,10 @@ fn view_home(
     }
     #[cfg(feature = "diagnostics")]
     off_views::seen(shadow.span(), offset, len, stride, raw, format);
-    crate::shadow::exact(start, len).unwrap_or(shadow)
+    // A raw view, or a structured one of whole dwords, that the host makes
+    // raw (`raw_window`): any copy where it begins on 16 bytes will do.
+    let sixteen = raw || (stride > 0 && stride.is_multiple_of(4));
+    crate::shadow::exact_for(start, len, sixteen.then(|| shadow.span())).unwrap_or(shadow)
 }
 
 /// Which title buffers get views off their copy's elements, and of what
@@ -4218,8 +4221,10 @@ fn buffer_srv(
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
     let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
-        // Its own bytes: it begins where they do.
-        (shadow, offset) = (home, 0);
+        // Its own bytes (or a window of them that begins on 16 bytes with it,
+        // `crate::shadow::exact_for`): it begins where they do.
+        offset = home.offset(start);
+        shadow = home;
         own.FirstElement = 0;
     }
     // A structured view as a raw view of the same bytes (see `raw_window`).

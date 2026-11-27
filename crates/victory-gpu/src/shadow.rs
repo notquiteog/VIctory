@@ -5841,6 +5841,104 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 
+/// As [`exact`], for a view that needs only to begin on 16 bytes of its copy
+/// (`sixteen`: the span of the title buffer it lies in): with
+/// `VICTORY_EXACT_WINDOWS=1`, a small one gets a window copy shared by every
+/// view that begins in the same MiB of the buffer on the same residue of 16
+/// ([`windows16`]).
+///
+/// Why: nearly all of the 900 copies [`exact`] made a frame (walking,
+/// Series X, 2026-11-26) were structured views of 4 to 20 bytes, stride 4,
+/// at ring positions in 0x2a7'0000..0x2d0'0000 of the title's 174 MB GPU
+/// buffer at 0xb1'0000 (the frame's constants, a new place every frame), each
+/// a committed buffer of 64 KiB of its own. On a heap without raw twins
+/// (NVIDIA's) a structured view is made raw, and a raw view begins on 16
+/// bytes: these began on 4 or 8 or 12. Four windows per MiB (one per residue)
+/// hold all of them, and are the same from frame to frame.
+pub(crate) fn exact_for(address: u64, len: u64, sixteen: Option<(u64, u64)>) -> Option<Arc<Shadow>> {
+    if let Some(span) = sixteen
+        && exact_windows()
+        && let Some(shadow) = windows16::get(address, len, span)
+    {
+        return Some(shadow);
+    }
+    exact(address, len)
+}
+
+fn exact_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_EXACT_WINDOWS").is_some_and(|v| v != "0");
+        tracing::info!(on, "small buffer views off 16 bytes of their copy share window copies by residue (VICTORY_EXACT_WINDOWS)");
+        on
+    })
+}
+
+/// The window copies of [`exact_for`].
+mod windows16 {
+    use super::*;
+
+    /// A window's step, and what it holds past it: a view of up to `SLACK`
+    /// bytes that begins in a step is inside its window.
+    const STEP: u64 = 1 << 20;
+    const SLACK: u64 = 256 << 10;
+    /// The most windows (then views get copies of their own again).
+    const MOST: usize = 512;
+
+    static WINDOWS: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+
+    /// Since the last frame line: askings answered, windows made.
+    pub(super) static STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    pub(super) fn count() -> usize {
+        WINDOWS.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The window holding `[address, address + len)` at a multiple of 16
+    /// from its start, inside the title buffer `span`.
+    pub(super) fn get(address: u64, len: u64, (base, bytes): (u64, u64)) -> Option<Arc<Shadow>> {
+        if len == 0 || len > SLACK || !address.is_multiple_of(4) {
+            return None;
+        }
+        let r = address % 16;
+        let start = ((address - r) & !(STEP - 1)).max(base.next_multiple_of(16)) + r;
+        let end = (start + STEP + SLACK).min(base + bytes);
+        if start > address || address + len > end {
+            return None;
+        }
+        let found = |map: &BTreeMap<u64, Arc<Shadow>>| {
+            map.get(&start).filter(|s| s.start + s.len >= address + len).map(|s| {
+                s.used.store(crate::host::moment(), Ordering::Relaxed);
+                s.clone()
+            })
+        };
+        if let Some(shadow) = found(&WINDOWS.read().unwrap_or_else(|e| e.into_inner())) {
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
+        }
+        if count() >= MOST {
+            return None;
+        }
+        let len = end - start;
+        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64 << 10))?;
+        let mut map = WINDOWS.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = found(&map) {
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            drop(map);
+            drop(buffer);
+            return Some(shadow);
+        }
+        crate::host::name(&buffer, || format!("title views from {start:#x}+{len:#x}, a window"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
+        map.insert(start, shadow.clone());
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        STATS[1].fetch_add(1, Ordering::Relaxed);
+        Some(shadow)
+    }
+}
+
 /// Whether [`exact`] keeps its copies in [`pooled`]'s shards
 /// (`VICTORY_EXACT_POOL=1`; off by default until measured).
 fn exact_pool() -> bool {
@@ -6029,6 +6127,13 @@ pub(crate) fn exact_line(frames: f64) {
     }
     let kept = if exact_pool() { pooled::kept() } else { EXACT.read().unwrap_or_else(|e| e.into_inner()).len() };
     let [fresh, released] = [0, 1].map(|i| POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [windowed, windows_made] = [0, 1].map(|i| windows16::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if exact_windows() {
+        tracing::info!(
+            "small views off 16 bytes per frame (VICTORY_EXACT_WINDOWS): {windowed:.1} found in a window copy, {windows_made:.2} windows made, {} windows",
+            windows16::count()
+        );
+    }
     let spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
