@@ -3105,6 +3105,11 @@ impl Deferred {
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            RECORD_CLEARED[0].fetch_add(1, Ordering::Relaxed);
+            RECORD_CLEARED[1].fetch_add(self.refreshed.len() as u64, Ordering::Relaxed);
+        }
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
@@ -4528,6 +4533,8 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::picked::log(frames);
+    #[cfg(feature = "diagnostics")]
+    ranged_line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
@@ -8379,7 +8386,11 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    if title_write_range() {
+                        batch.title_written(Some(&crate::watch::written_ranges(dst, len)));
+                    } else {
+                        batch.title_written(None);
+                    }
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
@@ -8411,7 +8422,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written(None);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8432,7 +8443,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                        batch.title_written(None);
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -9077,6 +9088,101 @@ mod written_spans_tests {
     }
 }
 
+/// Whether a copy of ours into title memory drops only the refreshes done
+/// ahead that it overlaps (`VICTORY_TITLE_WRITE_RANGE=1`; off by default:
+/// every one of them, and the refreshes after it are asked again). After
+/// Kemerd/VIctory-NVIDIA-RT e994b9005 by Kemerd.
+///
+/// The lists copy title buffers into title memory some 3,000 times a frame
+/// in Series X, a few hundred bytes each; each such copy dropped every
+/// range brought up to date ahead ([`Batch::refresh_ahead`],
+/// [`Batch::refresh_front`]), so the same ranges were looked at again,
+/// mostly to find nothing new. A range none of whose pages the copy writes
+/// (its own address widened to pages, and every other address the title
+/// shows those pages at) is as it was refreshed. Read once.
+fn title_write_range() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_WRITE_RANGE"))
+}
+
+/// Since the last frame-rate line, of [`title_write_range`]: copies of ours
+/// into title memory that dropped by range, refreshes done ahead they left
+/// standing, and those they dropped.
+#[cfg(feature = "diagnostics")]
+static RANGED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line, at recording: title writes of a list that
+/// forgot the ranges it had refreshed (`Deferred::title_written`), and the
+/// ranges they forgot (each pushed again as a step if the list names it again).
+#[cfg(feature = "diagnostics")]
+static RECORD_CLEARED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Logs [`RANGED`] and [`RECORD_CLEARED`] per frame and starts again.
+#[cfg(feature = "diagnostics")]
+fn ranged_line(frames: f64) {
+    let r: [u64; 2] = std::array::from_fn(|i| RECORD_CLEARED[i].swap(0, Ordering::Relaxed));
+    tracing::info!(
+        "title writes at recording, per frame: {:.0} made their list forget {:.0} ranges it had refreshed",
+        r[0] as f64 / frames.max(1.0),
+        r[1] as f64 / frames.max(1.0)
+    );
+    let c: [u64; 3] = std::array::from_fn(|i| RANGED[i].swap(0, Ordering::Relaxed));
+    if c[0] == 0 {
+        return;
+    }
+    let frames = frames.max(1.0);
+    tracing::info!(
+        "title writes of ours that dropped refreshes done ahead by range, per frame (VICTORY_TITLE_WRITE_RANGE=1): {:.0} writes, {:.0} refreshes left standing, {:.0} dropped",
+        c[0] as f64 / frames,
+        c[1] as f64 / frames,
+        c[2] as f64 / frames
+    );
+}
+
+/// Drops the entries of `ahead` whose range overlaps one of `ranges` (a title
+/// write's pages), and says how many it dropped: the others are still as
+/// they were refreshed.
+fn keep_outside(ahead: &mut ByCopy<(usize, usize)>, ranges: &[(usize, usize)]) -> usize {
+    let before = ahead.len();
+    if ranges.is_empty() {
+        return 0;
+    }
+    ahead.retain(|_, &mut (from, to)| !ranges.iter().any(|&(a, b)| from < b && a < to));
+    before - ahead.len()
+}
+
+#[cfg(test)]
+mod keep_tests {
+    use super::{ByCopy, keep_outside};
+
+    /// Three entries (by number): 100..200, 300..400 and 500..600.
+    fn entries() -> ByCopy<(usize, usize)> {
+        [(1, (100, 200)), (2, (300, 400)), (3, (500, 600))].into_iter().collect()
+    }
+
+    #[test]
+    fn entries_clear_of_the_ranges_are_kept_and_the_rest_dropped() {
+        let mut ahead = entries();
+        assert_eq!(keep_outside(&mut ahead, &[(350, 360), (450, 520)]), 2);
+        assert_eq!(ahead.keys().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn an_entry_that_only_touches_a_ranges_end_is_kept() {
+        let mut ahead = entries();
+        assert_eq!(keep_outside(&mut ahead, &[(50, 100), (200, 250)]), 0);
+        assert_eq!(ahead.len(), 3);
+    }
+
+    #[test]
+    fn a_range_over_everything_drops_everything_and_none_nothing() {
+        let mut ahead = entries();
+        assert_eq!(keep_outside(&mut ahead, &[]), 0);
+        assert_eq!(keep_outside(&mut ahead, &[(0, 1000)]), 3);
+        assert!(ahead.is_empty());
+    }
+}
+
 /// Whether the fills of a submission's upload memory are done together on
 /// several threads (`VICTORY_WIDE_FILLS=0`: one after the other, where the
 /// lists name them).
@@ -9178,9 +9284,28 @@ impl Batch {
 
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    ///
+    /// The title bytes of an entry of `ahead` stay as refreshed while no
+    /// write of ours touches their pages, so with `VICTORY_TITLE_WRITE_RANGE`
+    /// a write that says what it writes (`over`, [`crate::watch::written_ranges`])
+    /// drops only the entries that overlap it. A step of ours may write
+    /// anywhere and passes `None`: everything goes, as before.
+    fn title_written(&mut self, over: Option<&[(usize, usize)]>) {
         self.flush();
-        self.ahead.clear();
+        match over {
+            Some(ranges) if title_write_range() => {
+                let dropped = keep_outside(&mut self.ahead, ranges);
+                #[cfg(feature = "diagnostics")]
+                {
+                    RANGED[0].fetch_add(1, Ordering::Relaxed);
+                    RANGED[1].fetch_add(self.ahead.len() as u64, Ordering::Relaxed);
+                    RANGED[2].fetch_add(dropped as u64, Ordering::Relaxed);
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = dropped;
+            }
+            _ => self.ahead.clear(),
+        }
         self.textures.clear();
     }
 
@@ -12061,7 +12186,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_written(None);
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.

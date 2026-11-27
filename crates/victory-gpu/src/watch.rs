@@ -674,6 +674,26 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// The pages a write of ours at `[at, at + len)` touches, as (from, to)
+/// title addresses on page lines, unjoined: the range widened to whole pages,
+/// then one page for each other address [`elsewhere`] shows them at. These
+/// are the pages [`wrote`] notes in the journal. Empty for `len == 0`. (After
+/// Kemerd/VIctory-NVIDIA-RT e994b9005 by Kemerd.)
+pub(crate) fn written_ranges(at: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let end = at.saturating_add(len);
+    let mut ranges = vec![(at / PAGE * PAGE, end.div_ceil(PAGE) * PAGE)];
+    for (_, others) in elsewhere(at, len) {
+        for other in others {
+            let from = other / PAGE * PAGE;
+            ranges.push((from, from + PAGE));
+        }
+    }
+    ranges
+}
+
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {

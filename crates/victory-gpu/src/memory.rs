@@ -250,6 +250,28 @@ pub(crate) struct Ready {
     pub(crate) base: u32,
 }
 
+/// Of [`Memory::bring_up`] since the last report: lists it was called for,
+/// and copies those lists were given a refresh step of each (one step per
+/// copy and list: the steps every walk over a submission goes through).
+static BROUGHT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Memory {
+    /// Logs [`BROUGHT`] per frame at the report's pace and starts again.
+    fn report_brought(&self) {
+        let Some((since, frame)) = self.stats.from else {
+            return;
+        };
+        if std::time::Instant::now().duration_since(since).as_secs_f64() < 10.0 {
+            return;
+        }
+        let frames = self.frame.wrapping_sub(frame).max(1) as f64;
+        let [lists, steps] = [0, 1].map(|i| BROUGHT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "title memory by address, per frame: {lists:.1} lists brought every copy up to date, {steps:.0} refresh steps for it in the lists"
+        );
+    }
+}
+
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
@@ -823,6 +845,8 @@ impl Memory {
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
     fn bring_up(&self, list: &HostList) {
+        BROUGHT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BROUGHT[1].fetch_add(self.copies.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let push = push();
         if !push {
             let (start, len) = self.directory.1.span();
@@ -840,6 +864,7 @@ impl Memory {
 
     /// Every ten seconds or so, what was used.
     fn report(&mut self) {
+        self.report_brought();
         let now = std::time::Instant::now();
         let (since, frame) = *self.stats.from.get_or_insert((now, self.frame));
         if now.duration_since(since).as_secs_f64() < 10.0 {
