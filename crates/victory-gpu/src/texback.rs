@@ -215,9 +215,44 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    // (One larger than 8 MiB is not kept.)
+    if keep() && size <= 8 << 20 {
+        KEPT.with_borrow_mut(|tiled| {
+            if tiled.len() < size {
+                tiled.resize(size, 0);
+            }
+            land_into(back, at, &mut tiled[..size]);
+        });
+    } else {
+        land_into(back, at, &mut vec![0u8; size]);
+    }
+    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if copied == 1 || copied.is_multiple_of(128) {
+        tracing::info!(copied, bytes = size, "texture readback landed");
+    }
+}
+
+/// `VICTORY_TEXBACK_KEEP=1`: the bytes a texture is tiled into before it
+/// goes to the title are a buffer each landing thread keeps, not one made
+/// and freed per texture. About 20 textures of 256-512 KiB land a frame;
+/// blocks that size come from the kernel each time (zeroed pages, faults)
+/// and the making and freeing took most of the 8 ms a frame the
+/// read-backs did (rays on). Every byte of the part used is read from the
+/// title before anything is tiled into it, so what was there before does
+/// not matter.
+fn keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_KEEP").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    static KEPT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn land_into(back: &Back, at: usize, tiled: &mut [u8]) {
+    let size = tiled.len();
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
     let mut data = std::ptr::null_mut();
@@ -234,7 +269,7 @@ pub(crate) fn land(back: &Back) {
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        if let Err(e) = back.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
@@ -245,10 +280,6 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-    if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
-    }
 }
 
 

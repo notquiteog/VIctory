@@ -594,6 +594,18 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
+/// `VICTORY_LAND_AFTER=1`: a landing gives the line back (the waiters
+/// for flights to land go on) before it gives back the landed lists'
+/// descriptor slots and drops what waited for submissions to finish
+/// ([`bury`]); both only give back, and took about 12 ms a frame of a
+/// landing the line waited for (rays on). Nothing the title or a later
+/// submission reads moves: the read-backs, the title's values and the
+/// shadows' ranges are done before, as they were.
+fn land_after() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_AFTER").is_some_and(|v| v == "1"))
+}
+
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
@@ -5142,8 +5154,11 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
-        // SAFETY: a plain query on this queue's fence.
-        release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
+        let after = land_after();
+        if !after {
+            // SAFETY: a plain query on this queue's fence.
+            release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5220,7 +5235,9 @@ impl Host {
                         own.landed();
                     }
                     let mut lists = flight.lists;
-                    crate::list::tables_landed(&mut lists);
+                    if !after {
+                        crate::list::tables_landed(&mut lists);
+                    }
                     landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
@@ -5236,7 +5253,9 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            if !after {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -5255,7 +5274,9 @@ impl Host {
                 landing,
                 ..
             } = &mut *line;
-            kept.extend(landed);
+            if !after {
+                kept.extend(landed.drain(..));
+            }
             in_hand.clear();
             landing.clear();
             // What is still in the air, from the flights that are.
@@ -5273,10 +5294,29 @@ impl Host {
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
-            *poke = true;
+            *poke = !after;
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        if after {
+            // The line is free; what only gives back follows.
+            let _giving = crate::timeline::span("landing: slots and the buried given back, after telling");
+            for (lists, _) in &mut landed {
+                for list in lists.iter_mut() {
+                    list.release_tables();
+                }
+                crate::list::tables_landed(lists);
+            }
+            if last > 0 {
+                bury(last);
+            }
+            {
+                let mut line = line();
+                line.landed.extend(landed);
+                line.poke = true;
+            }
+            LINE_MOVED.notify_all();
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
