@@ -109,7 +109,7 @@ To uninstall
 Where things are
   Program:              %LOCALAPPDATA%\Programs\VI
   Settings, saves, cache: %LOCALAPPDATA%\VIctory
-  Logs:                 %LOCALAPPDATA%\VIctory\logs  (the "Open log folder" button on the Play tab)
+  Logs:                 %LOCALAPPDATA%\VIctory\logs  (the "Open the logs folder" button on the Play tab)
 
 Source and licence (GPL-3.0-or-later, see LICENSE): https://github.com/$Repo
 "@ | Set-Content (Join-Path $stage 'README.txt') -Encoding ascii
