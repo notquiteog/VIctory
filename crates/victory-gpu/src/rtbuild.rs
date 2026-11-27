@@ -970,6 +970,37 @@ pub(crate) fn host_structure(address: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The walk's choice of vertices (`rtbuild.hlsl`, `emit_triangle`),
+    /// in Rust: the same table and arithmetic.
+    fn walk_vertices(words: &[u32; 28], k: u32) -> [[f32; 3]; 3] {
+        let map = [0x210u32, 0x231, 0x432, 0x042][k as usize];
+        let id = words[15] >> (8 * k);
+        let (i, j) = (id & 3, id >> 2 & 3);
+        let first = 3u32.wrapping_sub(i).wrapping_sub(j) & 3;
+        [first, i, j].map(|n| {
+            let v = (map >> (4 * n) & 0xf) as usize;
+            std::array::from_fn(|c| f32::from_bits(words[3 * v + c]))
+        })
+    }
+
+    #[test]
+    fn the_walk_takes_the_vertices_the_console_weighs() {
+        let mut words = [0u32; 28];
+        for (n, w) in words.iter_mut().enumerate().take(15) {
+            *w = (n as f32 + 1.0).to_bits();
+        }
+        for k in 0..4 {
+            for id in 0..16u32 {
+                words[15] = id << (8 * k);
+                assert_eq!(
+                    walk_vertices(&words, k),
+                    victory_shader::bvh::triangle_vertices(&words, k),
+                    "triangle {k}, id {id:#x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_walk_compiles() {
         for entry in [s!("gather"), s!("extract")] {
