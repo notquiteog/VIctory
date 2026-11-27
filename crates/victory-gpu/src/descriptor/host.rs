@@ -1332,7 +1332,61 @@ fn view_home(
     if !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
+    #[cfg(feature = "diagnostics")]
+    off_views::seen(shadow.span(), offset, len, stride, raw, format);
     crate::shadow::exact(start, len).unwrap_or(shadow)
+}
+
+/// Which title buffers get views off their copy's elements, and of what
+/// shape (diagnostics builds): one asking in 64 is counted, by the buffer
+/// (start, bytes) and the view (bytes, stride, raw, format), with the
+/// offsets seen; the most counted are logged with the frame line
+/// ([`off_views::line`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) mod off_views {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    type Key = (u64, u64, u64, u32, bool, u32);
+    /// Count, lowest and highest offset, distinct offsets (up to 64).
+    type Seen = (u64, u64, u64, Vec<u64>);
+    static SEEN: Mutex<Option<HashMap<Key, Seen>>> = Mutex::new(None);
+    static TICK: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn seen(buffer: (u64, u64), offset: u64, len: u64, stride: u32, raw: bool, format: u32) {
+        if !TICK.fetch_add(1, Relaxed).is_multiple_of(64) {
+            return;
+        }
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.get_or_insert_with(HashMap::new).entry((buffer.0, buffer.1, len, stride, raw, format)).or_insert((0, u64::MAX, 0, Vec::new()));
+        e.0 += 1;
+        e.1 = e.1.min(offset);
+        e.2 = e.2.max(offset);
+        if e.3.len() < 64 && !e.3.contains(&offset) {
+            e.3.push(offset);
+        }
+    }
+
+    /// The most counted since the last line.
+    pub(crate) fn line() {
+        let Some(seen) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        let mut all: Vec<_> = seen.into_iter().collect();
+        all.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        let total: u64 = all.iter().map(|a| a.1.0).sum();
+        let text: Vec<String> = all
+            .iter()
+            .take(10)
+            .map(|((start, bytes, len, stride, raw, format), (n, lo, hi, offsets))| {
+                format!(
+                    "{n}/{total} buffer {start:#x}+{bytes:#x} view {len} bytes stride {stride} raw {raw} f{format} at {lo:#x}..{hi:#x} ({}{} offsets)",
+                    offsets.len(),
+                    if offsets.len() >= 64 { "+" } else { "" }
+                )
+            })
+            .collect();
+        tracing::info!("views off their copy's elements, by buffer and shape (1 in 64 asked): {}", text.join(" | "));
+    }
 }
 
 /// For device-removed reports: what the slots of the title's view heap that

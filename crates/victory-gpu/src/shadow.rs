@@ -5766,6 +5766,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
+    if exact_pool() {
+        return pooled::exact(address, len);
+    }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
     let found = |map: &BTreeMap<(u64, u64), ExactCopy>| {
@@ -5787,7 +5790,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     };
     let (buffer, data) = match taken {
         Some((_, buffer, data)) => (buffer, data as *mut u8),
-        None => host()?.shared_buffer(width)?,
+        None => {
+            POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+            host()?.shared_buffer(width)?
+        }
     };
     let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
     // Another thread made it meanwhile: its copy, and this buffer for the next.
@@ -5835,18 +5841,199 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 
+/// Whether [`exact`] keeps its copies in [`pooled`]'s shards
+/// (`VICTORY_EXACT_POOL=1`; off by default until measured).
+fn exact_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_EXACT_POOL").is_some_and(|v| v != "0");
+        tracing::info!(on, "copies of buffer views' own bytes in shards, swept a little at a time (VICTORY_EXACT_POOL)");
+        on
+    })
+}
+
+/// [`exact`] with its copies in shards, each swept every few copies made
+/// (`VICTORY_EXACT_POOL=1`).
+///
+/// Why (profile rc-prof, walking, Series X, 2026-11-26): of the 680 ms a
+/// frame the eight recording threads worked, 282 were in [`exact`]: 140
+/// waiting for its one lock and 110 making committed buffers. About 9,300
+/// askings and 900 new copies a frame (ring positions change every frame).
+/// The whole map was swept under the write lock every few thousand copies
+/// made: the copies it let go past the spare buffers' limit released their
+/// buffers there (the driver's frees), with every reader waiting; and in
+/// between, the spare buffers ran out and the recording threads made new
+/// ones. Here a shard is swept every [`SWEEP_EVERY`] copies made in it: the
+/// idle copies are found under its shared lock, taken out under its own
+/// lock (looked at again there), and their buffers go back to the spares or
+/// are released after every lock is let go. So buffers come back about as
+/// fast as copies are made, and nearly every copy finds a spare one.
+mod pooled {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    const SHARDS: usize = 32;
+    /// Copies made in a shard between its sweeps.
+    const SWEEP_EVERY: usize = 48;
+    /// Askings (all shards) an idle copy stays for.
+    const LATELY: u64 = 512;
+    /// The most spare buffers kept.
+    const SPARE_MOST: usize = 4096;
+
+    struct Shard {
+        map: RwLock<BTreeMap<(u64, u64), ExactCopy>>,
+        made: AtomicUsize,
+        sweeping: AtomicBool,
+    }
+
+    static SHARD: [Shard; SHARDS] = [const {
+        Shard { map: RwLock::new(BTreeMap::new()), made: AtomicUsize::new(0), sweeping: AtomicBool::new(false) }
+    }; SHARDS];
+
+    fn shard(address: u64, len: u64) -> &'static Shard {
+        let h = (address ^ len.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &SHARD[(h >> 58) as usize % SHARDS]
+    }
+
+    fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The copies kept now, all shards.
+    pub(super) fn kept() -> usize {
+        SHARD.iter().map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len()).sum()
+    }
+
+    /// Nobody holds it but the map, and it was not asked for lately.
+    fn idle(copy: &ExactCopy, now: u64) -> bool {
+        Arc::strong_count(&copy.shadow) == 1
+            && copy.used.load(Ordering::Relaxed) + LATELY <= now
+            && crate::host::references(&copy.shadow.buffer) <= 1
+    }
+
+    pub(super) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+        EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+        let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+        let shard = shard(address, len);
+        let found = |map: &BTreeMap<(u64, u64), ExactCopy>| {
+            map.get(&(address, len)).map(|copy| {
+                copy.used.store(now, Ordering::Relaxed);
+                copy.shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+                copy.shadow.clone()
+            })
+        };
+        if let Some(shadow) = found(&shard.map.read().unwrap_or_else(|e| e.into_inner())) {
+            return Some(shadow);
+        }
+        let width = len.next_multiple_of(64 << 10);
+        let taken = {
+            let mut spare = held(&EXACT_SPARE);
+            spare.iter().rposition(|(w, ..)| *w == width).map(|i| spare.swap_remove(i))
+        };
+        let (buffer, data) = match taken {
+            Some((_, buffer, data)) => (buffer, data as *mut u8),
+            None => {
+                POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                host()?.shared_buffer(width)?
+            }
+        };
+        let shadow = {
+            let mut map = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            match found(&map) {
+                Some(shadow) => Err(shadow),
+                None => {
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    let shadow = Arc::new(Shadow::new(buffer.clone(), data, gpu, address, len));
+                    map.insert((address, len), ExactCopy { shadow: shadow.clone(), used: AtomicU64::new(now) });
+                    Ok(shadow)
+                }
+            }
+        };
+        let shadow = match shadow {
+            // Another thread made it meanwhile: this buffer for the next.
+            Err(shadow) => {
+                let mut spare = held(&EXACT_SPARE);
+                if spare.len() < SPARE_MOST {
+                    spare.push((width, buffer, data as usize));
+                }
+                return Some(shadow);
+            }
+            Ok(shadow) => shadow,
+        };
+        drop(buffer);
+        crate::host::name(&shadow.buffer, || format!("title view {address:#x}+{len:#x}"));
+        EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        OWN_MADE.fetch_add(1, Ordering::Relaxed);
+        if shard.made.fetch_add(1, Ordering::Relaxed) + 1 >= SWEEP_EVERY && !shard.sweeping.swap(true, Ordering::Acquire) {
+            shard.made.store(0, Ordering::Relaxed);
+            sweep(shard, now);
+            shard.sweeping.store(false, Ordering::Release);
+        }
+        Some(shadow)
+    }
+
+    /// Lets the idle copies of `shard` go: found under its shared lock, taken
+    /// out under its own, their buffers spared or released after both.
+    fn sweep(shard: &Shard, now: u64) {
+        let idle_keys: Vec<(u64, u64)> = {
+            let map = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            map.iter().filter(|(_, c)| idle(c, now)).map(|(k, _)| *k).collect()
+        };
+        if idle_keys.is_empty() {
+            return;
+        }
+        let gone: Vec<ExactCopy> = {
+            let mut map = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut gone = Vec::new();
+            for k in &idle_keys {
+                if map.get(k).is_some_and(|c| idle(c, now))
+                    && let Some(copy) = map.remove(k)
+                {
+                    gone.push(copy);
+                }
+            }
+            gone
+        };
+        let mut released = Vec::new();
+        {
+            let mut spare = held(&EXACT_SPARE);
+            for copy in gone {
+                let shadow = &copy.shadow;
+                if spare.len() < SPARE_MOST && shadow.card.is_none() && shadow.place.is_none() && !shadow.mapped {
+                    spare.push((shadow.width(), shadow.buffer.clone(), shadow.data as usize));
+                } else {
+                    POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+                }
+                released.push(copy);
+            }
+        }
+        // (The copies, and the buffers not spared, go here: outside every lock.)
+        drop(released);
+    }
+}
+
+/// Since the last frame line ([`pooled`]): buffers made because no spare
+/// one fitted, and buffers released because the spares were full.
+static POOL_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    #[cfg(feature = "diagnostics")]
+    crate::descriptor::host::off_views::line();
     if asked == 0 {
         return;
     }
-    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
+    let kept = if exact_pool() { pooled::kept() } else { EXACT.read().unwrap_or_else(|e| e.into_inner()).len() };
+    let [fresh, released] = [0, 1].map(|i| POOL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; {spare} spare buffers, \
+         {fresh:.1} buffers made and {released:.1} released per frame (VICTORY_EXACT_POOL)",
         asked as f64 / frames,
         made as f64 / frames
     );
