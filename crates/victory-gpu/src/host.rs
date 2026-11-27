@@ -66,6 +66,32 @@ unsafe impl Sync for Host {}
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
 static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+/// [`RETIRED`] in shards by thread ([`retire_shards`]): eight recording
+/// threads letting go of what their tables' slots viewed stood in one lock.
+static RETIRED_SHARDS: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; 16];
+
+/// Whether [`retire`] puts objects in the calling thread's shard of
+/// [`RETIRED_SHARDS`] in place of the one [`RETIRED`]
+/// (`VICTORY_RETIRE_SHARDS=1`, off by default). [`bury`] drains them all;
+/// within a shard the numbers come in order as in the one queue.
+fn retire_shards() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RETIRE_SHARDS").is_some_and(|v| v == "1");
+        tracing::info!(on, "objects let go are queued by thread (VICTORY_RETIRE_SHARDS)");
+        on
+    })
+}
+
+/// The queue [`retire`] puts an object let go on.
+fn retired_queue() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    if !retire_shards() {
+        return &RETIRED;
+    }
+    thread_local! { static SHARD: usize = { static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0); NEXT.fetch_add(1, Ordering::Relaxed) % 16 }; }
+    &RETIRED_SHARDS[SHARD.with(|s| *s)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -574,7 +600,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired_queue()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -590,7 +616,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retired_queue().lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
 /// A landing gives the line back (the waiters for flights to land go on)
@@ -625,15 +651,17 @@ fn bury_lag() -> u64 {
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let drain = |queue: &Mutex<std::collections::VecDeque<(u64, Retired)>>| -> Vec<(u64, Retired)> {
+        let mut retired = queue.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
         retired.drain(..n).collect()
     };
-    drop(done);
+    drop(drain(&RETIRED));
+    if retire_shards() {
+        for shard in &RETIRED_SHARDS {
+            drop(drain(shard));
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
