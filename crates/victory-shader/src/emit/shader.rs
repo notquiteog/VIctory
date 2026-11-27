@@ -75,6 +75,11 @@ pub fn constant_marks() -> bool {
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// The root SRV `t<SLOT_TLAS>` in [`ROOT_CBV_SPACE`]: the host's top-level
+/// ray-tracing structure that a walk translated as an inline ray query traces
+/// (`VICTORY_RT_HARDWARE`, `super::rayquery`; after Linox-IDK/VIctory
+/// 44280ad213).
+pub const SLOT_TLAS: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
@@ -147,6 +152,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// Inline ray queries (ray-tracing tier 1.1).
+    pub const RAYTRACING_1_1: u64 = 1 << 25;
 }
 
 pub(crate) struct Types {
@@ -722,23 +729,39 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                    // 16: a ray-tracing structure (the host's top level); 11: a raw buffer.
+                    let tlas = slot == SLOT_TLAS;
+                    let (var, shape) = if tlas {
+                        let rtas = self.m.named_struct("struct.RaytracingAccelerationStructure", vec![self.t.i32]);
+                        let rtas = self.m.ptr(rtas);
+                        (self.m.undef(rtas), 16)
+                    } else {
+                        (u, 11)
+                    };
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
-                        Some(self.m.md_value(u)),
+                        Some(self.m.md_value(var)),
                         Some(empty),
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
-                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, shape)),
                         Some(i32c(&mut self, 0)),
-                        None,
+                        // A ray-tracing structure: element type (tag 0) u32 (5).
+                        if tlas {
+                            let tag = i32c(&mut self, 0);
+                            let u32k = i32c(&mut self, 5);
+                            Some(self.m.md_node(vec![Some(tag), Some(u32k)]))
+                        } else {
+                            None
+                        },
                     ];
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
-                        dxil_kind: 11,
+                        dxil_kind: shape,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
@@ -1009,6 +1032,10 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
+        }
+        // D3D_SHADER_FEATURE_RAYTRACING_TIER_1_1.
+        if self.flags & flags::RAYTRACING_1_1 != 0 {
+            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         // A validator for shader model 6.7 compares signature parts byte for byte with

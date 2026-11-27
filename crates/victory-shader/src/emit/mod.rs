@@ -96,6 +96,9 @@ mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+mod rayquery;
+#[cfg(test)]
+mod rayquery_tests;
 mod rect;
 mod sampler;
 mod shader;
