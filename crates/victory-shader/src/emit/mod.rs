@@ -87,6 +87,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod float_atomic_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -213,6 +215,19 @@ pub fn group_sync() -> u8 {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether a float atomic minimum or maximum on title memory
+/// (`global_atomic_fmin`, `_fmax`) is one integer atomic operation on its bits
+/// (`lower.rs` `float_atomic_by_ints`); `VICTORY_FLOAT_ATOMIC_INTS=0`: a loop
+/// of compare-exchanges, as before. The structure builder's programs gather
+/// the bounds of what they build so, one lane of each wave on the same six
+/// dwords: under that contention each wave's loop failed again and again
+/// while thousands of others got in between. Part of the translation: the
+/// shader cache keys on it.
+pub fn float_atomic_ints() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLOAT_ATOMIC_INTS").is_none_or(|v| v != "0"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near

@@ -40,6 +40,8 @@ thread_local! {
     /// The tests' way to translate as with `VICTORY_BVH_NO_HIT=1`
     /// ([`no_hit`]).
     pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tests' choice for [`node_once`].
+    pub(in crate::emit) static TEST_NODE_ONCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a node test answers "no hit" and reads nothing
@@ -64,6 +66,24 @@ fn no_hit() -> bool {
     }
     std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
         && !crate::bvh_builder_on()
+}
+
+/// Whether a node test reads the node's first 64 bytes at once, before it
+/// looks at the node's kind (`VICTORY_BVH_NODE_ONCE=0`: each kind reads its
+/// own dwords in its own branch, as before). Every kind's dwords are in those
+/// 64 bytes but a 32-bit box node's last twelve, and they lie in one page of
+/// title memory. Read in the branches, a wave whose lanes are at nodes of
+/// several kinds waited for memory once for each kind, and a triangle's
+/// vertices were read only after the dword that says which they are: three
+/// waits for memory one after another (the directory, that dword, the
+/// vertices) where the hardware has one.
+fn node_once() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NODE_ONCE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_NODE_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// Where the instruction's node is.
@@ -233,6 +253,9 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        // The first 64 bytes, for every kind ([`node_once`]).
+        let first: Option<Vec<V>> = (node_once() && !bvh_miss()).then(|| self.bvh_node_words(at, None, 0, 16));
+        let head = self.cur;
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -248,7 +271,7 @@ impl<'a> Lower<'a> {
         let boxes = if bvh_miss() {
             [self.s.m.i32(bvh::NONE); 4]
         } else {
-            self.bvh_boxes(at, kind, &ray, sort)
+            self.bvh_boxes(at, kind, &ray, sort, first.as_deref())
         };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
@@ -256,7 +279,7 @@ impl<'a> Lower<'a> {
         let triangle = if bvh_miss() {
             bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
         } else {
-            self.bvh_triangle(at, kind, &ray)
+            self.bvh_triangle(at, kind, &ray, first.as_deref())
         };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
@@ -394,9 +417,13 @@ impl<'a> Lower<'a> {
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
-    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+    /// `pre`: the node's first sixteen dwords, read already.
+    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool, pre: Option<&[V]>) -> [V; 4] {
         let head = self.cur;
-        let children = self.bvh_node_words(at, None, 0, 4);
+        let children = match pre {
+            Some(w) => w[..4].to_vec(),
+            None => self.bvh_node_words(at, None, 0, 4),
+        };
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -411,7 +438,10 @@ impl<'a> Lower<'a> {
         // again (DexNom/VIctory#21).
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = match pre {
+            Some(w) => w[4..].to_vec(),
+            None => self.bvh_node_words(at, None, 16, 12),
+        };
         let first: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         let floats = |l: &mut Self, at: NodeAt| -> (Vec<V>, usize) {
             let words = l.bvh_node_words(at, None, 0, 12);
@@ -452,7 +482,10 @@ impl<'a> Lower<'a> {
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = match pre {
+            Some(w) => w[4..].to_vec(),
+            None => self.bvh_node_words(at, None, 16, 12),
+        };
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
@@ -565,12 +598,16 @@ impl<'a> Lower<'a> {
 
     /// The triangle test ([`bvh::triangle`] of [`bvh::triangle_vertices`]):
     /// four result dwords, made in the current block.
-    fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
+    /// `pre`: the node's first sixteen dwords, read already.
+    fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray, pre: Option<&[V]>) -> [V; 4] {
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         // The triangle's byte of the dword at byte 60: which of its
         // vertices barycentric I and J weigh.
-        let id = self.bvh_node_words(at, None, 60, 1)[0];
+        let id = match pre {
+            Some(w) => w[15],
+            None => self.bvh_node_words(at, None, 60, 1)[0],
+        };
         let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
@@ -596,8 +633,25 @@ impl<'a> Lower<'a> {
             let nibble = self.s.m.bin(c, Bin::Shl, n, k2);
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
-            let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
-            let words = self.bvh_node_words(at, Some(byte), 0, 3);
+            let words = match pre {
+                // One of the node's five vertices, dwords 3v to 3v + 2: the
+                // vertex numbers the maps hold are 0-4.
+                Some(w) => (0..3)
+                    .map(|a| {
+                        let mut x = w[12 + a];
+                        for v in (0..4).rev() {
+                            let kv = k(self, v as u32);
+                            let is = self.s.m.cmp(c, pred::EQ, vertex, kv);
+                            x = self.s.m.select(c, is, w[3 * v + a], x);
+                        }
+                        x
+                    })
+                    .collect(),
+                None => {
+                    let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
+                    self.bvh_node_words(at, Some(byte), 0, 3)
+                }
+            };
             // Relative to the ray's origin.
             let r: Vec<V> = (0..3)
                 .map(|a| {

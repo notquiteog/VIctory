@@ -1561,6 +1561,25 @@ pub(super) fn heap_handles_local() -> bool {
     set.unwrap_or_else(|| HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The tests' stand-in for title memory read and written by address
+    /// ([`Lower::memory`]): a heap slot holding a raw UAV, and the title
+    /// address of its first byte.
+    pub(super) static TEST_MEMORY_UAV: std::cell::Cell<Option<(u32, u64)>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`float_atomic_ints`], for its thread only.
+    pub(super) static TEST_FLOAT_ATOMIC_INTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`super::float_atomic_ints`], or a test's choice.
+fn float_atomic_ints() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FLOAT_ATOMIC_INTS.get() {
+        return on;
+    }
+    super::float_atomic_ints()
+}
+
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tells the translator that the host's shaders run on AMD RDNA hardware
@@ -3776,6 +3795,24 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+        #[cfg(test)]
+        if let Some((slot, base)) = TEST_MEMORY_UAV.get() {
+            // The tests' stand-in: the raw UAV at heap slot `slot` holds
+            // title memory from `base` on; any other address reads past
+            // its end.
+            let _ = (guard, store);
+            let c = self.cur;
+            let slot = self.s.m.i32(slot);
+            let handle = self.s.heap_handle(c, slot, false, false, (11 | 0x1000, 0));
+            let (base_low, base_high) = (self.s.m.i32(base as u32), self.s.m.i32((base >> 32) as u32));
+            let at = self.s.m.bin(c, Bin::Sub, lo, base_low);
+            let in_low = self.s.m.cmp(c, pred::IUGE, lo, base_low);
+            let in_high = self.s.m.cmp(c, pred::EQ, hi, base_high);
+            let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
+            let outside = self.s.m.i32(0xffff_ff00);
+            self.page_there = Some(inside);
+            return (handle, self.s.m.select(c, inside, at, outside));
+        }
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3854,6 +3891,114 @@ impl<'a> Lower<'a> {
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// A float minimum (`min`) or maximum of the dword at `byte` of `h` and
+    /// the value `v` (its bits), as one integer atomic operation
+    /// ([`super::float_atomic_ints`]); the dword from before. A float's bits
+    /// in order as a signed integer are its order among floats of its
+    /// sign, and as an unsigned integer the reverse order among negative
+    /// ones, so a value with the sign bit clear is the signed minimum
+    /// (maximum) with the dword, one with it set the unsigned maximum
+    /// (minimum). -0 counts below +0, as the console's minimum and maximum
+    /// order them. A NaN value leaves the dword as it is (it only reads it).
+    /// A NaN already in the dword is not ordered so by its bits: where the
+    /// dword was one, a loop of compare-exchanges finishes the operation
+    /// (in the same order).
+    fn float_atomic_by_ints(&mut self, h: V, byte: V, v: V, min: bool) -> V {
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let head = self.cur;
+        let fv = self.as_float(v);
+        let nan = self.is_nan_f32(fv);
+        let zero = self.s.m.i32(0);
+        let negative = self.s.m.cmp(head, pred::SLT, v, zero);
+        let (number, nan_block, positive_block, negative_block, check, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(head, Term::CondBr(nan, nan_block, number));
+        self.s.m.terminate(number, Term::CondBr(negative, negative_block, positive_block));
+        // DXIL's atomic operations: or 2, signed minimum 4 and maximum 5,
+        // unsigned minimum 6 and maximum 7.
+        let atomic = |l: &mut Self, block: usize, code: u32, x: V| {
+            let code = l.s.m.i32(code);
+            l.s.op(block, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, code, byte, iu, iu, x])
+        };
+        let read = atomic(self, nan_block, 2, zero);
+        self.s.m.terminate(nan_block, Term::Br(join));
+        let up = atomic(self, positive_block, if min { 4 } else { 5 }, v);
+        self.s.m.terminate(positive_block, Term::Br(check));
+        let down = atomic(self, negative_block, if min { 7 } else { 6 }, v);
+        self.s.m.terminate(negative_block, Term::Br(check));
+        let was = self.s.m.phi(check, i32t);
+        self.s.m.set_phi(was, vec![(up, positive_block), (down, negative_block)]);
+        self.cur = check;
+        let fwas = self.as_float(was);
+        let was_nan = self.is_nan_f32(fwas);
+        let (fix, pass, done) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(check, Term::CondBr(was_nan, fix, join));
+        // The dword was a NaN: what is there now (the NaN, or what this or
+        // another operation put in its place) is exchanged for the value
+        // where that is a NaN or the value orders before (after) it.
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let first = self.s.op(
+            fix,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let first = self.s.m.extract(fix, first, 0);
+        self.cur = fix;
+        let first = self.as_int(first);
+        self.s.m.terminate(fix, Term::Br(pass));
+        self.cur = pass;
+        let seen = self.s.m.phi(pass, i32t);
+        let n = self.s.m.phi(pass, i32t);
+        // The value where the dword is a NaN or orders after (before) it;
+        // in that order, the bits as a signed integer with those of
+        // negative floats turned around (-0 below +0, as above).
+        let fseen = self.as_float(seen);
+        let seen_nan = self.is_nan_f32(fseen);
+        let key = |l: &mut Self, x: V| {
+            let (k31, rest) = (l.s.m.i32(31), l.s.m.i32(0x7FFF_FFFF));
+            let sign = l.s.m.bin(pass, Bin::AShr, x, k31);
+            let flip = l.s.m.bin(pass, Bin::And, sign, rest);
+            l.s.m.bin(pass, Bin::Xor, x, flip)
+        };
+        let (ks, kv) = (key(self, seen), key(self, v));
+        let better = self.s.m.cmp(pass, if min { pred::SLT } else { pred::SGT }, kv, ks);
+        let take = self.s.m.bin(pass, Bin::Or, seen_nan, better);
+        let wanted = self.s.m.select(pass, take, v, seen);
+        let found = self.s.op(
+            pass,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &[h, byte, iu, iu, seen, wanted],
+        );
+        let one = self.s.m.i32(1);
+        let n1 = self.s.m.bin(pass, Bin::Add, n, one);
+        let lost = self.s.m.cmp(pass, pred::NE, found, seen);
+        let limit = self.s.m.i32(1 << 16);
+        let more = self.s.m.cmp(pass, pred::IULT, n1, limit);
+        let again = self.s.m.bin(pass, Bin::And, lost, more);
+        self.s.m.terminate(pass, Term::CondBr(again, pass, done));
+        self.s.m.set_phi(seen, vec![(first, fix), (found, pass)]);
+        self.s.m.set_phi(n, vec![(zero, fix), (n1, pass)]);
+        self.s.m.terminate(done, Term::Br(join));
+        let result = self.s.m.phi(join, i32t);
+        self.s.m.set_phi(result, vec![(read, nan_block), (was, check), (was, done)]);
+        self.cur = join;
+        result
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -4039,6 +4184,7 @@ impl<'a> Lower<'a> {
                     &[h, code, byte, iu, iu, x],
                 )
             }
+            None if float_atomic_ints() => self.float_atomic_by_ints(h, byte, v, op == "fmin"),
             None => {
                 // A float minimum or maximum has no atomic operation on
                 // the host: the dword is exchanged for the smaller (larger)

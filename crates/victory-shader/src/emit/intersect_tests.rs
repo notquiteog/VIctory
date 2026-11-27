@@ -643,6 +643,19 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+fn the_node_test_reading_each_kind_in_its_branch_matches_the_reference_on_the_card() {
+    // `VICTORY_BVH_NODE_ONCE=0`: as before the node's first 64 bytes were
+    // read at once.
+    super::lower::intersect::TEST_NODE_ONCE.set(Some(false));
+    run(true, Descriptor::Table, u64::from(NODES), true);
+    {
+        let _memory = Memory::at(BASE);
+        run(true, WHOLE, BASE + u64::from(NODES), true);
+    }
+    super::lower::intersect::TEST_NODE_ONCE.set(None);
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));

@@ -231,9 +231,14 @@ pub(crate) fn command_took(op: &str, ms: f64) {
 fn command_key(op: &str) -> String {
     let head = op.split(" | ").next().unwrap_or(op);
     let word = head.split(' ').next().unwrap_or("");
-    match (head.find('['), head.find(']')) {
-        (Some(a), Some(b)) if a < b => format!("{word} {}", &head[a..=b]),
-        _ => head.split(' ').take(2).collect::<Vec<_>>().join(" "),
+    // The pipeline's brackets begin with a word (`[compute `): an indirect
+    // dispatch's note has its groups in brackets before them
+    // (`groups now [0, 1, 1]`), and every indirect dispatch was summed under
+    // its groups.
+    let a = head.match_indices('[').map(|(a, _)| a).find(|&a| head[a + 1..].starts_with(|c: char| c.is_ascii_alphabetic()));
+    match a.and_then(|a| head[a..].find(']').map(|b| (a, a + b))) {
+        Some((a, b)) => format!("{word} {}", &head[a..=b]),
+        None => head.split(' ').take(2).collect::<Vec<_>>().join(" "),
     }
 }
 
@@ -445,6 +450,10 @@ mod command_tests {
         assert_eq!(
             command_key("indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] | t"),
             "indirect [mesh 0750cb2d975c7563, pixel 085d374c5a795549]"
+        );
+        assert_eq!(
+            command_key("indirect kind 2 max 1 at 0x9a0 groups now [0, 1, 1] [compute 0c3b4ef2a0c8a2b1] | x"),
+            "indirect [compute 0c3b4ef2a0c8a2b1]"
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
