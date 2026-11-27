@@ -88,7 +88,10 @@ impl Task {
 
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    /// The queued tasks with the handle of the queue each was submitted
+    /// through: ports are shared (a composite queue serves on the source
+    /// queue's ports), and a queue's terminate cancels only its own.
+    tasks: Mutex<VecDeque<(usize, Task)>>,
     ready: Condvar,
 }
 
@@ -116,12 +119,12 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(&self, queue: usize, task: Task) {
         match self.mode {
             Mode::Immediate => task.run(false),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                lock(&self.tasks).push_back((queue, task));
                 self.ready.notify_one();
             }
         }
@@ -130,7 +133,7 @@ impl Port {
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
     fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+        let waiting = |t: &mut VecDeque<(usize, Task)>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
@@ -143,7 +146,7 @@ impl Port {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
-        tasks.pop_front()
+        tasks.pop_front().map(|(_, task)| task)
     }
 }
 
@@ -246,7 +249,7 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        self.ports[port as usize].submit(Arc::as_ptr(self) as usize, task);
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -360,6 +363,9 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     let Some(queue) = queue(handle) else {
         return false;
     };
+    if queue.terminated.load(Ordering::Acquire) {
+        return false;
+    }
     let Some(port) = queue.ports.get(port as usize) else {
         return false;
     };
@@ -400,11 +406,22 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    // Ports are shared (a composite queue serves on the source queue's
+    // ports): what another queue submitted stays queued for it, what this
+    // one did is canceled.
+    let this = Arc::as_ptr(&queue) as usize;
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let pending: Vec<Task> = {
+            let mut tasks = lock(&port.tasks);
+            let (mine, theirs): (Vec<_>, Vec<_>) =
+                tasks.drain(..).partition(|(queue, _)| *queue == this);
+            *tasks = theirs.into_iter().collect();
+            mine.into_iter().map(|(_, task)| task).collect()
+        };
         // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
+        // (Those of other queues on the port see theirs is open and, with
+        // what they submitted still queued, take it.) After the lock
+        // above, so none misses both flag and wake.
         port.ready.notify_all();
         for task in pending {
             task.run(true);
@@ -1719,6 +1736,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    /// Ports are shared with a composite queue, and ending one queue
+    /// cancels what was submitted through it alone: what the other queue
+    /// on the same ports submitted stays queued for its own dispatch,
+    /// uncanceled.
+    #[test]
+    fn terminate_spares_another_queues_callbacks() {
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test passes a pointer to its flag.
+            unsafe { *context.cast::<bool>() = canceled };
+        }
+        let none = std::ptr::null_mut();
+        // A manual queue and a composite of its ports.
+        let pair = || -> (*const Queue, *const Queue) {
+            let mut q = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+            assert_eq!(XTaskQueueGetPort(q, WORK, &mut work), S_OK);
+            assert_eq!(XTaskQueueGetPort(q, COMPLETION, &mut completion), S_OK);
+            let mut composite = std::ptr::null();
+            assert_eq!(XTaskQueueCreateComposite(work, completion, &mut composite), S_OK);
+            (q, composite)
+        };
+
+        // What `a` queued stays queued when `b` ends, and runs uncanceled.
+        let (a, b) = pair();
+        let mut a_canceled = false;
+        let flag = (&mut a_canceled as *mut bool).cast();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, flag, Some(note)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
+        assert!(!a_canceled, "a's callback was canceled by b's end");
+        assert!(XTaskQueueDispatch(a, WORK, 0), "a's callback was not queued");
+        assert!(!a_canceled);
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
+
+        // The reverse: `a`'s end does not cancel what `b` queued, `b`'s
+        // own does, and a dispatch of an ended queue takes nothing.
+        let (a, b) = pair();
+        let mut b_canceled = false;
+        let flag = (&mut b_canceled as *mut bool).cast();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, WORK, 0, flag, Some(note)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(a, false, none, None), S_OK);
+        assert!(!b_canceled, "b's callback was canceled by a's end");
+        assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
+        assert!(b_canceled);
+        assert!(!XTaskQueueDispatch(b, WORK, INFINITE), "ended b dispatched");
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
     }
 
     /// The call a test provider looks at in its cleanup, and what it saw
