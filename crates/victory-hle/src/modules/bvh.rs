@@ -60,10 +60,13 @@ unsafe extern "system" fn batched(this: *mut c_void, list: *mut c_void, count: u
     // once).
     victory_gpu::bvhsize::batch(descs as u64, count);
     victory_gpu::hwrt::batched(descs as u64, count);
+    let planned = victory_gpu::hwrt::plan_batched(descs as u64, count);
     // SAFETY: as in `prebuild`.
     let original: Batched = unsafe { std::mem::transmute(ORIGINAL[1].load(Ordering::Acquire)) };
     // SAFETY: as in `prebuild`.
     unsafe { original(this, list, count, descs) };
+    // After the builder's work in the list: the host's structures of them.
+    victory_gpu::hwrt::done(list.cast_const().cast(), planned);
 }
 
 unsafe extern "system" fn build(this: *mut c_void, list: *mut c_void, desc: *const c_void, count: u32, postbuild: *const c_void) {
@@ -76,18 +79,25 @@ unsafe extern "system" fn build(this: *mut c_void, list: *mut c_void, desc: *con
 
 unsafe extern "system" fn rehydrate(this: *mut c_void, list: *mut c_void, count: u32, descs: *const c_void, extra: *const u64) -> i32 {
     victory_gpu::hwrt::rehydrate(descs as u64, count, extra as u64);
+    let planned = victory_gpu::hwrt::plan_rehydrate(descs as u64, count);
     // SAFETY: as in `prebuild`.
     let original: Rehydrate = unsafe { std::mem::transmute(ORIGINAL[3].load(Ordering::Acquire)) };
     // SAFETY: as in `prebuild`.
-    unsafe { original(this, list, count, descs, extra) }
+    let result = unsafe { original(this, list, count, descs, extra) };
+    if result >= 0 {
+        victory_gpu::hwrt::done(list.cast_const().cast(), planned);
+    }
+    result
 }
 
 unsafe extern "system" fn copy(this: *mut c_void, list: *mut c_void, dest: u64, source: u64, mode: u32) {
     victory_gpu::hwrt::copied(dest, source, mode);
+    let planned = victory_gpu::hwrt::plan_copy(dest, source);
     // SAFETY: as in `prebuild`.
     let original: Copy = unsafe { std::mem::transmute(ORIGINAL[4].load(Ordering::Acquire)) };
     // SAFETY: as in `prebuild`.
     unsafe { original(this, list, dest, source, mode) };
+    victory_gpu::hwrt::done(list.cast_const().cast(), planned);
 }
 
 /// Ours for an import, and where the DLL's own is kept.

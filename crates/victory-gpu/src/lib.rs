@@ -22,6 +22,8 @@ mod ambient;
 pub mod bvhsize;
 #[cfg(windows)]
 pub mod hwrt;
+#[cfg(windows)]
+mod rtbuild;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]

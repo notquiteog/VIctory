@@ -1071,6 +1071,26 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
 /// module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted. None if the host cannot hold it; the draw is then dropped.
+/// Where the card holds the title page of 64 KiB that `address` lies in: the
+/// copy, and the byte offset in its buffer of the page's start (wrapping, as
+/// a shader adds it). Read only, for the hardware ray-tracing path
+/// (`crate::hwrt`, branch hw-rt), which copies a structure's bytes out to
+/// build a host structure from them. `None`: no copy holds it (yet): what
+/// asks treats the structure as not ready and asks again later. Not to be
+/// kept across frames: a page may move.
+pub(crate) fn card_page(address: u64) -> Option<(Arc<Shadow>, u32)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let page = address / PAGE;
+    if page >= u64::from(MEMORY_PAGES) - 1 {
+        return None;
+    }
+    let n = m.copy_of(page)?;
+    // SAFETY: an entry of the directory, under the mutex.
+    let offset = unsafe { m.entry(page).add(1).read() };
+    Some((m.copies.get(n)?.clone(), offset))
+}
+
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,

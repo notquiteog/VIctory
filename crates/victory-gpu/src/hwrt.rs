@@ -70,7 +70,7 @@ pub(crate) fn u64_at(b: &[u8], at: usize) -> u64 {
 
 /// A pointer of the title's CPU into its own memory.
 fn pointer(p: u64) -> bool {
-    (0x1_0000..1 << 47).contains(&p) && p % 4 == 0
+    (0x1_0000..1 << 47).contains(&p) && p.is_multiple_of(4)
 }
 
 /// Reads title memory: whether it was all there.
@@ -556,6 +556,110 @@ pub fn prebuilt(inputs: u64, bound: u64) {
             }
         }
     });
+}
+
+/// What the hardware path does after one of the builder's calls, planned
+/// before it (the title's descriptions are read then): host structures for
+/// the structures it builds, unpacks or copies (`crate::rtbuild`).
+#[derive(Debug, Default)]
+pub struct Planned(Vec<crate::rtbuild::Job>);
+
+/// Bytes enough for a structure of `inputs`, by the builder's own answer
+/// (`crate::bvhsize`) if one was seen, else by a generous bound: a box node
+/// and a triangle node per triangle, two nodes per instance.
+#[cfg(windows)]
+fn bytes_of(dest: u64, x: &Inputs) -> u64 {
+    if let Some(bound) = crate::bvhsize::bound_of(dest) {
+        return bound;
+    }
+    if x.kind == 0 {
+        return u64::from(x.count) * 256 + 4096;
+    }
+    let triangles: u64 = x
+        .geometries
+        .iter()
+        .map(|g| {
+            u64::from(if g.index_count > 0 {
+                g.index_count
+            } else {
+                g.vertex_count
+            }) / 3
+        })
+        .sum();
+    triangles * 192 + 4096
+}
+
+/// A batched build of `count` described at `descs` (before the builder's
+/// call).
+#[cfg(windows)]
+pub fn plan_batched(descs: u64, count: u32) -> Planned {
+    if !hardware() || !pointer(descs) {
+        return Planned::default();
+    }
+    let bytes = records(descs, count, BATCHED);
+    let mut jobs = Vec::new();
+    for r in bytes.chunks(BATCHED) {
+        let dest = u64_at(r, 0);
+        let Some(x) = Inputs::parse(&r[8..8 + INPUTS], &title_read) else {
+            continue;
+        };
+        if dest == 0 || !dest.is_multiple_of(256) {
+            continue;
+        }
+        jobs.push(crate::rtbuild::Job::Build {
+            dest,
+            bytes: bytes_of(dest, &x),
+            top: x.kind == 0,
+            flags: x.flags,
+        });
+    }
+    Planned(jobs)
+}
+
+/// Packed structures unpacked in place, `count` described at `descs`: their
+/// size is in their header, on the CPU while packed (memory.rs, `packed`).
+#[cfg(windows)]
+pub fn plan_rehydrate(descs: u64, count: u32) -> Planned {
+    if !hardware() || !pointer(descs) {
+        return Planned::default();
+    }
+    let bytes = records(descs, count, BUILD);
+    let mut jobs = Vec::new();
+    for r in bytes.chunks(BUILD) {
+        let dest = u64_at(r, 0);
+        let mut header = [0u8; 8];
+        if dest == 0 || !dest.is_multiple_of(256) || !title_read(dest, &mut header) {
+            continue;
+        }
+        let (version, nodes) = (u32_at(&header, 0), u32_at(&header, 4));
+        if version & 0xff != 6 || nodes == 0 {
+            continue;
+        }
+        let flags = Inputs::parse(&r[8..8 + INPUTS], &title_read).map_or(0, |x| x.flags);
+        jobs.push(crate::rtbuild::Job::Build {
+            dest,
+            bytes: (u64::from(nodes) + 1) * 64,
+            top: version & 0x8000 == 0,
+            flags,
+        });
+    }
+    Planned(jobs)
+}
+
+/// A copy of the structure at `source` to `dest`.
+#[cfg(windows)]
+pub fn plan_copy(dest: u64, source: u64) -> Planned {
+    if !hardware() {
+        return Planned::default();
+    }
+    Planned(vec![crate::rtbuild::Job::Copy { dest, source }])
+}
+
+/// After the builder's call into the title list `list`: what was planned,
+/// in the list's order.
+#[cfg(windows)]
+pub fn done(list: *const crate::object::Object, planned: Planned) {
+    crate::rtbuild::queue(list, planned.0);
 }
 
 #[cfg(test)]

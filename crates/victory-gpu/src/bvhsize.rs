@@ -384,6 +384,14 @@ pub(crate) fn landed(slot: u64, asking: u32) {
     }
 }
 
+/// The bound of the structure at `structure` from its latest batch (if
+/// recent): what the hardware ray-tracing path (`crate::rtbuild`) copies of
+/// it.
+pub(crate) fn bound_of(structure: u64) -> Option<u64> {
+    let frame = crate::frame::current();
+    with(|s| s.built.get(&structure).filter(|b| b.1 + RECENT >= frame).map(|b| b.0))
+}
+
 /// The bound of the latest asking into `slot`, for the trace.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn bound_at(slot: u64) -> Option<u64> {
