@@ -1,4 +1,4 @@
-﻿# VIctory for AMD and NVIDIA
+# VIctory for AMD and NVIDIA
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), which runs an Xbox Series title on Windows from files you supply. This fork targets **AMD and NVIDIA cards**. The goal is a steady 30 fps with the title's own ray tracing on. It isn't there yet.
 
@@ -7,8 +7,8 @@ A fork of [VIctory](https://github.com/Marvisak/VIctory), which runs an Xbox Ser
 ## Status
 
 - Native ray tracing is **on by default**. To turn it off, use `-NoRayTracing`.
-- Walking outdoors as Series S at half resolution, frames take about 50â€“90 ms (11â€“20 fps), and the CPU is the limit.
-- You need 64 GB of RAM: the game uses 25â€“45 GB.
+- Walking outdoors as Series S at half resolution, frames take about 50–90 ms (11–20 fps), and the CPU is the limit.
+- You need 64 GB of RAM: the game uses 25–45 GB.
 - The first run after a new driver or build stutters while shaders are compiled. `victory warm` compiles them ahead of time.
 
 ## Run it
