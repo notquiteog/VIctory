@@ -48,8 +48,9 @@ pub const MEMORY: usize = usize::MAX - 1;
 
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
-const RAW: [&str; 5] = [
+const RAW: [&str; 6] = [
     "an address not from a root parameter",
+    "an address past a root descriptor's high half",
     "an address from a root parameter that is no address",
     "an address in an SGPR that is no root parameter",
     "an address loaded from memory",
@@ -989,7 +990,9 @@ impl<'a> Tracer<'a> {
             && !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
-            return Err("an address with an untracked high half");
+            // (a high half that adds more than the low half's carry to the
+            // descriptor's: the address as it stands)
+            return Err("an address past a root descriptor's high half");
         }
         Ok(Address {
             param,
@@ -1007,8 +1010,64 @@ impl<'a> Tracer<'a> {
             ))
     }
 
-    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
+    /// Whether `t`, added (with carry) to an address's high half, is the
+    /// high half of the computed offset added to its low half, as the
+    /// console compiler makes 64-bit offsets of 32-bit ones: zero (or all
+    /// ones), the sign of a 32-bit value (`s_ashr_i32 x, 31`,
+    /// `v_ashrrev_i32 31, x`), or the high dword of such a pair shifted
+    /// left (`s_lshl_b64`, `v_lshlrev_b64`, an index scaled to bytes).
+    // shortcut: such a high half is taken as the carry of the offset
+    // (offsets below 4 GiB), as before; the sign is not checked against the
+    // low half's.
+    fn offset_high(&self, t: Term, depth: u32) -> bool {
+        let v = match t {
+            Term::Const(c) => return c == 0 || c == u32::MAX,
+            Term::Value(v) => v,
+        };
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let is31 = |l: &Self, op: &Operand| l.vterm(inst, op) == Some(Term::Const(31));
+        match (&inst.fields, inst.name()) {
+            (Fields::Sop { src, .. }, "s_ashr_i32") => src.get(1).is_some_and(|o| is31(self, o)),
+            (Fields::Valu(f), "v_ashrrev_i32") => f.src.first().is_some_and(|o| is31(self, o)),
+            (
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code, .. }),
+                    src,
+                    ..
+                },
+                "s_lshl_b64",
+            ) if depth > 0 && inst.write(Reg::S(*code + 1)) == Some(v) => match src.first() {
+                Some(Operand::Scalar { code: s, .. }) => inst
+                    .read(Reg::S(*s + 1))
+                    .is_some_and(|h| self.offset_high(self.origin(h), depth - 1)),
+                _ => false,
+            },
+            (Fields::Valu(f), "v_lshlrev_b64") if depth > 0 => {
+                let Some(Operand::Vector { reg: d, .. }) = f.dst else {
+                    return false;
+                };
+                if inst.write(Reg::V(d + 1)) != Some(v) {
+                    return false;
+                }
+                match f.src.get(1) {
+                    Some(&Operand::Vector { reg, .. }) => inst
+                        .read(Reg::V(reg + 1))
+                        .is_some_and(|h| self.offset_high(self.vorigin(h), depth - 1)),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `hi` adds only the low half's carry to `high`: `s_addc_u32` or
+    /// `v_add_co_ci_u32` with `high` as one operand and, as the other, zero
+    /// or the high half of the offset the low half adds
+    /// ([`Self::offset_high`]). Another addend (a root constant, say) is
+    /// part of the address's high half, which an [`Address`] cannot
+    /// represent.
     fn carried(&self, hi: Term, high: Value) -> bool {
         let Term::Value(v) = hi else { return false };
         if v == high {
@@ -1048,7 +1107,8 @@ impl<'a> Tracer<'a> {
             return self.carried(self.vorigin(lane), high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return self.carried(a, high) || self.carried(b, high);
+            return self.offset_high(a, 2) && self.carried(b, high)
+                || self.offset_high(b, 2) && self.carried(a, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -1056,10 +1116,16 @@ impl<'a> Tracer<'a> {
         let Fields::Valu(f) = &inst.fields else {
             return false;
         };
-        inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
-                .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+        if inst.name() != "v_add_co_ci_u32" || f.src.len() < 2 {
+            return false;
+        }
+        match (self.vterm(inst, &f.src[0]), self.vterm(inst, &f.src[1])) {
+            (Some(a), Some(b)) => {
+                self.offset_high(a, 2) && self.carried(b, high)
+                    || self.offset_high(b, 2) && self.carried(a, high)
+            }
+            _ => false,
+        }
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -4134,5 +4200,68 @@ pub(crate) mod tests {
         let r = track(&eo, &layout, HwStage::Cs, Some(&st))
             .expect("guard in active() should prune the !in_bounds edge after early-out strip");
         assert_eq!(r.descriptors.len(), 3);
+    }
+
+    #[test]
+    fn a_real_high_half_addend_is_not_treated_as_carry() {
+        // s[12:13] = s[6:7] + s[2:3], a full 64-bit sum. The high half's
+        // nonzero addend s3 is not the low half's carry, so this address
+        // cannot be rebuilt as the root descriptor plus only s2.
+        let r = track_words(
+            &[
+                0x800C_0206, // s_add_u32 s12, s6, s2
+                0x820D_0307, // s_addc_u32 s13, s7, s3
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xDC70_8000,
+                0x000C_0101, // global_store_dword v1, v1, s[12:13]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn a_sign_extended_scaled_index_is_the_carry_of_its_low_half() {
+        // s[2:3] = sign-extended s2 times 4 (the console compiler's 64-bit
+        // index), added to the root descriptor s[6:7]: the high addend s3 is
+        // the index's own high half, so the address is the descriptor's.
+        let r = track_words(
+            &[
+                0x9103_9F02, // s_ashr_i32 s3, s2, 31
+                0x8F82_8202, // s_lshl_b64 s[2:3], s[2:3], 2
+                0x800C_0206, // s_add_u32 s12, s6, s2
+                0x820D_0307, // s_addc_u32 s13, s7, s3
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xDC70_8000,
+                0x000C_0101, // global_store_dword v1, v1, s[12:13]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, 1);
+    }
+
+    #[test]
+    fn only_a_zero_vector_addend_leaves_room_for_carry() {
+        let run = |zero| {
+            track_words(
+                &[
+                    0xD70F_6A00,
+                    0x0202_0406, // v_add_co_u32 v0, vcc_lo, s6, v2
+                    if zero { 0x7E08_0280 } else { 0x7E08_0281 }, // v_mov_b32 v4, 0/1
+                    0x5002_0807, // v_add_co_ci_u32 v1, vcc_lo, s7, v4, vcc_lo
+                    0xDC70_8000,
+                    0x007D_0100, // global_store_dword v[0:1], v1, off
+                    S_ENDPGM,
+                ],
+                &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+                HwStage::Cs,
+            )
+        };
+        assert_eq!(run(true).scalar[0].1.param, 1);
+        assert_eq!(run(false).scalar[0].1.param, MEMORY);
     }
 }
