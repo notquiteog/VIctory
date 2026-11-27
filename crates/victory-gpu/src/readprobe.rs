@@ -63,7 +63,17 @@ struct Probe {
     /// Where in our code our touches were, since the run began: how many
     /// at each address.
     sites: HashMap<usize, u64>,
+    /// The 64 KiB blocks a page was ever armed in ([`repaired`]).
+    blocks: std::collections::HashSet<usize>,
 }
+
+/// The write guards (`crate::watch`) change a 64 KiB block's protection at
+/// once and take the first page's old protection for the whole block's: an
+/// armed first page makes the block no-access, and they leave it so (memory
+/// not theirs to guard). A touch of a page of such a block, no-access and not
+/// armed, opens the page (read-write: what the guards would have left) and
+/// goes on, counted.
+const BLOCK: usize = 64 << 10;
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
@@ -71,7 +81,7 @@ fn probe() -> std::sync::MutexGuard<'static, Option<Probe>> {
     PROBE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Our own code: the module this is in.
 fn ours() -> (usize, usize) {
@@ -111,7 +121,7 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
         return;
     }
     let mut probe = probe();
-    let probe = probe.get_or_insert_with(|| Probe { armed: HashMap::new(), seen: HashMap::new(), ever: HashMap::new(), sites: HashMap::new() });
+    let probe = probe.get_or_insert_with(|| Probe { armed: HashMap::new(), seen: HashMap::new(), ever: HashMap::new(), sites: HashMap::new(), blocks: Default::default() });
     let mut n = 0;
     for &at in pages {
         let page = at / PAGE * PAGE;
@@ -119,7 +129,9 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
             STATS[2].fetch_add(1, Ordering::Relaxed);
             break;
         }
-        if probe.armed.contains_key(&page) {
+        // (Not a block's first page: the guards take its protection for
+        // the block's, [`BLOCK`].)
+        if probe.armed.contains_key(&page) || page % BLOCK == 0 {
             continue;
         }
         // In the table before the protection changes, under the lock the
@@ -141,6 +153,7 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
             continue;
         }
         probe.armed.insert(page, Armed { old, copy });
+        probe.blocks.insert(page / BLOCK);
         probe.seen.entry(copy).or_default().armed += 1;
         probe.ever.entry(copy).or_default().armed += 1;
         n += 1;
@@ -155,7 +168,7 @@ fn install() -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     };
-    use windows_sys::Win32::System::Memory::VirtualProtect;
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     unsafe extern "system" fn touched(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
@@ -171,11 +184,17 @@ fn install() -> bool {
             // Touched by two threads at once: the first gave the page its
             // protection back. If the touch would now go, it goes again;
             // anything else is not ours to handle.
-            return if open(page, r.ExceptionInformation[0] == 1) {
-                EXCEPTION_CONTINUE_EXECUTION
-            } else {
-                EXCEPTION_CONTINUE_SEARCH
-            };
+            if open(page, r.ExceptionInformation[0] == 1) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if probe.blocks.contains(&(page / BLOCK)) && no_access(page) {
+                let mut was = 0;
+                // SAFETY: title memory the guards left no-access by our arming.
+                unsafe { VirtualProtect(page as *const _, PAGE, PAGE_READWRITE, &mut was) };
+                STATS[3].fetch_add(1, Ordering::Relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
         };
         let mut was = 0;
         // SAFETY: the page we armed, back as it was.
@@ -196,6 +215,14 @@ fn install() -> bool {
         }
         STATS[1].fetch_add(1, Ordering::Relaxed);
         EXCEPTION_CONTINUE_EXECUTION
+    }
+    /// Whether `page` is committed and no-access.
+    fn no_access(page: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+        // SAFETY: asks about an address; the answer is written to ours.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_NOACCESS
     }
     /// Whether a touch of `page` (a write, or not) would go now.
     fn open(page: usize, write: bool) -> bool {
@@ -234,10 +261,11 @@ pub(crate) fn line(frames: f64) {
     };
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "read probe per frame (VICTORY_READ_PROBE): {:.1} pages armed, {:.1} touched, {:.1} landings out of room; {armed} armed now",
+        "read probe per frame (VICTORY_READ_PROBE): {:.1} pages armed, {:.1} touched, {:.1} landings out of room, {:.1} pages          the guards left no-access opened; {armed} armed now",
         s[0],
         s[1],
-        s[2]
+        s[2],
+        s[3]
     );
     let mut seen: Vec<_> = seen.into_iter().collect();
     seen.sort_unstable_by_key(|(_, s)| std::cmp::Reverse(s.armed));
@@ -255,7 +283,7 @@ pub(crate) fn line(frames: f64) {
         sites.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
         let base = ours().0;
         for (at, n) in sites.into_iter().take(16) {
-            let name = crate::profile::symbol_of(at as u64).unwrap_or_default();
+            let name = name_of(at as u64);
             tracing::info!("  read probe ours at +{:#x} {name}: {n}", at - base);
         }
     }
@@ -271,5 +299,19 @@ pub(crate) fn line(frames: f64) {
                 s.ours
             );
         }
+    }
+}
+
+/// The function at `at` and how far in, where the profiler's symbol library
+/// is built in (diagnostics builds).
+fn name_of(at: u64) -> String {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::profile::symbol_of(at).unwrap_or_default()
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = at;
+        String::new()
     }
 }

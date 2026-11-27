@@ -129,6 +129,8 @@ mod watch;
 mod texback;
 #[cfg(windows)]
 mod readprobe;
+#[cfg(windows)]
+mod classes;
 
 #[cfg(windows)]
 pub use host::on_failure;

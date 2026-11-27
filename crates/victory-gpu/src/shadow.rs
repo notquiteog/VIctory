@@ -102,6 +102,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Its memory class (`crate::classes`, `VICTORY_PORT_CLASSES`).
+    class: crate::classes::Class,
 }
 
 /// Times what it is made for on a big copy ([`crate::heapstat`]).
@@ -2738,6 +2740,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::classes::gone(self);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3267,6 +3270,14 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Its memory class, if it is a copy that may be classed
+    /// (`crate::classes`): a title buffer's, in the card's memory, not in
+    /// place, its memory write-watched.
+    pub(crate) fn class(&self) -> Option<&crate::classes::Class> {
+        (self.card.is_some() && !self.window && self.place.is_none() && self.watched.load(Ordering::Relaxed) == 1)
+            .then_some(&self.class)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3336,6 +3347,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            class: Default::default(),
         }
     }
 
@@ -3381,6 +3393,11 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // Class G: the card's copy is the only home of what shaders write.
+        if self.class.skips() {
+            return;
+        }
+        self.class.writing();
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -4025,8 +4042,9 @@ impl Shadow {
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = BigTimer::new(self, crate::heapstat::refreshed);
-        // In place: the card reads title memory itself.
-        if self.place.is_some() {
+        // In place: the card reads title memory itself. Closed (class G):
+        // nothing in title memory is newer than the copy.
+        if self.place.is_some() || self.class.closed() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4066,7 +4084,7 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        if self.place.is_some() || self.class.closed() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);

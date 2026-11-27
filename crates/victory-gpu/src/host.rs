@@ -4528,6 +4528,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::readprobe::line(frames);
+    crate::classes::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5177,11 +5178,17 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
-        let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
+        // (Class G copies, `crate::classes`: not followed.)
+        let gpu_only = |shadow: &Arc<crate::shadow::Shadow>| shadow.class().is_some_and(|c| c.skips());
+        let declared: Vec<Declared> =
+            declared.iter().filter(|(shadow, _)| shadow.carded() && !gpu_only(shadow)).cloned().collect();
+        let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
-        let looked: Vec<&crate::picked::Range> =
-            picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
+        let looked: Vec<&crate::picked::Range> = picked
+            .looked
+            .iter()
+            .filter(|l| !gpu_only(&l.0) && !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0)))
+            .collect();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5192,9 +5199,22 @@ impl Host {
             }
             None => 0,
         };
+        if crate::classes::mode() != crate::classes::Mode::Off {
+            crate::classes::consider(declared.iter().map(|d| &d.0), sent_as);
+            // Copies widened since: their whole span, fetched and landed
+            // behind this submission.
+            declared.extend(crate::classes::owed(sent_as));
+        }
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        for (shadow, ranges) in &dirty {
+            if !ranges.is_empty()
+                && let Some(class) = shadow.class()
+            {
+                class.sent_up();
+            }
+        }
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -5850,6 +5870,9 @@ impl Host {
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
                 });
+                if let Some(upto) = plans.iter().map(|p| p.0.sent_as).max() {
+                    crate::classes::landed(upto);
+                }
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 stage.next("landing: ranges done with");
