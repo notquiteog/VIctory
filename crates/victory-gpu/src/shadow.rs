@@ -5312,17 +5312,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
     }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
+    let Some((key, entry)) = map
+        .range_mut(..=(address, usize::MAX))
         .rev()
         .take(64)
         .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
