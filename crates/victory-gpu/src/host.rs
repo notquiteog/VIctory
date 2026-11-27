@@ -73,12 +73,12 @@ static RETIRED_SHARDS: [Mutex<std::collections::VecDeque<(u64, Retired)>>; 16] =
 
 /// Whether [`retire`] puts objects in the calling thread's shard of
 /// [`RETIRED_SHARDS`] in place of the one [`RETIRED`]
-/// (`VICTORY_RETIRE_SHARDS=1`, off by default). [`bury`] drains them all;
+/// (`VICTORY_RETIRE_SHARDS=0`: the one queue). [`bury`] drains them all;
 /// within a shard the numbers come in order as in the one queue.
 fn retire_shards() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_RETIRE_SHARDS").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_RETIRE_SHARDS").is_none_or(|v| v != "0");
         tracing::info!(on, "objects let go are queued by thread (VICTORY_RETIRE_SHARDS)");
         on
     })
