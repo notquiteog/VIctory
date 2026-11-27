@@ -384,10 +384,13 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
-const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format offset:byte_off`.
+const fn mtbuf_at(op: u8, vdata: u8, srsrc: u8, format: u8, byte_off: u16) -> [u32; 2] {
     [
-        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+        0x3A << 26
+            | (format as u32 & 0x7F) << 19
+            | (op as u32 & 7) << 16
+            | byte_off as u32 & 0xFFF,
         0x80 << 24
             | (op as u32 >> 3 & 1) << 21
             | (srsrc as u32 >> 2 & 0x1F) << 16
@@ -395,12 +398,38 @@ const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
     ]
 }
 
+/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
+const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    mtbuf_at(op, vdata, srsrc, format, 0)
+}
+
+/// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
+/// load `op` in buffer format `format` at byte `byte_off`.
+fn tbuffer_load_of_v1_at(op: u8, format: u8, byte_off: u16) -> HostShader {
+    let mut body = buffer_store_dword(1, 8, 0).to_vec();
+    body.extend(mtbuf_at(op, 0, 8, format, byte_off));
+    build_valu_cs(&body)
+}
+
 /// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
 /// load `op` in buffer format `format`.
 fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
-    let mut body = buffer_store_dword(1, 8, 0).to_vec();
-    body.extend(mtbuf(op, 0, 8, format));
-    build_valu_cs(&body)
+    tbuffer_load_of_v1_at(op, format, 0)
+}
+
+#[test]
+fn two_byte_tbuffer_loads_at_odd_byte_offsets_read_zero() {
+    // tbuffer_load_format_x, 16_UINT: the console's buffer unit reads a
+    // two-byte element only at an even byte address; at an odd one the load
+    // is like an out-of-bounds one and gives zero.
+    let x = 0;
+    let cases: &[(u16, u32)] = &[(0, 0x5678), (1, 0), (2, 0x1234), (3, 0)];
+    for &(byte_off, want) in cases {
+        let shader = tbuffer_load_of_v1_at(x, 11, byte_off);
+        run_cases(&shader, &[[0x1234_5678, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: 16_UINT at byte {byte_off} = {got:#010x}, want {want:#010x}");
+        });
+    }
 }
 
 #[test]

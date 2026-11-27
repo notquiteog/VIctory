@@ -8329,7 +8329,18 @@ impl<'a> Lower<'a> {
                 }
             };
             let w = load(self, at, 1)[0];
-            vec![self.s.m.bin(c, Bin::LShr, w, sh)]
+            let x = self.s.m.bin(c, Bin::LShr, w, sh);
+            // A two-byte element reads only at an even byte address: at an
+            // odd one the console's typed load is like an out-of-bounds one
+            // and its fetched channels are 0 (measured on RDNA2 upstream).
+            if total == 16 {
+                let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+                let low = self.s.m.bin(c, Bin::And, off, one);
+                let odd = self.s.m.cmp(c, pred::NE, low, zero);
+                vec![self.s.m.select(c, odd, zero, x)]
+            } else {
+                vec![x]
+            }
         } else {
             load(self, off, total / 32)
         };
