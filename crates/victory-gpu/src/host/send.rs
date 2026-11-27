@@ -189,48 +189,70 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+/// Source, ranges and byte offset of their pairs in the submission memory.
+type PairWork<'a> = (usize, &'a [(usize, usize)], u64);
+
+/// Plan the long runs and short-word chunks in a single pass. Pair offsets
+/// are relative to the start of this copy's pair area until its long runs
+/// have been assigned. The layout stays exactly as before: long runs first,
+/// followed by the aligned pair area.
+fn plan_copy<'a>(
+    from: usize,
+    ranges: &'a [(usize, usize)],
+    at: &mut u64,
+    work: &mut Vec<PairWork<'a>>,
+) -> Copy {
+    let mut runs = Vec::new();
+    let mut words = 0usize;
+    let first_work = work.len();
+    for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+        let before = words;
+        for &(a, b) in chunk {
+            let len = b - a;
+            if short(a, len) {
+                words += len / 4;
+            } else {
+                runs.push((a, *at, len));
+                *at += (len as u64).next_multiple_of(16);
+            }
+        }
+        if words > before {
+            work.push((from, chunk, before as u64 * 8));
+        }
+    }
+    let pairs = (*at, words as u32);
+    for (_, _, to) in &mut work[first_work..] {
+        *to += *at;
+    }
+    *at += (words as u64 * 8).next_multiple_of(16);
+    Copy { runs, pairs }
+}
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
-        let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
-        }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
+    let mut work = Vec::new();
+    for (shadow, ranges) in dirty {
+        copies.push(plan_copy(shadow.card_data() as usize, ranges, &mut at, &mut work));
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    for ((shadow, _), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
-        }
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+        let mut to = (memory.data + to as usize) as *mut [u32; 2];
+        for &(a, b) in ranges.iter().filter(|&&(a, b)| short(a, b - a)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -325,5 +347,68 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reference layout from the old multi-pass planner.
+    fn reference<'a>(
+        from: usize,
+        ranges: &'a [(usize, usize)],
+        at: &mut u64,
+        work: &mut Vec<PairWork<'a>>,
+    ) -> Copy {
+        let mut runs = Vec::new();
+        for &(a, b) in ranges.iter().filter(|&&(a, b)| !short(a, b - a)) {
+            runs.push((a, *at, b - a));
+            *at += ((b - a) as u64).next_multiple_of(16);
+        }
+        let words = ranges.iter().filter(|&&(a, b)| short(a, b - a))
+            .map(|&(a, b)| (b - a) / 4).sum::<usize>();
+        let pairs = (*at, words as u32);
+        *at += (words as u64 * 8).next_multiple_of(16);
+        let mut to = pairs.0;
+        for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+            let words = chunk.iter().filter(|&&(a, b)| short(a, b - a))
+                .map(|&(a, b)| (b - a) / 4).sum::<usize>();
+            if words != 0 {
+                work.push((from, chunk, to));
+                to += words as u64 * 8;
+            }
+        }
+        Copy { runs, pairs }
+    }
+
+    #[test]
+    fn single_scan_preserves_upload_layout() {
+        let mixed: Vec<_> = (0..RUNS_AT_A_TIME * 3 + 7)
+            .map(|i| {
+                let a = i * 512;
+                match i % 6 {
+                    0 => (a, a + 256),
+                    1 => (a, a + 260),
+                    2 => (a + 1, a + 5),
+                    3 => (a, a + 3),
+                    4 => (a, a + 4),
+                    _ => (a, a),
+                }
+            })
+            .collect();
+        let only_long = vec![(0, 512); RUNS_AT_A_TIME + 1];
+        let only_short = vec![(0, 4); RUNS_AT_A_TIME + 1];
+        let cases = [&[][..], &mixed[..], &only_long[..], &only_short[..], &mixed[..]];
+        let (mut old_at, mut new_at) = (0, 0);
+        let (mut old_work, mut new_work) = (Vec::new(), Vec::new());
+        for (i, ranges) in cases.into_iter().enumerate() {
+            let old = reference(i, ranges, &mut old_at, &mut old_work);
+            let new = plan_copy(i, ranges, &mut new_at, &mut new_work);
+            assert_eq!(new.runs, old.runs);
+            assert_eq!(new.pairs, old.pairs);
+            assert_eq!(new_at, old_at);
+        }
+        assert_eq!(new_work, old_work);
     }
 }
