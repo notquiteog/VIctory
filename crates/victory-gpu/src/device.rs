@@ -312,10 +312,15 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            // Shortcut: fixed capability masks pending console format measurements.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
+            if resource::element(q[0]).is_some_and(|(_, texels)| texels == 4) {
+                // RENDER_TARGET, BLENDABLE and MULTISAMPLE_RENDERTARGET
+                // describe output-merger uses unavailable for BC textures.
+                const TARGET_FLAGS: u32 = 0x0020_c000;
+                q[1] &= !TARGET_FLAGS;
+            }
             S_OK
         }
         MULTISAMPLE => {
@@ -624,6 +629,31 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn block_compressed_formats_are_not_render_targets() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |format| {
+            let mut data = [format, 0u32, 0u32];
+            assert_eq!(check(device, 3, data.as_mut_ptr().cast(), 12), S_OK);
+            assert_eq!(data[0], format);
+            data
+        };
+        // RENDER_TARGET, BLENDABLE and MULTISAMPLE_RENDERTARGET.
+        const TARGET_FLAGS: u32 = 0x0020_c000;
+        const TEXTURE2D: u32 = 0x20;
+        for format in (70..=84).chain(94..=99) {
+            let [_, support, _] = query(format);
+            assert_eq!(support & TARGET_FLAGS, 0, "BC format {format}");
+            assert_ne!(support & TEXTURE2D, 0, "BC format {format}");
+        }
+        // RGBA8, the BGR format between the two BC ranges, and console color.
+        for format in [28, 87, 116, 189] {
+            assert_eq!(query(format)[1] & TARGET_FLAGS, TARGET_FLAGS);
+        }
     }
 
     /// The queries the AMD upscaler's capability check makes.
