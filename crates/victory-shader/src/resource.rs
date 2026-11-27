@@ -637,6 +637,20 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The operands of `s_addk_i32` writing `v`: the destination's value on
+    /// entry and its sign-extended immediate.
+    fn addk(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_addk_i32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { dst: Some(dst), imm: Some(imm), .. } = &inst.fields else {
+            return None;
+        };
+        let imm = i32::from(*imm as i16) as u32;
+        Some([self.term(inst, dst)?, Term::Const(imm)])
+    }
+
     fn sum(&self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
@@ -701,6 +715,7 @@ impl<'a> Tracer<'a> {
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
+            .or_else(|| self.addk(v))
             .or_else(|| self.vadd(v))
         else {
             return dynamic;
@@ -4263,5 +4278,56 @@ pub(crate) mod tests {
         };
         assert_eq!(run(true).scalar[0].1.param, 1);
         assert_eq!(run(false).scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn a_table_address_offset_by_s_addk_emits_to_dxil() {
+        use crate::native::{ComputeIo, NativeProgram, ResourceType, StageIo, UsedResource};
+
+        let words: &[u32] = &[
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xB782_0010, // s_addk_i32 s2, 0x10
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+            0xE030_1000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![RootParam { slot: 0, ..param(Table, 9, 1) }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: Table,
+                table_offset_dwords: 4,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 9,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo { rsrc2: 12 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        assert_eq!(res.scalar, [((0, 3), at(0, 0x10))]);
+        assert_eq!(res.descriptors[0].source, Source::Loaded { load: (0, 3), first: 0 });
+        let io = crate::io::raise(&p, &native).unwrap();
+        let empty = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+        let shader = crate::emit::emit(&empty, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        }
     }
 }
