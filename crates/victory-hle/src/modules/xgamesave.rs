@@ -213,7 +213,10 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // A leftover the host will not delete (a file the crash left,
+            // a folder in use) must not cost the save; cleanup is
+            // best-effort, as in `containers` and `delete`.
+            let _ = std::fs::remove_dir_all(entry.path());
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -1524,6 +1527,27 @@ mod tests {
             // Read again: the new version stays the container.
             assert_eq!(state(root), after, "{what}: second read");
         }
+    }
+
+    /// A `.new` leftover the host will not delete (a file, which
+    /// `remove_dir_all` refuses) does not cost the committed save, and the
+    /// next update still goes through.
+    #[test]
+    fn an_undeletable_new_leftover_does_not_cost_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        std::fs::write(slot.join("crashed.new"), b"").unwrap();
+
+        assert_eq!(state(root), old_state(), "read");
+        assert!(slot.join("v1").is_dir(), "v1 was removed");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "update");
+        let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
+        let after = Some(("two".into(), blobs));
+        assert_eq!(state(root), after, "after the update");
+        assert!(slot.join("v2").is_dir(), "the update did not commit");
     }
 
     /// With no readable version at all, reads and updates fail and nothing
