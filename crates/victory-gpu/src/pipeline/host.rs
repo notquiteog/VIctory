@@ -347,11 +347,17 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count =
+                        (self.targets.NumRenderTargets as usize).min(self.targets.RTFormats.len());
+                    self.targets.NumRenderTargets = count as u32;
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::target_format(crate::resource::pc_format(
                             f.0 as u32,
                         )) as i32;
                     }
+                    // D3D12 rejects pipelines with non-unknown formats past `NumRenderTargets`
+                    // (`E_INVALIDARG`), and `describe` hashes all 8 slots into the cache key.
+                    self.targets.RTFormats[count..].fill(DXGI_FORMAT_UNKNOWN);
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
@@ -1546,6 +1552,33 @@ mod tests {
         };
         t.RTFormats[..formats.len()].copy_from_slice(formats);
         t
+    }
+
+    /// Formats past `NumRenderTargets` read as unknown and the count stops at
+    /// 8, so stale slots neither fail pipeline creation nor change the key.
+    #[test]
+    fn unused_target_slots_are_cleared_and_the_count_clamped() {
+        #[repr(C, align(8))]
+        struct Sub15(u32, D3D12_RT_FORMAT_ARRAY);
+        let read = |t: D3D12_RT_FORMAT_ARRAY| {
+            let mut g = GraphicsState::default();
+            let sub = Sub15(15, t);
+            // SAFETY: `sub` is a complete subobject 15.
+            unsafe { g.read(15, (&raw const sub).cast()) };
+            g
+        };
+        let mut stale = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        stale.RTFormats[1] = DXGI_FORMAT_R32_FLOAT;
+        stale.RTFormats[7] = DXGI_FORMAT_R32_FLOAT;
+        let g = read(stale);
+        assert_eq!(g.targets.NumRenderTargets, 1);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert!(g.targets.RTFormats[1..].iter().all(|&f| f == DXGI_FORMAT_UNKNOWN));
+        assert_eq!(g.describe(), read(targets(&[DXGI_FORMAT_R8G8B8A8_UNORM])).describe());
+
+        let g = read(D3D12_RT_FORMAT_ARRAY { RTFormats: [DXGI_FORMAT_R32_FLOAT; 8], NumRenderTargets: 10 });
+        assert_eq!(g.targets.NumRenderTargets, 8);
+        assert!(g.targets.RTFormats.iter().all(|&f| f == DXGI_FORMAT_R32_FLOAT));
     }
 
     fn blending(independent: bool) -> D3D12_BLEND_DESC {
