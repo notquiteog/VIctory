@@ -433,6 +433,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Back edges per entry of the loops whose count the code fixes
+    /// (`super::trips`), by IR header: their limit is that count.
+    trips: HashMap<usize, u32>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -445,6 +448,17 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// A loop's iteration limit: the stage's, or for a loop whose count the
+/// code fixes (`trips` back edges per entry) just above that count, so the
+/// loop runs to its end. A limit named by `VICTORY_SHADER_LOOP_LIMIT` is
+/// kept as named.
+pub(super) fn counted_limit(stage: u32, switch: u32, trips: Option<u32>) -> u32 {
+    match trips {
+        Some(n) if switch == LOOP_LIMIT => stage.max(n.saturating_add(1)),
+        _ => stage,
+    }
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2412,6 +2426,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            trips: HashMap::new(),
             abort: None,
         }
     }
@@ -3075,6 +3090,7 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        self.trips = super::trips::trips(p, &self.rpo);
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -14480,12 +14496,15 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        // A loop whose count the code fixes, whatever memory holds, runs to
+        // its end (`super::trips`).
+        let stage = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
             named => named,
         };
+        let limit = counted_limit(stage, super::loop_limit(), self.trips.get(&to).copied());
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)

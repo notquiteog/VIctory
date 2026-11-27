@@ -406,6 +406,26 @@ fn a_mask_operations_scc_read_as_data_is_the_waves_any() {
     }
 }
 
+/// A loop whose count the code fixes runs to its end, past the compute
+/// stage's loop limit (4,096): 8,192 trips of `v0 += 1` store 8,192
+/// (after DexNom/VIctory#137).
+#[test]
+fn a_counted_loop_past_the_stage_limit_runs_to_its_end() {
+    const TRIPS: u32 = 8192;
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, 128), // v_mov_b32 v0, 0
+        0xBE86_03FF,
+        TRIPS,                 // s_mov_b32 s6, TRIPS
+        0x4A00_0081,           // loop: v_add_nc_u32 v0, 1, v0
+        sop2(0x01, 6, 6, 129), // s_sub_u32 s6, s6, 1
+        0xBF07_8006,           // s_cmp_lg_u32 s6, 0
+        0xBF85_FFFC,           // s_cbranch_scc1 loop
+    ]);
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, TRIPS, "{backend}: trips of a loop counted to {TRIPS}");
+    });
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;
