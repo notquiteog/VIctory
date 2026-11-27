@@ -151,7 +151,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
-| `VICTORY_BVH_NODE_ONCE=0` | a node test reads each kind's dwords in that kind's branch, as before (on: the node's first 64 bytes at once, before the kind is looked at; a triangle's vertices picked from them) |
+| `VICTORY_BVH_NODE_ONCE=1` / `=2` | how a node test reads the node (unset or 0: each kind's dwords in that kind's branch). 1: the node's first 64 bytes at once, before the kind is looked at, with a triangle's vertices picked from them. 2: a triangle node's 64 bytes at once, in its own branch. On the RTX card, 1 made the trace passes 3-4x slower (register pressure), and 2 was within noise |
 | `VICTORY_FLOAT_ATOMIC_INTS=0` | a float atomic minimum or maximum on title memory is a loop of compare-exchanges, as before (on: one integer atomic on its bits) |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |

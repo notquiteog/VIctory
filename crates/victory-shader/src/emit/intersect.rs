@@ -41,7 +41,7 @@ thread_local! {
     /// ([`no_hit`]).
     pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The tests' choice for [`node_once`].
-    pub(in crate::emit) static TEST_NODE_ONCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(in crate::emit) static TEST_NODE_ONCE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a node test answers "no hit" and reads nothing
@@ -68,22 +68,28 @@ fn no_hit() -> bool {
         && !crate::bvh_builder_on()
 }
 
-/// Whether a node test reads the node's first 64 bytes at once, before it
-/// looks at the node's kind (`VICTORY_BVH_NODE_ONCE=0`: each kind reads its
-/// own dwords in its own branch, as before). Every kind's dwords are in those
-/// 64 bytes but a 32-bit box node's last twelve, and they lie in one page of
-/// title memory. Read in the branches, a wave whose lanes are at nodes of
-/// several kinds waited for memory once for each kind, and a triangle's
-/// vertices were read only after the dword that says which they are: three
-/// waits for memory one after another (the directory, that dword, the
-/// vertices) where the hardware has one.
-fn node_once() -> bool {
+/// How a node test reads its node (`VICTORY_BVH_NODE_ONCE`):
+/// - `1`: the node's first 64 bytes at once, before it looks at the node's
+///   kind. Every kind's dwords are in those 64 bytes but a 32-bit box node's
+///   last twelve, and they lie in one page of title memory.
+/// - `2`: each kind in its own branch, a triangle node's 64 bytes at once
+///   there and its vertices picked from them.
+/// - `0` (the default): each kind its own dwords in its own branch. A wave
+///   whose lanes are at nodes of several kinds waits for memory once for
+///   each kind, and a triangle's vertices are read only after the dword
+///   that says which they are: three waits for memory one after another
+///   (the directory, that dword, the vertices) where the hardware has one.
+fn node_once() -> u8 {
     #[cfg(test)]
-    if let Some(on) = TEST_NODE_ONCE.get() {
-        return on;
+    if let Some(mode) = TEST_NODE_ONCE.get() {
+        return mode;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_NODE_ONCE").is_none_or(|v| v != "0"))
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_BVH_NODE_ONCE").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Where the instruction's node is.
@@ -254,7 +260,7 @@ impl<'a> Lower<'a> {
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
         // The first 64 bytes, for every kind ([`node_once`]).
-        let first: Option<Vec<V>> = (node_once() && !bvh_miss()).then(|| self.bvh_node_words(at, None, 0, 16));
+        let first: Option<Vec<V>> = (node_once() == 1 && !bvh_miss()).then(|| self.bvh_node_words(at, None, 0, 16));
         let head = self.cur;
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
@@ -279,6 +285,7 @@ impl<'a> Lower<'a> {
         let triangle = if bvh_miss() {
             bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
         } else {
+            let first = first.or_else(|| (node_once() == 2).then(|| self.bvh_node_words(at, None, 0, 16)));
             self.bvh_triangle(at, kind, &ray, first.as_deref())
         };
         let triangle_end = self.cur;

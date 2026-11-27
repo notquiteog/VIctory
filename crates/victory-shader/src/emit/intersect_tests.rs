@@ -643,14 +643,19 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
-fn the_node_test_reading_each_kind_in_its_branch_matches_the_reference_on_the_card() {
-    // `VICTORY_BVH_NODE_ONCE=0`: as before the node's first 64 bytes were
-    // read at once.
-    super::lower::intersect::TEST_NODE_ONCE.set(Some(false));
-    run(true, Descriptor::Table, u64::from(NODES), true);
-    {
-        let _memory = Memory::at(BASE);
-        run(true, WHOLE, BASE + u64::from(NODES), true);
+fn the_node_test_read_the_other_ways_matches_the_reference_on_the_card() {
+    // `VICTORY_BVH_NODE_ONCE=1`: the node's first 64 bytes read before its
+    // kind is looked at; `=2`: a triangle node's 64 bytes read at once in
+    // its branch (the default, each kind's dwords in its own branch, the
+    // other tests).
+    for mode in [1, 2] {
+        super::lower::intersect::TEST_NODE_ONCE.set(Some(mode));
+        run(true, Descriptor::Table, u64::from(NODES), true);
+        {
+            let _memory = Memory::at(BASE);
+            run(true, WHOLE, BASE + u64::from(NODES), true);
+        }
+        run(false, Descriptor::Table, u64::from(NODES), true);
     }
     super::lower::intersect::TEST_NODE_ONCE.set(None);
 }
