@@ -60,6 +60,9 @@ struct Probe {
     seen: HashMap<(u64, u64), Seen>,
     /// Since the run began, for the end of it.
     ever: HashMap<(u64, u64), Seen>,
+    /// Where in our code our touches were, since the run began: how many
+    /// at each address.
+    sites: HashMap<usize, u64>,
 }
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
@@ -108,7 +111,7 @@ pub(crate) fn arm(pages: &[usize], copy: (u64, u64)) {
         return;
     }
     let mut probe = probe();
-    let probe = probe.get_or_insert_with(|| Probe { armed: HashMap::new(), seen: HashMap::new(), ever: HashMap::new() });
+    let probe = probe.get_or_insert_with(|| Probe { armed: HashMap::new(), seen: HashMap::new(), ever: HashMap::new(), sites: HashMap::new() });
     let mut n = 0;
     for &at in pages {
         let page = at / PAGE * PAGE;
@@ -165,13 +168,23 @@ fn install() -> bool {
             return EXCEPTION_CONTINUE_SEARCH;
         };
         let Some(armed) = probe.armed.remove(&page) else {
-            return EXCEPTION_CONTINUE_SEARCH;
+            // Touched by two threads at once: the first gave the page its
+            // protection back. If the touch would now go, it goes again;
+            // anything else is not ours to handle.
+            return if open(page, r.ExceptionInformation[0] == 1) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
         };
         let mut was = 0;
         // SAFETY: the page we armed, back as it was.
         unsafe { VirtualProtect(page as *const _, PAGE, armed.old, &mut was) };
         let (from, to) = ours();
         let at = r.ExceptionAddress as usize;
+        if from <= at && at < to {
+            *probe.sites.entry(at).or_default() += 1;
+        }
         for seen in [probe.seen.entry(armed.copy).or_default(), probe.ever.entry(armed.copy).or_default()] {
             if from <= at && at < to {
                 seen.ours += 1;
@@ -183,6 +196,18 @@ fn install() -> bool {
         }
         STATS[1].fetch_add(1, Ordering::Relaxed);
         EXCEPTION_CONTINUE_EXECUTION
+    }
+    /// Whether a touch of `page` (a write, or not) would go now.
+    fn open(page: usize, write: bool) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        };
+        // SAFETY: asks about an address; the answer is written to ours.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        n != 0
+            && info.State == MEM_COMMIT
+            && (info.Protect == PAGE_READWRITE || (!write && info.Protect == PAGE_READONLY))
     }
     // SAFETY: the handler touches only the probe's table and protections.
     !unsafe { AddVectoredExceptionHandler(1, Some(touched)) }.is_null()
@@ -197,13 +222,15 @@ pub(crate) fn line(frames: f64) {
     }
     static CALLS: AtomicU64 = AtomicU64::new(0);
     let calls = CALLS.fetch_add(1, Ordering::Relaxed);
-    let (seen, ever, armed) = {
+    let (seen, ever, sites, armed) = {
         let mut probe = probe();
         let Some(probe) = probe.as_mut() else {
             return;
         };
-        let ever = (calls % 60 == 59).then(|| probe.ever.clone());
-        (std::mem::take(&mut probe.seen), ever, probe.armed.len())
+        let last = calls % 60 == 59;
+        let ever = last.then(|| probe.ever.clone());
+        let sites = last.then(|| probe.sites.clone());
+        (std::mem::take(&mut probe.seen), ever, sites, probe.armed.len())
     };
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -222,6 +249,15 @@ pub(crate) fn line(frames: f64) {
             s.title_writes,
             s.ours
         );
+    }
+    if let Some(sites) = sites {
+        let mut sites: Vec<_> = sites.into_iter().collect();
+        sites.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let base = ours().0;
+        for (at, n) in sites.into_iter().take(16) {
+            let name = crate::profile::symbol_of(at as u64).unwrap_or_default();
+            tracing::info!("  read probe ours at +{:#x} {name}: {n}", at - base);
+        }
     }
     if let Some(ever) = ever {
         let mut ever: Vec<_> = ever.into_iter().collect();

@@ -1612,6 +1612,19 @@ struct Symbol {
     name: [u16; 1024],
 }
 
+/// The function `address` is in and how far into it, for a log line
+/// written outside a report (the read probe's): the symbol library is
+/// opened once per thread that asks.
+pub(crate) fn symbol_of(address: u64) -> Option<String> {
+    thread_local! {
+        static LIBRARY: Option<DbgHelp> = DbgHelp::open();
+    }
+    LIBRARY.with(|library| {
+        let (name, at) = library.as_ref()?.symbol(address)?;
+        Some(format!("{name}+{:#x}", address.wrapping_sub(at)))
+    })
+}
+
 impl DbgHelp {
     fn open() -> Option<DbgHelp> {
         // SAFETY: loads the system's own dbghelp.dll and looks its
