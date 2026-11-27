@@ -621,10 +621,16 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+        let [loads, misses, bypass] = super::library::call_lines();
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            // count/sum ms/longest ms (`library::CALL_TIMES`)
+            loads,
+            misses,
+            bypass,
+            sampler_tables = ?super::host::sampler_stats(),
             "host pipelines all made"
         );
     }

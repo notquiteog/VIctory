@@ -3,7 +3,8 @@
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
 //! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! the immediate samplers (or a table of them in the sampler heap, with
+//! `VICTORY_PIPELINE_SAMPLER_TABLE=1`), and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
 use std::ops::Range;
@@ -478,6 +479,313 @@ pub(crate) fn bounded_root_srvs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
 }
 
+/// `VICTORY_PIPELINE_SAMPLER_TABLE=1`: the immediate samplers of a stage are
+/// a table in the sampler heap instead of static samplers of the root
+/// signature, so that a pipeline loaded from the pipeline library samples
+/// through the samplers it names whatever order another run made static
+/// samplers in (the card's driver keeps static samplers in a table of its
+/// own and a compiled pipeline holds their places in it). The descriptors
+/// are ours, written by the card's descriptor write into the tail of the
+/// bound sampler heap ([`SamplerTail`]); the title never sees them. A draw
+/// of such a pipeline with no room for the tail in the bound sampler heap is
+/// dropped and counted. Off by default (after Kemerd/VIctory-NVIDIA-RT
+/// 42c41ef6f by Kemerd).
+pub(crate) fn sampler_table() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_SAMPLER_TABLE").is_some_and(|v| v == "1"))
+}
+
+/// Sampler slots kept for the tables of [`sampler_table`] at the end of
+/// every sampler heap, before its last slot (the one shaders clamp sampler
+/// indices to, which stays a point sampler).
+pub(crate) const SAMPLER_TAIL: u32 = 256;
+
+/// A sampler description in words, to tell two apart (floats by their bits).
+type SamplerKey = [u32; 13];
+
+/// The words of `d`: filter, three address modes, bias, anisotropy,
+/// comparison, border colour, both LOD bounds.
+fn sampler_key(d: &D3D12_SAMPLER_DESC) -> SamplerKey {
+    let [r, g, b, a] = d.BorderColor.map(f32::to_bits);
+    [
+        d.Filter.0 as u32,
+        d.AddressU.0 as u32,
+        d.AddressV.0 as u32,
+        d.AddressW.0 as u32,
+        d.MipLODBias.to_bits(),
+        d.MaxAnisotropy,
+        d.ComparisonFunc.0 as u32,
+        r,
+        g,
+        b,
+        a,
+        d.MinLOD.to_bits(),
+        d.MaxLOD.to_bits(),
+    ]
+}
+
+/// The heap descriptor of a stage's static sampler, the same fields the
+/// static one gets, or none where a heap descriptor cannot say the same: a
+/// border colour of integer texels (the description has only float
+/// borders). The border colour does not matter to a sampler that never
+/// addresses by it.
+pub(super) fn table_sampler(
+    s: &victory_shader::emit::StaticSampler,
+    aniso_point_mip_supported: bool,
+) -> Option<D3D12_SAMPLER_DESC> {
+    // D3D12_TEXTURE_ADDRESS_MODE_BORDER
+    const BORDER: u32 = 4;
+    let border = if s.address.contains(&BORDER) {
+        match s.border {
+            0 => [0.0; 4],
+            1 => [0.0, 0.0, 0.0, 1.0],
+            2 => [1.0; 4],
+            _ => return None,
+        }
+    } else {
+        [0.0; 4]
+    };
+    Some(D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+        MipLODBias: s.mip_lod_bias,
+        MaxAnisotropy: s.max_anisotropy,
+        ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+        BorderColor: border,
+        MinLOD: s.min_lod,
+        MaxLOD: s.max_lod,
+    })
+}
+
+/// A run of sampler descriptors kept at `offset` of the tail, for every
+/// stage whose samplers are exactly these.
+struct SamplerBlock {
+    offset: u32,
+    keys: Vec<SamplerKey>,
+    descs: Vec<D3D12_SAMPLER_DESC>,
+}
+
+/// The blocks made so far, in the order of their offsets, and the slots of
+/// the tail they take. Taken for a moment by the threads that make pipelines
+/// and by the first draw of a list that needs a block written.
+struct SamplerBlocks {
+    list: Vec<SamplerBlock>,
+    used: u32,
+}
+
+static SAMPLER_BLOCKS: std::sync::Mutex<SamplerBlocks> =
+    std::sync::Mutex::new(SamplerBlocks { list: Vec::new(), used: 0 });
+
+/// How many blocks exist: what a list compares with before it asks for the
+/// blocks to be written.
+static SAMPLER_BLOCK_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The sampler tables' counters, for the stats line: stages given a table,
+/// stages left with static samplers (no room in the tail, a border a heap
+/// descriptor cannot say, or no room in the root signature), draws dropped
+/// for want of room in the bound sampler heap.
+static SAMPLER_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Blocks, slots they take, and [`SAMPLER_STATS`].
+pub(crate) fn sampler_stats() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let used = SAMPLER_BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).used;
+    [
+        SAMPLER_BLOCK_COUNT.load(Relaxed) as u64,
+        u64::from(used),
+        SAMPLER_STATS[0].load(Relaxed),
+        SAMPLER_STATS[1].load(Relaxed),
+        SAMPLER_STATS[2].load(Relaxed),
+    ]
+}
+
+/// Counts a draw dropped for want of room for its sampler table.
+pub(crate) fn sampler_refused() {
+    SAMPLER_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl SamplerBlocks {
+    /// The offset in the tail of the block holding `descs`: the one made
+    /// before for the same descriptions, else a new one. None for none or
+    /// too many descriptions, or when the tail is full.
+    fn block(&mut self, descs: &[D3D12_SAMPLER_DESC]) -> Option<u32> {
+        let n = u32::try_from(descs.len()).ok().filter(|&n| n > 0 && n <= SAMPLER_TAIL)?;
+        let keys: Vec<SamplerKey> = descs.iter().map(sampler_key).collect();
+        if let Some(b) = self.list.iter().find(|b| b.keys == keys) {
+            return Some(b.offset);
+        }
+        let offset = self.used;
+        if offset + n > SAMPLER_TAIL {
+            return None;
+        }
+        self.used += n;
+        self.list.push(SamplerBlock { offset, keys, descs: descs.to_vec() });
+        Some(offset)
+    }
+}
+
+/// [`SamplerBlocks::block`] on the blocks of the process.
+fn sampler_block(descs: &[D3D12_SAMPLER_DESC]) -> Option<u32> {
+    let mut blocks = SAMPLER_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    let offset = blocks.block(descs);
+    SAMPLER_BLOCK_COUNT.store(blocks.list.len(), std::sync::atomic::Ordering::Release);
+    offset
+}
+
+/// How many blocks exist now.
+pub(crate) fn sampler_blocks() -> usize {
+    SAMPLER_BLOCK_COUNT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A sampler heap of our own for lists with no title sampler heap bound
+/// (in place of `Host::fallback_sampler_heap`, whose one slot leaves no
+/// tail): whole, 2,048 point samplers until a table is written over the
+/// tail's.
+pub(crate) fn table_heap() -> Option<&'static ID3D12DescriptorHeap> {
+    static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let host = host()?;
+        let count = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+        // SAFETY: plain shader-visible heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .ok()?;
+        let desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        // SAFETY: handles of the heap just made, written in its range.
+        unsafe {
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            for i in 0..count as usize {
+                host.device.CreateSampler(&desc, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + i * step });
+            }
+        }
+        Some(heap)
+    })
+    .as_ref()
+}
+
+/// The sampler heaps the blocks were written into so far, with how many:
+/// the heap is held (an address of a released heap cannot come back while
+/// it is listed, so no new heap is taken for a written one). The oldest go
+/// when there are more than `KEPT`; one met again is written again, which
+/// holds the same descriptors.
+static SAMPLER_FILLED: std::sync::Mutex<Vec<(ID3D12DescriptorHeap, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The tail of a bound sampler heap: where the blocks are, from the point
+/// of view of a list.
+pub(crate) struct SamplerTail {
+    heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+}
+
+/// Where the tail of a sampler heap of `count` slots starts, if the title's
+/// first `title` slots leave room for it: [`SAMPLER_TAIL`] slots before the
+/// last.
+fn tail_start(count: u32, title: u32) -> Option<u32> {
+    count.checked_sub(SAMPLER_TAIL + 1).filter(|&first| title <= first)
+}
+
+impl SamplerTail {
+    /// The tail of `heap`, whose first `title` slots are the title's
+    /// samplers: none if they leave no room, or the heap is not a sampler
+    /// heap.
+    pub(crate) fn new(heap: &ID3D12DescriptorHeap, title: u32) -> Option<Self> {
+        let host = host()?;
+        // SAFETY: plain queries of a live heap and the device.
+        let (desc, step, cpu, gpu) = unsafe {
+            (
+                heap.GetDesc(),
+                host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER),
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                heap.GetGPUDescriptorHandleForHeapStart().ptr,
+            )
+        };
+        if desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER || step == 0 {
+            return None;
+        }
+        let first = tail_start(desc.NumDescriptors, title)?;
+        let skip = u64::from(first) * u64::from(step);
+        Some(Self {
+            heap: heap.clone(),
+            cpu: cpu.checked_add(usize::try_from(skip).ok()?)?,
+            gpu: gpu.checked_add(skip)?,
+            step,
+        })
+    }
+
+    /// The handle of the block of `n` descriptors at `offset`, if the tail
+    /// has them all.
+    pub(crate) fn handle(&self, offset: u32, n: u32) -> Option<u64> {
+        (offset.checked_add(n)? <= SAMPLER_TAIL).then(|| self.gpu + u64::from(offset) * u64::from(self.step))
+    }
+
+    /// Writes the blocks this heap does not hold yet; how many exist now
+    /// (the caller remembers it and asks again only when [`sampler_blocks`]
+    /// is more). Under one lock, so that a draw that finds a block written
+    /// by another thread finds the descriptors there: the writes are small
+    /// and happen once for a block and a heap.
+    pub(crate) fn fill(&self) -> usize {
+        use windows::core::Interface;
+        const KEPT: usize = 256;
+        let Some(host) = host() else { return 0 };
+        let mut filled = SAMPLER_FILLED.lock().unwrap_or_else(|e| e.into_inner());
+        let at = match filled.iter().position(|(h, _)| h.as_raw() == self.heap.as_raw()) {
+            Some(at) => at,
+            None => {
+                if filled.len() >= KEPT {
+                    filled.remove(0);
+                }
+                filled.push((self.heap.clone(), 0));
+                filled.len() - 1
+            }
+        };
+        let blocks = SAMPLER_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        for block in blocks.list.iter().skip(filled[at].1) {
+            for (i, d) in block.descs.iter().enumerate() {
+                let slot = (block.offset as usize + i) * self.step as usize;
+                // SAFETY: a slot of the tail of a live sampler heap: blocks
+                // end inside the tail (`SamplerBlocks::block`).
+                unsafe { host.device.CreateSampler(d, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.cpu + slot }) };
+            }
+        }
+        filled[at].1 = blocks.list.len();
+        blocks.list.len()
+    }
+}
+
+/// The dwords a root signature's parameters take (64 at most): constants
+/// their count, a table one, a root descriptor two.
+fn root_dwords(params: &[D3D12_ROOT_PARAMETER1]) -> u32 {
+    params
+        .iter()
+        .map(|p| match p.ParameterType {
+            // SAFETY: the member the type names.
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe { p.Anonymous.Constants.Num32BitValues },
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => 1,
+            _ => 2,
+        })
+        .sum()
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
@@ -489,6 +797,10 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Its immediate samplers as a table in the tail of the sampler heap
+    /// ([`sampler_table`]): the root parameter, the offset of the block in
+    /// the tail and its length; none for static samplers or no samplers.
+    pub(crate) samplers: Option<(u32, u32, u32)>,
 }
 
 impl Stage {
@@ -606,6 +918,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                samplers: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -695,6 +1008,46 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            // With the sampler tables on, a stage whose samplers heap
+            // descriptors can say, for which the tail and the root signature
+            // have room, gets a table; else its samplers stay static.
+            if sampler_table() && !t.static_samplers.is_empty() {
+                let descs: Option<Vec<D3D12_SAMPLER_DESC>> = t
+                    .static_samplers
+                    .iter()
+                    .map(|s| table_sampler(s, aniso_point_mip_supported))
+                    .collect();
+                let block = descs
+                    .as_deref()
+                    .filter(|_| root_dwords(&params) < 64)
+                    .and_then(|d| sampler_block(d).map(|offset| (offset, d.len() as u32)));
+                if let Some((offset, n)) = block {
+                    ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+                        NumDescriptors: n,
+                        BaseShaderRegister: 0,
+                        RegisterSpace: SAMPLER_SPACE,
+                        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                        OffsetInDescriptorsFromTableStart: 0,
+                    }));
+                    let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                    stage.samplers = Some((params.len() as u32, offset, n));
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: 1,
+                                pDescriptorRanges: range,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                    SAMPLER_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    bound.push(stage);
+                    continue;
+                }
+                SAMPLER_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -1351,6 +1704,281 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// A static sampler as the translator hands them over.
+    fn static_sampler(filter: u32, address: u32, border: u32) -> victory_shader::emit::StaticSampler {
+        victory_shader::emit::StaticSampler {
+            filter,
+            address: [address; 3],
+            mip_lod_bias: 0.5,
+            max_anisotropy: 4,
+            comparison: 1,
+            border,
+            min_lod: 0.0,
+            max_lod: 12.0,
+        }
+    }
+
+    /// A static sampler becomes the heap descriptor with the same fields.
+    #[test]
+    fn a_table_sampler_keeps_the_static_ones_fields() {
+        let s = static_sampler(0x15, 3, 0);
+        let d = table_sampler(&s, true).unwrap();
+        assert_eq!(d.Filter.0 as u32, s.filter_for_host(true));
+        assert_eq!((d.AddressU.0, d.AddressV.0, d.AddressW.0), (3, 3, 3));
+        assert_eq!((d.MipLODBias, d.MaxAnisotropy, d.ComparisonFunc.0), (0.5, 4, 1));
+        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 12.0));
+        assert_eq!(d.BorderColor, [0.0; 4]);
+    }
+
+    /// Border colours matter only where the sampler addresses by border; an
+    /// integer border colour has no heap descriptor.
+    #[test]
+    fn border_colours_follow_the_address_mode() {
+        let by_border = |c| table_sampler(&static_sampler(0, 4, c), true).map(|d| d.BorderColor);
+        assert_eq!(by_border(0), Some([0.0; 4]));
+        assert_eq!(by_border(1), Some([0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(by_border(2), Some([1.0; 4]));
+        assert_eq!(by_border(3), None);
+        assert_eq!(by_border(4), None);
+        // Wrapping never reads the border: any value is a plain table sampler.
+        assert!(table_sampler(&static_sampler(0, 1, 4), true).is_some());
+    }
+
+    /// The same descriptions share a block; others take the next slots; a
+    /// full tail and garbage lengths refuse.
+    #[test]
+    fn sampler_blocks_are_shared_and_bounded() {
+        let one = |filter| table_sampler(&static_sampler(filter, 1, 0), true).unwrap();
+        let mut blocks = SamplerBlocks { list: Vec::new(), used: 0 };
+        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
+        assert_eq!(blocks.block(&[one(0)]), Some(2));
+        assert_eq!(blocks.block(&[one(0), one(0x15)]), Some(0));
+        // Same samplers in another order are another block.
+        assert_eq!(blocks.block(&[one(0x15), one(0)]), Some(3));
+        assert_eq!((blocks.list.len(), blocks.used), (3, 5));
+        assert_eq!(blocks.block(&[]), None);
+        let many = vec![one(0); SAMPLER_TAIL as usize + 1];
+        assert_eq!(blocks.block(&many), None);
+        let rest = vec![one(0x10); (SAMPLER_TAIL - 5) as usize];
+        assert_eq!(blocks.block(&rest), Some(5));
+        assert_eq!(blocks.block(&[one(0x11)]), None);
+        // What is there is still found when the tail is full.
+        assert_eq!(blocks.block(&[one(0)]), Some(2));
+    }
+
+    /// The tail lies before the last slot of a whole sampler heap, if the
+    /// title's slots leave room; its blocks end inside it.
+    #[test]
+    fn the_tail_needs_room_after_the_titles_slots() {
+        let whole = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+        assert_eq!(tail_start(whole, 0), Some(whole - 1 - SAMPLER_TAIL));
+        assert_eq!(tail_start(whole, whole - 1 - SAMPLER_TAIL), Some(whole - 1 - SAMPLER_TAIL));
+        assert_eq!(tail_start(whole, whole - SAMPLER_TAIL), None);
+        assert_eq!(tail_start(SAMPLER_TAIL, 0), None);
+        let Some(heap) = table_heap() else { return };
+        assert!(SamplerTail::new(heap, whole).is_none());
+        let tail = SamplerTail::new(heap, 16).unwrap();
+        assert!(tail.handle(0, SAMPLER_TAIL).is_some());
+        assert!(tail.handle(1, SAMPLER_TAIL).is_none());
+        assert!(tail.handle(u32::MAX, 2).is_none());
+        // SAFETY: plain queries of a live heap and the device.
+        let (start, step) = unsafe {
+            (
+                heap.GetGPUDescriptorHandleForHeapStart().ptr,
+                host().unwrap().device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER),
+            )
+        };
+        let first = u64::from(whole - 1 - SAMPLER_TAIL);
+        assert_eq!(tail.handle(0, 1), Some(start + first * u64::from(step)));
+        assert_eq!(tail.handle(3, 1), Some(start + (first + 3) * u64::from(step)));
+    }
+
+    /// The dwords of root parameters: constants by their count, a table
+    /// one, a root descriptor two.
+    #[test]
+    fn root_dwords_count_each_kind() {
+        let constants = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 7 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let table = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 0, pDescriptorRanges: std::ptr::null() },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let cbv = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1::default() },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        assert_eq!(root_dwords(&[]), 0);
+        assert_eq!(root_dwords(&[constants, table, cbv]), 10);
+    }
+
+    /// A shader whose immediate sampler is a table in the tail samples
+    /// through the descriptor that table holds: a point and a linear sampler
+    /// of a texture of two texels (0 and 1) at u = 0.4 give the first texel
+    /// and the mix 0.3, the same root signature and pipeline for both, only
+    /// the block bound differs. On the host GPU (WARP where there is none
+    /// but WARP).
+    #[test]
+    fn a_sampler_table_samples_through_its_own_descriptors() {
+        const CS: &str = "Texture2D<float> tex : register(t0);
+            SamplerState smp : register(s0, space0);
+            RWStructuredBuffer<float> result : register(u0);
+            [numthreads(1, 1, 1)] void main() { result[0] = tex.SampleLevel(smp, float2(0.4, 0.5), 0); }";
+        assert_eq!(SAMPLER_SPACE, 0, "the test's shader names the sampler space");
+        let Some(host) = host() else { return };
+        let Some(heap) = table_heap() else { return };
+        let code = crate::host::compile(CS, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        let srv_range = D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let sampler_range = D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: SAMPLER_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let table = |range: &D3D12_DESCRIPTOR_RANGE1| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: 1, pDescriptorRanges: range },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let params = [
+            table(&srv_range),
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1::default() },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            table(&sampler_range),
+        ];
+        let (root, _) = root_signature(&host.device, &params, &[], true, D3D12_ROOT_SIGNATURE_FLAG_NONE)
+            .expect("a root signature with a sampler table");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        let pso: ID3D12PipelineState = unsafe { host.device.CreateComputePipelineState(&desc) }.expect("a pipeline");
+
+        // The texture: two texels, cleared to 0 and the second to 1.
+        let texture: ID3D12Resource = {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 2,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // SAFETY: a valid texture description and a live output pointer.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut texture,
+                )
+            }
+            .expect("a texture");
+            texture.unwrap()
+        };
+        let made_heap = |kind, visible| -> ID3D12DescriptorHeap {
+            // SAFETY: plain heap creation.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 1,
+                    Flags: if visible { D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE } else { D3D12_DESCRIPTOR_HEAP_FLAG_NONE },
+                    NodeMask: 0,
+                })
+            }
+            .expect("a descriptor heap")
+        };
+        let rtvs = made_heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false);
+        let views = made_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true);
+        // SAFETY: views of a live texture in slots of the heaps just made.
+        unsafe {
+            host.device.CreateRenderTargetView(&texture, None, rtvs.GetCPUDescriptorHandleForHeapStart());
+            host.device.CreateShaderResourceView(&texture, None, views.GetCPUDescriptorHandleForHeapStart());
+        }
+        let (result, data) = host.shared_buffer(256).expect("a buffer");
+
+        // The blocks, written into the tail of our heap as a draw does.
+        let point = table_sampler(&static_sampler(0, 3, 0), true).map(|mut d| {
+            (d.MipLODBias, d.MaxAnisotropy, d.ComparisonFunc) = (0.0, 1, D3D12_COMPARISON_FUNC_NEVER);
+            d
+        });
+        // MIN_MAG_MIP_LINEAR.
+        let linear = point.map(|d| D3D12_SAMPLER_DESC { Filter: D3D12_FILTER(0x15), ..d });
+        let (point, linear) = (point.unwrap(), linear.unwrap());
+        let tail = SamplerTail::new(heap, 0).expect("a tail");
+        let sample = |d: &D3D12_SAMPLER_DESC, first: bool| -> f32 {
+            let offset = sampler_block(std::slice::from_ref(d)).expect("room in the tail");
+            assert!(tail.fill() >= 1);
+            let handle = tail.handle(offset, 1).expect("the block in the tail");
+            let list = host.new_list().expect("a host list");
+            // SAFETY: an open list; live heaps, views, root signature,
+            // pipeline and buffer; the shared buffer holds 256 bytes and the
+            // GPU is done with it when `execute` returns.
+            unsafe {
+                if first {
+                    let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+                    list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                    let second = windows::Win32::Foundation::RECT { left: 1, top: 0, right: 2, bottom: 1 };
+                    list.list.ClearRenderTargetView(rtv, &[1.0; 4], Some(&[second]));
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        &texture,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )]);
+                }
+                std::ptr::write_bytes(data, 0xee, 4);
+                list.list.SetDescriptorHeaps(&[Some(views.clone()), Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
+                list.list.SetComputeRootUnorderedAccessView(1, result.GetGPUVirtualAddress());
+                list.list.SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+                list.list.Dispatch(1, 1, 1);
+                list.close();
+                host.execute(&[&list]);
+                assert!(host.device.GetDeviceRemovedReason().is_ok(), "the device after sampling");
+                data.cast::<f32>().read()
+            }
+        };
+        let by_point = sample(&point, true);
+        let by_linear = sample(&linear, false);
+        eprintln!("through the sampler table: point {by_point}, linear {by_linear}");
+        assert_eq!(by_point, 0.0, "the point sampler's block gives the first texel");
+        assert!((by_linear - 0.3).abs() < 0.01, "the linear sampler's block mixes the texels: {by_linear}");
+    }
 
     #[test]
     fn direct_heap_flags_follow_final_features() {

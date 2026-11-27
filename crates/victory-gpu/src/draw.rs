@@ -410,6 +410,11 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Whether the host list has heaps set (a fallback one among them).
     host_heaps_set: bool,
+    /// The tail of the bound sampler heap that holds the tables of the
+    /// pipelines' samplers (`VICTORY_PIPELINE_SAMPLER_TABLE`), and how many
+    /// of the blocks this list has seen written into it.
+    sampler_tail: Option<crate::pipeline::host::SamplerTail>,
+    sampler_seen: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1278,6 +1283,8 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.sampler_tail = None;
+        self.sampler_seen = 0;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1571,6 +1578,38 @@ impl State {
         true
     }
 
+    /// Binds the table of a stage's immediate samplers
+    /// (`VICTORY_PIPELINE_SAMPLER_TABLE`): the blocks not yet written into
+    /// the bound sampler heap are written, once per heap, and the table
+    /// parameter points at the stage's block in its tail. True if the stage
+    /// has none. False, counted, if the heap has no room for the tail (a
+    /// title sampler heap that fills it): the draw is dropped, never drawn
+    /// through other samplers.
+    fn sampler_table(&mut self, list: &HostList, stage: &crate::pipeline::host::Stage, compute: bool) -> bool {
+        let Some((param, offset, n)) = stage.samplers else { return true };
+        let handle = self.sampler_tail.as_ref().and_then(|tail| {
+            if self.sampler_seen < crate::pipeline::host::sampler_blocks() {
+                self.sampler_seen = tail.fill();
+            }
+            tail.handle(offset, n)
+        });
+        let Some(handle) = handle else {
+            crate::pipeline::host::sampler_refused();
+            once!("a draw whose sampler table has no room in the sampler heap bound is dropped");
+            return false;
+        };
+        // SAFETY: an open list; the block is in the tail of the bound sampler
+        // heap, written above.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            }
+        }
+        true
+    }
+
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
@@ -1601,15 +1640,31 @@ impl State {
         if !self.host_heaps_set || self.host_heaps != self.heaps {
             let mut views = None;
             let mut samplers = None;
+            // Where the title's slots end in the sampler heap bound, for the
+            // tables of the pipelines' samplers.
+            let mut title_samplers = 0;
             for &h in self.heaps.iter().filter(|&&h| h != 0) {
                 let heap = crate::descriptor::heap(h as This);
                 if let Some(host) = heap.host() {
+                    if heap.samplers() {
+                        title_samplers = host.count();
+                    }
                     *(if heap.samplers() { &mut samplers } else { &mut views }) = Some(host.heap.clone());
                 }
             }
             let host = crate::host::host();
+            let tables = crate::pipeline::host::sampler_table();
             let views = views.or_else(|| host.and_then(|h| h.fallback_view_heap().cloned()));
-            let samplers = samplers.or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            // With the sampler tables on, our own whole heap, so that the
+            // tables have a place.
+            let samplers = samplers
+                .or_else(|| tables.then(crate::pipeline::host::table_heap).flatten().cloned())
+                .or_else(|| host.and_then(|h| h.fallback_sampler_heap().cloned()));
+            self.sampler_tail = samplers
+                .as_ref()
+                .filter(|_| tables)
+                .and_then(|h| crate::pipeline::host::SamplerTail::new(h, title_samplers));
+            self.sampler_seen = 0;
             let heaps: Vec<Option<ID3D12DescriptorHeap>> = [views, samplers].into_iter().filter(Option::is_some).collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             if !heaps.is_empty() {
@@ -1665,6 +1720,9 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                return false;
+            }
+            if !self.sampler_table(list, stage, compute) {
                 return false;
             }
             if stage.shader.ambient.is_some() {

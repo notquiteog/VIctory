@@ -71,6 +71,41 @@ pub(super) fn folder() -> Option<PathBuf> {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+
+/// What the calls of [`pipeline`] cost, for the "all made" and "saved"
+/// lines: loads from the library, makes after a load that missed, and makes
+/// without a library, each the count, the sum and the longest in
+/// microseconds. Written by the workers.
+static CALL_TIMES: [[AtomicU64; 3]; 3] = [const { [const { AtomicU64::new(0) }; 3] }; 3];
+const LOAD_CALL: usize = 0;
+const MISS_CALL: usize = 1;
+const BYPASS_CALL: usize = 2;
+
+/// Counts one call of `kind` that took `since` until now.
+fn timed(kind: usize, since: std::time::Instant) {
+    let us = since.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    let [count, sum, longest] = &CALL_TIMES[kind];
+    count.fetch_add(1, Ordering::Relaxed);
+    sum.fetch_add(us, Ordering::Relaxed);
+    longest.fetch_max(us, Ordering::Relaxed);
+}
+
+/// The calls of `kind` as "count/sum ms/longest ms".
+fn call_times(kind: usize) -> String {
+    let [count, sum, longest] = &CALL_TIMES[kind];
+    format!(
+        "{}/{:.0}/{:.0}",
+        count.load(Ordering::Relaxed),
+        sum.load(Ordering::Relaxed) as f64 / 1e3,
+        longest.load(Ordering::Relaxed) as f64 / 1e3
+    )
+}
+
+/// The loads, the makes after a miss and the makes without a library, each
+/// "count/sum ms/longest ms" ([`CALL_TIMES`]).
+pub(crate) fn call_lines() -> [String; 3] {
+    [call_times(LOAD_CALL), call_times(MISS_CALL), call_times(BYPASS_CALL)]
+}
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -647,7 +682,10 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        let began = std::time::Instant::now();
+        let made = create();
+        timed(BYPASS_CALL, began);
+        return made;
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -662,6 +700,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            timed(LOAD_CALL, began);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -673,7 +712,10 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let made_at = std::time::Instant::now();
+        let pso = create()?;
+        timed(MISS_CALL, made_at);
+        pso
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -769,6 +811,15 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            // count/sum ms/longest ms of the loads, the makes after a miss
+            // and the makes without a library.
+            loads = %call_times(LOAD_CALL),
+            misses = %call_times(MISS_CALL),
+            bypass = %call_times(BYPASS_CALL),
+            // the sampler tables (`VICTORY_PIPELINE_SAMPLER_TABLE`): blocks,
+            // slots, stages with a table, stages left static, draws dropped
+            // for want of room in the heap.
+            sampler_tables = ?crate::pipeline::host::sampler_stats(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
