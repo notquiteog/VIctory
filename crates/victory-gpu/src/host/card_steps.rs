@@ -514,9 +514,14 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
 /// its place, after it), nor the submission be cut between them (one
 /// list): [`BEHIND_PLACED`], and the line stood 32-48 ms a frame until the
 /// flights had landed. It brings the placed order ([`placed_order`]).
+///
+/// On unless `VICTORY_PLACED_FILLS=0`: Series X, rays on, walking, the
+/// line's settles 78.8 -> 13.2 ms a frame, median 152 -> 127 ms, p75
+/// 238 -> 157; Series S 97/81 -> 79/85 (run settle-order sox/sos, captures
+/// clean).
 pub(super) fn placed_fills() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_FILLS"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLS").is_none_or(|v| v != "0"))
 }
 
 /// With [`placed_fills`], for a copy at its place (`p`) whose source or
