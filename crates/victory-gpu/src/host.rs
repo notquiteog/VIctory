@@ -593,6 +593,22 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// A landing gives the line back (the waiters for flights to land go on)
+/// before it gives back the landed lists' descriptor slots and drops what
+/// waited for submissions to finish ([`bury`]); both only give back. With
+/// rays on they were about 9 ms (the slots: tree work under the heap's
+/// lock) and 3 ms (the driver destroying allocations) of a landing the
+/// line waited for; with this the copy-back went from 23.4 and 19.6 ms a
+/// frame to 14.0 and 13.3 in runs paired by list calls and draws, the
+/// pictures unchanged. Nothing the title or a later submission reads
+/// moves: the read-backs, the title's values and the shadows' ranges are
+/// done before, as they were. `VICTORY_LAND_AFTER=0`: in the landing, as
+/// before.
+fn land_after() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_AFTER").is_none_or(|v| v != "0"))
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -5409,8 +5425,11 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
-        // SAFETY: a plain query on this queue's fence.
-        release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
+        let after = land_after();
+        if !after {
+            // SAFETY: a plain query on this queue's fence.
+            release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5489,7 +5508,9 @@ impl Host {
                     }
                     crate::land::spent(crate::land::stat::RB_DONE, done_from);
                     let mut lists = flight.lists;
-                    crate::list::tables_landed(&mut lists);
+                    if !after {
+                        crate::list::tables_landed(&mut lists);
+                    }
                     landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
@@ -5505,7 +5526,9 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            if !after {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -5524,7 +5547,9 @@ impl Host {
                 landing,
                 ..
             } = &mut *line;
-            kept.extend(landed);
+            if !after {
+                kept.extend(landed.drain(..));
+            }
             in_hand.clear();
             landing.clear();
             // What is still in the air, from the flights that are.
@@ -5542,10 +5567,29 @@ impl Host {
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
-            *poke = true;
+            *poke = !after;
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        if after {
+            // The line is free; what only gives back follows.
+            let _giving = crate::timeline::span("landing: slots and the buried given back, after telling");
+            for (lists, _) in &mut landed {
+                for list in lists.iter_mut() {
+                    list.release_tables();
+                }
+                crate::list::tables_landed(lists);
+            }
+            if last > 0 {
+                bury(last);
+            }
+            {
+                let mut line = line();
+                line.landed.extend(landed);
+                line.poke = true;
+            }
+            LINE_MOVED.notify_all();
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces

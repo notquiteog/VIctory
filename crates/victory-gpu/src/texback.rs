@@ -379,24 +379,20 @@ fn write(landing: &Landing) {
     }
     let (at, end) = (landing.ticket.at, landing.ticket.end);
     let size = end - at;
-    let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    // (One larger than 8 MiB is not kept.)
+    let written = if keep() && size <= 8 << 20 {
+        KEPT.with_borrow_mut(|tiled| {
+            if tiled.len() < size {
+                tiled.resize(size, 0);
+            }
+            write_into(landing, at, &mut tiled[..size])
+        })
+    } else {
+        write_into(landing, at, &mut vec![0u8; size])
+    };
+    if !written {
         return;
     }
-    for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
-        let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let from = footprint.Offset as usize;
-        let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
-        if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            return;
-        }
-    }
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     spent(stat::TB_WORK, working);
     count(stat::TB_WRITTEN, 1);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -409,6 +405,48 @@ fn write(landing: &Landing) {
             "texture readback landed"
         );
     }
+}
+
+/// The bytes a texture is tiled into before it goes to the title are a
+/// buffer each writing thread keeps (up to 8 MiB), not one made and freed
+/// per texture. About 20 textures of 256-512 KiB land a frame; blocks that
+/// size come from the kernel each time (zeroed pages, faults), and the
+/// making and freeing took most of the 8 ms a frame the read-backs did
+/// (rays on): with this they took 3.5 ms, against 4.0 and 5.5. Every byte
+/// of the part used is read from the title before anything is tiled into
+/// it, so what was there before does not matter. `VICTORY_TEXBACK_KEEP=0`:
+/// one per texture, as before.
+fn keep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_KEEP").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    static KEPT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Tiles `landing` into `tiled` (the title's bytes at `at` first, for what
+/// the subresources do not cover) and copies it to the title; false if it
+/// could not be.
+fn write_into(landing: &Landing, at: usize, tiled: &mut [u8]) -> bool {
+    let size = tiled.len();
+    if !crate::host::read_into(at as *const u8, tiled) {
+        return false;
+    }
+    for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
+        let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let from = footprint.Offset as usize;
+        let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
+        if let Err(e) = landing.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            return false;
+        }
+    }
+    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    true
 }
 
 /// The thread that writes read-backs into title memory, and what waits for it.
