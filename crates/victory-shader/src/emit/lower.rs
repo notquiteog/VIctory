@@ -2056,6 +2056,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            s.lds_title_dwords = s.lds_dwords;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -2263,6 +2264,7 @@ impl<'a> Lower<'a> {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            s.lds_title_dwords = s.lds_dwords;
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -6187,23 +6189,51 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
+        // Past the program's LDS the console reads 0 and drops writes. On
+        // the host such an index is undefined behaviour, and the dwords
+        // right after the program's are the layer's own (lane exchange,
+        // halves, wave order), so each access gets its dword's pointer with
+        // the index clamped into the program's part, and whether it was in
+        // it (`inb`): reads past it give 0, writes and atomics past it do
+        // nothing.
+        // shortcut: LDS addresses are taken as aligned.
+        let limit = self.s.lds_title_dwords;
         let byte_addr = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             l.s.m.bin(c, Bin::Add, a, o)
         };
-        let dword_at = |l: &mut Self, at: V| -> V {
+        let dword_at = |l: &mut Self, at: V| -> (V, V) {
             let c = l.cur;
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let n = l.s.m.i32(limit);
+            let inb = l.s.m.cmp(c, pred::IULT, index, n);
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inb, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inb)
         };
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let at = byte_addr(l, bytes);
             dword_at(l, at)
+        };
+        // What a load gives: 0 past the program's LDS.
+        let loaded = |l: &mut Self, p: V, inb: V| -> V {
+            let c = l.cur;
+            let w = l.s.m.load(c, p);
+            let zero = l.s.m.i32(0);
+            l.s.m.select(c, inb, w, zero)
+        };
+        // The lanes that access memory: the lane guard's, and in bounds.
+        let within = |l: &mut Self, inb: V| -> V {
+            match guard {
+                Some(g) => {
+                    let c = l.cur;
+                    l.s.m.bin(c, Bin::And, g, inb)
+                }
+                None => inb,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -6237,7 +6267,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inb) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -6246,7 +6276,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.s.m.load(c, p);
+                let w = loaded(self, p, inb);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -6289,7 +6319,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let g = within(self, inb);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -6307,8 +6338,8 @@ impl<'a> Lower<'a> {
                 let mut n = 0;
                 for (off, w) in elements {
                     for k in 0..w {
-                        let p = dword(self, off + 4 * k);
-                        let x = self.s.m.load(self.cur, p);
+                        let (p, inb) = dword(self, off + 4 * k);
+                        let x = loaded(self, p, inb);
                         self.write(inst, Reg::V(reg + n), x, guard);
                         n += 1;
                     }
@@ -6329,8 +6360,8 @@ impl<'a> Lower<'a> {
                 _ => return Err("an LDS read of bytes or halves"),
             };
             let at = byte_addr(self, offset);
-            let p = dword_at(self, at);
-            let word = self.s.m.load(self.cur, p);
+            let (p, inb) = dword_at(self, at);
+            let word = loaded(self, p, inb);
             let c = self.cur;
             let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
             let three = self.s.m.i32(3);
@@ -6369,8 +6400,10 @@ impl<'a> Lower<'a> {
                 }
                 let at = self.begin_guarded(guard);
                 for (off, x) in stores {
-                    let p = dword(self, off);
+                    let (p, inb) = dword(self, off);
+                    let here = self.begin_guarded(Some(inb));
                     self.s.m.store(self.cur, p, x);
+                    self.end_guarded(here, &[]);
                 }
                 self.end_guarded(at, &[]);
                 return Ok(());
@@ -6384,7 +6417,7 @@ impl<'a> Lower<'a> {
             };
             let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
             let at_bytes = byte_addr(self, offset);
-            let p = dword_at(self, at_bytes);
+            let (p, inb) = dword_at(self, at_bytes);
             let c = self.cur;
             if hi_src {
                 let k16 = self.s.m.i32(16);
@@ -6402,7 +6435,8 @@ impl<'a> Lower<'a> {
             let shifted_val = self.s.m.bin(c, Bin::Shl, val, shift);
             // Atomic clear + set so concurrent lanes writing adjacent bytes or
             // halves within the same 32-bit dword do not race.
-            let at = self.begin_guarded(guard);
+            let g = within(self, inb);
+            let at = self.begin_guarded(Some(g));
             self.s
                 .m
                 .atomic(self.cur, super::bitcode::Rmw::And, p, clear_mask);
@@ -6442,13 +6476,25 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inb) = dword(self, offset);
+        // A lane the guard lets through but whose dword is past the
+        // program's LDS gets 0 back; a lane the guard stops keeps its value.
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let outside = match guard {
+            Some(g) => {
+                let past = self.s.m.select(c, inb, outside, zero);
+                self.s.m.select(c, g, past, outside)
+            }
+            None => self.s.m.select(c, inb, outside, zero),
+        };
+        let g = Some(within(self, inb));
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(g);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -6456,7 +6502,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(g);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
