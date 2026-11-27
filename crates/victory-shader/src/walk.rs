@@ -56,6 +56,10 @@ pub struct Walk {
     pub carried: Vec<Reg>,
     /// Instruction names in the loop and how often, for the shape.
     pub ops: BTreeMap<&'static str, usize>,
+    /// The loop's code with registers numbered by first use ([`canonical`]):
+    /// loops with the same one are the same walk, whatever registers the
+    /// compiler gave them (what a recogniser matches on).
+    pub fingerprint: u64,
 }
 
 impl Walk {
@@ -63,7 +67,7 @@ impl Walk {
     /// sort on.
     pub fn shape(&self) -> String {
         format!(
-            "tests{}{} lds{}/{}/{} loads{} smem{} stores{} atom{} img{} lanes{} bar{} exits{} inner{} out{} carried{}",
+            "tests{}{} lds{}/{}/{} loads{} smem{} stores{} atom{} img{} lanes{} bar{} exits{} inner{} out{} carried{} code {:016x}",
             self.tests,
             if self.tests64 > 0 { "w" } else { "" },
             self.lds_reads,
@@ -80,6 +84,7 @@ impl Walk {
             self.inner,
             self.live_out.len(),
             self.carried.len(),
+            self.fingerprint,
         )
     }
 }
@@ -254,7 +259,58 @@ fn describe(p: &Program, h: usize, body: &[bool], depth: usize, inner: usize) ->
         }
     }
     w.live_out = out.into_iter().collect();
+    w.fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        canonical(p, body).hash(&mut h);
+        h.finish()
+    };
     w
+}
+
+/// The loop's code, block by block in program order, each instruction its
+/// name and fields with every register renamed by its first appearance in
+/// the loop (scalars and vectors apart; `vcc`, `m0`, `exec` and the like
+/// keep their names). Literals, inline constants and offsets stay.
+pub fn canonical(p: &Program, body: &[bool]) -> String {
+    let mut blocks: Vec<usize> = (0..p.blocks.len()).filter(|&b| body[b]).collect();
+    blocks.sort_by_key(|&b| p.blocks[b].offset);
+    let mut scalars: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut vectors: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut out = String::new();
+    for b in blocks {
+        out.push_str("|");
+        for inst in &p.blocks[b].insts {
+            out.push_str(inst.name());
+            // Fields' operands, renamed, in the order the fields print them.
+            let mut text = format!("{:?}", inst.fields);
+            let mut renamed = String::with_capacity(text.len());
+            for (kind, key) in [("Scalar { code: ", 0u8), ("Vector { reg: ", 1)] {
+                renamed.clear();
+                let mut rest = text.as_str();
+                while let Some(at) = rest.find(kind) {
+                    renamed.push_str(&rest[..at + kind.len()]);
+                    rest = &rest[at + kind.len()..];
+                    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                    let n: u8 = rest[..digits].parse().unwrap_or(0);
+                    rest = &rest[digits..];
+                    let name = if key == 0 && n >= 106 && n < crate::ir::PARKED {
+                        format!("x{n}")
+                    } else {
+                        let map = if key == 0 { &mut scalars } else { &mut vectors };
+                        let next = map.len();
+                        format!("r{}", *map.entry(n).or_insert(next))
+                    };
+                    renamed.push_str(&name);
+                }
+                renamed.push_str(rest);
+                std::mem::swap(&mut text, &mut renamed);
+            }
+            out.push_str(&text);
+            out.push(';');
+        }
+    }
+    out
 }
 
 #[cfg(test)]
