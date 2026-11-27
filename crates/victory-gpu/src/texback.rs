@@ -232,17 +232,18 @@ pub(crate) fn land(back: &Back) {
     }
 }
 
-/// `VICTORY_TEXBACK_KEEP=1`: the bytes a texture is tiled into before it
-/// goes to the title are a buffer each landing thread keeps, not one made
-/// and freed per texture. About 20 textures of 256-512 KiB land a frame;
-/// blocks that size come from the kernel each time (zeroed pages, faults)
-/// and the making and freeing took most of the 8 ms a frame the
-/// read-backs did (rays on). Every byte of the part used is read from the
-/// title before anything is tiled into it, so what was there before does
-/// not matter.
+/// The bytes a texture is tiled into before it goes to the title are a
+/// buffer each landing thread keeps (up to 8 MiB), not one made and freed
+/// per texture. About 20 textures of 256-512 KiB land a frame; blocks that
+/// size come from the kernel each time (zeroed pages, faults), and the
+/// making and freeing took most of the 8 ms a frame the read-backs did
+/// (rays on): with this they took 3.5 ms, against 4.0 and 5.5. Every byte
+/// of the part used is read from the title before anything is tiled into
+/// it, so what was there before does not matter. `VICTORY_TEXBACK_KEEP=0`:
+/// one per texture, as before.
 fn keep() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_KEEP").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_KEEP").is_none_or(|v| v != "0"))
 }
 
 thread_local! {

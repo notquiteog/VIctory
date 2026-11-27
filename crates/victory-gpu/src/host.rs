@@ -588,24 +588,28 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// A landing gives the line back (the waiters for flights to land go on)
+/// before it gives back the landed lists' descriptor slots and drops what
+/// waited for submissions to finish ([`bury`]); both only give back. With
+/// rays on they were about 9 ms (the slots: tree work under the heap's
+/// lock) and 3 ms (the driver destroying allocations) of a landing the
+/// line waited for; with this the copy-back went from 23.4 and 19.6 ms a
+/// frame to 14.0 and 13.3 in runs paired by list calls and draws, the
+/// pictures unchanged. Nothing the title or a later submission reads
+/// moves: the read-backs, the title's values and the shadows' ranges are
+/// done before, as they were. `VICTORY_LAND_AFTER=0`: in the landing, as
+/// before.
+fn land_after() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_AFTER").is_none_or(|v| v != "0"))
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
 /// were page faults in memory nothing of ours named any more, at no command
 /// in particular. Objects let go while nothing runs wait as well: lists
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
-/// `VICTORY_LAND_AFTER=1`: a landing gives the line back (the waiters
-/// for flights to land go on) before it gives back the landed lists'
-/// descriptor slots and drops what waited for submissions to finish
-/// ([`bury`]); both only give back, and took about 12 ms a frame of a
-/// landing the line waited for (rays on). Nothing the title or a later
-/// submission reads moves: the read-backs, the title's values and the
-/// shadows' ranges are done before, as they were.
-fn land_after() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_AFTER").is_some_and(|v| v == "1"))
-}
-
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
