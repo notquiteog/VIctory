@@ -182,8 +182,8 @@ word_enum! {
 word_enum! {
     /// Which releases the updater follows.
     Channel {
-        #[default]
         Stable = "stable" => "Stable (latest release)",
+        #[default]
         Nightly = "nightly" => "Latest build (newest commit on main)",
     }
 }
@@ -273,7 +273,7 @@ impl Default for Updates {
         Updates {
             check_on_start: true,
             last_check: 0,
-            channel: Channel::Stable,
+            channel: Channel::Nightly,
             installed_from: Channel::Stable,
         }
     }
@@ -312,8 +312,9 @@ const HEADER: &str =
     "# VI launcher settings. Edit in the launcher (Settings tab) or here while it is closed.\n\n";
 
 /// The defaults this version has: 2 is Series S at half resolution with ray
-/// tracing, as `scripts/play.ps1` (0.1.0 had Series X).
-pub const DEFAULTS: u32 = 2;
+/// tracing, as `scripts/play.ps1` (0.1.0 had Series X); 3 is updates from
+/// the Latest build channel, rebuilt from every change (Stable before).
+pub const DEFAULTS: u32 = 3;
 
 impl Settings {
     /// Takes a file written by an older launcher to this one's defaults
@@ -322,12 +323,20 @@ impl Settings {
         if self.defaults >= DEFAULTS {
             return None;
         }
+        let was = self.defaults;
         self.defaults = DEFAULTS;
+        let mut notes = Vec::new();
         // 0.1.0 wrote its default console (Series X) into every file.
-        (self.console == Console::SeriesX).then(|| {
+        if was < 2 && self.console == Console::SeriesX {
             self.console = Console::SeriesS;
-            "The recommended settings changed: the game now starts as an Xbox Series S (1080p picture, the world drawn at 540p, ray tracing on), the fastest measured. Series X can be chosen again under Settings.".to_owned()
-        })
+            notes.push("The recommended settings changed: the game now starts as an Xbox Series S (1080p picture, the world drawn at 540p, ray tracing on), the fastest measured. Series X can be chosen again under Settings.");
+        }
+        // Files before 3 hold Stable, the old default channel.
+        if was < 3 && self.updates.channel == Channel::Stable {
+            self.updates.channel = Channel::Nightly;
+            notes.push("Updates now come from the Latest build channel, rebuilt from every change, so fixes reach you as soon as they are made. Stable can be chosen again under Updates.");
+        }
+        (!notes.is_empty()).then(|| notes.join("\n\n"))
     }
 
     pub fn from_toml(text: &str) -> Result<Self, String> {
@@ -1024,15 +1033,16 @@ mod tests {
     #[test]
     fn a_file_of_0_1_0_is_brought_to_the_new_defaults_once() {
         // What 0.1.0 wrote: every field, its default console among them.
-        let old = "game_dir = 'D:\\g'\nsetup_done = true\nconsole = \"series-x\"\npreset = \"recommended\"\nambient = 0.8\nrender_scale = 0.0\n";
+        let old = "game_dir = 'D:\\g'\nsetup_done = true\nconsole = \"series-x\"\npreset = \"recommended\"\nambient = 0.8\nrender_scale = 0.0\n[updates]\nchannel = \"stable\"\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, old).unwrap();
         let (mut s, note) = Settings::load(&path);
-        assert!(note.unwrap().contains("Series S"));
+        let note = note.unwrap();
+        assert!(note.contains("Series S") && note.contains("Latest build"));
         assert_eq!(
-            (s.console, s.defaults, s.ray_tracing),
-            (Console::SeriesS, DEFAULTS, true)
+            (s.console, s.defaults, s.ray_tracing, s.updates.channel),
+            (Console::SeriesS, DEFAULTS, true, Channel::Nightly)
         );
         assert_eq!(s.warm, WarmMode::Used);
         // Chosen again after that, it stays.
@@ -1041,8 +1051,28 @@ mod tests {
         let (s, note) = Settings::load(&path);
         assert_eq!((s.console, note), (Console::SeriesX, None));
         // A 0.1.0 file that had Series S says nothing.
-        std::fs::write(&path, "console = \"series-s\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "console = \"series-s\"\n[updates]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
         assert_eq!(Settings::load(&path).1, None);
+        // A file of defaults 2 keeps its console; Stable moves to Latest build once.
+        std::fs::write(
+            &path,
+            "defaults = 2\nconsole = \"series-x\"\n[updates]\nchannel = \"stable\"\n",
+        )
+        .unwrap();
+        let (mut s, note) = Settings::load(&path);
+        assert!(note.unwrap().contains("Latest build"));
+        assert_eq!(
+            (s.console, s.updates.channel),
+            (Console::SeriesX, Channel::Nightly)
+        );
+        s.updates.channel = Channel::Stable;
+        s.save(&path).unwrap();
+        let (s, note) = Settings::load(&path);
+        assert_eq!((s.updates.channel, note), (Channel::Stable, None));
     }
 
     #[test]
