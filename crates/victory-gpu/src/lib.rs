@@ -127,6 +127,8 @@ pub mod upscale;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod readprobe;
 
 #[cfg(windows)]
 pub use host::on_failure;

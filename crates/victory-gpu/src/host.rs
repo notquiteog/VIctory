@@ -4527,6 +4527,7 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
+    crate::readprobe::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);

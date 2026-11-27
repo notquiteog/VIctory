@@ -655,6 +655,8 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    let probe = crate::readprobe::on();
+    let mut probed = Vec::new();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -687,6 +689,9 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
+            if probe {
+                probed.push(title + from);
+            }
             if beside.is_some() {
                 let page = (title + from) / PAGE;
                 // (Two parts in one page.)
@@ -698,6 +703,11 @@ unsafe fn piece_at(
             }
         }
     });
+    if probe && !probed.is_empty() {
+        // SAFETY: the host copy the piece came through lives while it lands.
+        let of = if copy.is_null() { (0, 0) } else { unsafe { (*copy).span() } };
+        crate::readprobe::arm(&probed, of);
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the
