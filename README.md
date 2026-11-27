@@ -22,7 +22,9 @@ Measured walking outdoors on an NVIDIA card, Series S profile at half resolution
 
 ## Run it
 
-You need:
+Without building anything: download **VI-Setup.exe** from [Releases](https://github.com/notquiteog/VIctory/releases), start it, press Install, and choose the folder of your copy of the game. Its Play button starts the game the way `scripts\play.ps1` does below, with the same defaults; the flags are on its Settings tab ([apps/victory-launcher](apps/victory-launcher/README.md)).
+
+To build it yourself, you need:
 
 - Windows 10 or 11, x64
 - a CPU with AVX2
