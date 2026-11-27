@@ -1197,6 +1197,104 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
     out
 }
 
+/// Original subtraction, retained for small batches and degenerate spans.
+fn snapshot_parts_pairwise(
+    range: (usize, usize),
+    pending: &[(usize, usize)],
+    inside: impl Fn((usize, usize)) -> (usize, usize),
+) -> Vec<(usize, usize)> {
+    let mut parts = vec![range];
+    for &span in pending {
+        let (a, e) = inside(span);
+        let mut rest = Vec::with_capacity(parts.len() + 1);
+        for (from, to) in parts {
+            if e <= from || a >= to {
+                rest.push((from, to));
+                continue;
+            }
+            if from < a {
+                rest.push((from, a));
+            }
+            if e < to {
+                rest.push((e, to));
+            }
+        }
+        parts = rest;
+        if parts.is_empty() {
+            break;
+        }
+    }
+    parts
+}
+
+/// Compute the uncovered snapshot intervals without repeatedly rebuilding
+/// the remaining ranges. Keep the exact old boundaries for empty spans,
+/// which can split an interval despite containing no bytes.
+fn snapshot_parts(
+    range: (usize, usize),
+    pending: &[(usize, usize)],
+    inside: impl Fn((usize, usize)) -> (usize, usize),
+) -> Vec<(usize, usize)> {
+    let (from, to) = range;
+    if pending.len() < 32 || from >= to {
+        return snapshot_parts_pairwise(range, pending, inside);
+    }
+    let mut skip = Vec::new();
+    for &span in pending {
+        let (a, b) = inside(span);
+        if b <= from || a >= to {
+            continue;
+        }
+        if a >= b {
+            return snapshot_parts_pairwise(range, pending, inside);
+        }
+        if a <= from && b >= to {
+            return Vec::new();
+        }
+        skip.push((a, b));
+    }
+    outside(from, to, skip)
+}
+
+#[cfg(test)]
+mod snapshot_sweep_tests {
+    use super::{snapshot_parts, snapshot_parts_pairwise};
+
+    #[test]
+    fn snapshot_sweep_matches_pairwise() {
+        let mut seed = 123456789u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as usize
+        };
+        for count in [0, 1, 31, 32, 33, 128, 1024, 2800] {
+            for _ in 0..32 {
+                let pending: Vec<_> = (0..count).map(|_| {
+                    let a = next() % 32768;
+                    (a, a + 1 + next() % 256)
+                }).collect();
+                let inside = |(a, b): (usize, usize)| (a.clamp(32, 32700), b.clamp(32, 32700));
+                let a = next() % 16000;
+                let b = a + 1 + next() % 16000;
+                let range = inside((a, b));
+                assert_eq!(snapshot_parts(range, &pending, inside),
+                    snapshot_parts_pairwise(range, &pending, inside));
+            }
+        }
+        let identity = |r| r;
+        let mut pending: Vec<_> = (0..2800).map(|i| (i * 8 + 2, i * 8 + 4)).collect();
+        for range in [(0, 22400), (8, 16), (9, 9), (50000, 60000)] {
+            assert_eq!(snapshot_parts(range, &pending, identity),
+                snapshot_parts_pairwise(range, &pending, identity));
+        }
+        pending.push((5, 5));
+        assert_eq!(snapshot_parts((0, 22400), &pending, identity),
+            snapshot_parts_pairwise((0, 22400), &pending, identity));
+        pending.push((0, 22400));
+        assert!(snapshot_parts((0, 22400), &pending, identity).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod relay_tests {
     use super::{Flights, changed_runs, merge_piece, outside};
@@ -3411,24 +3509,7 @@ impl Shadow {
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
-        }
+        let parts = snapshot_parts(self.inside(address, len), &pending, |(a, e)| self.inside(a, e - a));
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
