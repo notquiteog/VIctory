@@ -15,7 +15,7 @@ Measured walking outdoors on an NVIDIA card, Series S profile at half resolution
 
 - Ray tracing is the title's own: real bounced light, reflections and clouds. A tree canopy sometimes shows as dark squares for a few seconds.
 - You need 64 GB of RAM: the game uses 25–45 GB.
-- The first run after a new driver or build stutters while shaders are compiled. `target\diag\victory.exe warm --used` compiles the ones earlier runs used ahead of time.
+- Before each start, `play.ps1` compiles the pipelines earlier runs used, so a new driver or build doesn't stutter. This is quick when nothing changed. The very first run still compiles as it goes.
 
 ## Run it
 
@@ -45,6 +45,8 @@ scripts\play.ps1 -Exe <your copy's executable>
 | `-NoRayTracing` | Uses the ambient stand-in for indirect light instead of ray tracing. |
 | `-Safe` | Turns off the newer submission paths. Try it first if something breaks. |
 | `-Adapter <name>` | Picks a card on a PC with more than one. |
+| `-WarmAll` | Compiles every pipeline the game has ever created, not only the ones earlier runs used. Takes a long time the first time. |
+| `-NoWarm` | Starts at once, without compiling pipelines first. |
 | `-SmoothMotion` | NVIDIA only: starts a copy named `victory_sm.exe`, so a Smooth Motion profile you set for that name in the NVIDIA App applies. |
 
 Every `VICTORY_*` setting is documented where the code reads it.

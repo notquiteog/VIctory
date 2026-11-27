@@ -16,6 +16,9 @@
 #                for that name in the NVIDIA App applies (the driver's frame generation; nothing is downloaded)
 # -Build         target\diag (the default, the build all measurements are of) or target\release
 # -More          other settings: -More @{VICTORY_PANEL='1'}
+# -NoWarm        start at once, without first compiling the pipelines earlier runs used (victory warm --used)
+# -WarmAll       compile every pipeline the title has ever created first, not only those earlier runs used (long the
+#                first time: tens of thousands; afterwards only new ones)
 # -RayTracing    accepted and ignored (ray tracing is the default); kept so older command lines still work
 #
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -29,6 +32,8 @@ param(
     [switch]$SmoothMotion,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
+    [switch]$NoWarm,
+    [switch]$WarmAll,
     [switch]$RayTracing
 )
 $settings = @{
@@ -87,4 +92,16 @@ $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory @runArgs } finally { Pop-Location }
+try {
+    if (-not $NoWarm) {
+        # Host pipelines made ahead, into the driver's cache on disk, so the run does not stutter compiling them:
+        # those earlier runs drew with (or, with -WarmAll, every one the title ever created). Ones made before for
+        # this build and driver are skipped, so this is quick once done; it runs at idle priority.
+        $what = if ($WarmAll) { 'every pipeline the title has created' } else { 'the pipelines earlier runs used' }
+        Write-Host "Compiling $what ahead (-NoWarm skips this)"
+        $warmArgs = @('warm')
+        if (-not $WarmAll) { $warmArgs += '--used' }
+        & (Join-Path $PSScriptRoot "..\target\$Build\victory.exe") @warmArgs
+    }
+    & $victory @runArgs
+} finally { Pop-Location }
