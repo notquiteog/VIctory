@@ -482,6 +482,36 @@ fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {
     }
 }
 
+/// The reference's result with [`super::bvh_walk_guard`]'s cuts (at the
+/// level the test runs at, 1 unless it sets one): of a box, a child at
+/// node 0, at the box or (2) before it is not entered. (These scenes' child
+/// ids are made up, so some are.)
+fn guarded(want: [u32; 4], scene: &Scene, case: &Case, pointers: u64, wide: bool, sort: bool) -> [u32; 4] {
+    let level = super::bvh_walk_guard();
+    let Some((n, kind @ (4 | 5), _)) = case else {
+        return want;
+    };
+    if level == 0 {
+        return want;
+    }
+    let pointer = (pointers >> 3) + u64::from(scene.pointer(*n, *kind));
+    let here = pointer as u32 & !7;
+    let low = !wide || pointer >> 32 == 0;
+    let cut = |id: u32| {
+        let to = id & !7;
+        id != bvh::NONE && (to == 0 || low && if level >= 2 { to <= here } else { to == here })
+    };
+    if sort {
+        let mut out = [bvh::NONE; 4];
+        for (o, id) in out.iter_mut().zip(want.into_iter().filter(|&id| !cut(id))) {
+            *o = id;
+        }
+        out
+    } else {
+        want.map(|id| if cut(id) { bvh::NONE } else { id })
+    }
+}
+
 /// Sets the tests' title memory for this thread until dropped.
 struct Memory;
 
@@ -576,7 +606,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => guarded(expected(&scene, c, sort), &scene, c, pointers, wide, sort),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -640,6 +670,24 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
         (structure >> 40) as u32 | bvh::BOX_SORT,
     );
     run(false, descriptor, 0, true);
+}
+
+#[test]
+fn the_node_test_read_the_other_ways_matches_the_reference_on_the_card() {
+    // `VICTORY_BVH_NODE_ONCE=1`: the node's first 64 bytes read before its
+    // kind is looked at; `=2`: a triangle node's 64 bytes read at once in
+    // its branch (the default, each kind's dwords in its own branch, the
+    // other tests).
+    for mode in [1, 2] {
+        super::lower::intersect::TEST_NODE_ONCE.set(Some(mode));
+        run(true, Descriptor::Table, u64::from(NODES), true);
+        {
+            let _memory = Memory::at(BASE);
+            run(true, WHOLE, BASE + u64::from(NODES), true);
+        }
+        run(false, Descriptor::Table, u64::from(NODES), true);
+    }
+    super::lower::intersect::TEST_NODE_ONCE.set(None);
 }
 
 #[test]
@@ -719,4 +767,20 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+#[test]
+fn the_node_test_with_the_walk_guard_matches_the_reference_on_the_card() {
+    // `VICTORY_BVH_WALK_GUARD=1` and `=2`: the children it cuts are left out
+    // of the reference too ([`guarded`]); every page is there.
+    for level in [1, 2] {
+        super::lower::intersect::TEST_WALK_GUARD.set(Some(level));
+        run(true, Descriptor::Table, u64::from(NODES), true);
+        {
+            let _memory = Memory::at(BASE);
+            run(true, WHOLE, BASE + u64::from(NODES), true);
+        }
+        run(false, Descriptor::Table, u64::from(NODES), true);
+    }
+    super::lower::intersect::TEST_WALK_GUARD.set(None);
 }

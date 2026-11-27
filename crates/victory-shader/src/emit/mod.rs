@@ -87,6 +87,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod float_atomic_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -121,7 +123,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_max_wave, host_settings, set_host_max_wave, set_host_nvidia, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    FAULTS_GUARD_CUTS, FAULTS_LOOP_EXITS, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDE_CONSTANT, SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_TITLE_VIEW_COUNT, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constant_marks, constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -145,6 +147,42 @@ pub fn helper_lane_waves() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     HELPER_LANE_WAVES.load(std::sync::atomic::Ordering::Relaxed)
         && *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_LANE_WAVES").is_none_or(|v| v != "0"))
+}
+
+/// How node tests guard walks of ray-tracing structures
+/// (`VICTORY_BVH_WALK_GUARD`; 1 when unset, `=0` off). Level 1 is the
+/// default since the Series X bench gpu-g (2026-11-27, three walking runs
+/// each): the GPU slow state in 33 of 115 samples on main b57be5004, 3 of
+/// 121 with level 1, 9 of 119 with level 2; the picture as on main. The title's walker keeps
+/// its own stack, which a translation does not see; what a node test can
+/// see is the node and the children it hands back. A structure that is
+/// stale or written over (a compacted copy made from an old size, a page
+/// copied before the builder wrote it) can hand back children that lead
+/// back up the tree, and a walk of it runs until the title's or our loop
+/// bound stops it.
+/// - `1`: a box's child at node 0 (where a structure's header is) or at the
+///   box itself is not entered, and a triangle on a page without a copy is
+///   missed (as Marvisak/VIctory PR 2853 by Lkxex does), not tested with
+///   zeros.
+/// - `2`: also a child at or before its box. Children lie after their box
+///   in a structure built top down; if the console's builder lays any out
+///   otherwise, this cuts real geometry (look at the picture).
+///
+/// With either, the walking programs count what was cut, and the lanes that
+/// left a loop at its limit, in the faults buffer ([`FAULTS_GUARD_CUTS`]);
+/// the host logs them. Part of the translation (the shader cache keys on
+/// `VICTORY_*` names).
+pub fn bvh_walk_guard() -> u8 {
+    #[cfg(test)]
+    if let Some(level) = lower::intersect::TEST_WALK_GUARD.get() {
+        return level;
+    }
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_BVH_WALK_GUARD").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("2") => 2,
+        _ => 1,
+    })
 }
 
 /// The loop limit without an override: 2^20.
@@ -213,6 +251,19 @@ pub fn group_sync() -> u8 {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether a float atomic minimum or maximum on title memory
+/// (`global_atomic_fmin`, `_fmax`) is one integer atomic operation on its bits
+/// (`lower.rs` `float_atomic_by_ints`); `VICTORY_FLOAT_ATOMIC_INTS=0`: a loop
+/// of compare-exchanges, as before. The structure builder's programs gather
+/// the bounds of what they build so, one lane of each wave on the same six
+/// dwords: under that contention each wave's loop failed again and again
+/// while thousands of others got in between. Part of the translation: the
+/// shader cache keys on it.
+pub fn float_atomic_ints() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLOAT_ATOMIC_INTS").is_none_or(|v| v != "0"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near

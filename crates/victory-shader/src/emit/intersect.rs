@@ -40,6 +40,10 @@ thread_local! {
     /// The tests' way to translate as with `VICTORY_BVH_NO_HIT=1`
     /// ([`no_hit`]).
     pub(in crate::emit) static TEST_NO_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tests' choice for [`node_once`].
+    pub(in crate::emit) static TEST_NODE_ONCE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// The tests' choice for [`super::super::bvh_walk_guard`].
+    pub(in crate::emit) static TEST_WALK_GUARD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether a node test answers "no hit" and reads nothing
@@ -64,6 +68,30 @@ fn no_hit() -> bool {
     }
     std::env::var_os("VICTORY_BVH_NO_HIT").is_some_and(|v| v == "1")
         && !crate::bvh_builder_on()
+}
+
+/// How a node test reads its node (`VICTORY_BVH_NODE_ONCE`):
+/// - `1`: the node's first 64 bytes at once, before it looks at the node's
+///   kind. Every kind's dwords are in those 64 bytes but a 32-bit box node's
+///   last twelve, and they lie in one page of title memory.
+/// - `2`: each kind in its own branch, a triangle node's 64 bytes at once
+///   there and its vertices picked from them.
+/// - `0` (the default): each kind its own dwords in its own branch. A wave
+///   whose lanes are at nodes of several kinds waits for memory once for
+///   each kind, and a triangle's vertices are read only after the dword
+///   that says which they are: three waits for memory one after another
+///   (the directory, that dword, the vertices) where the hardware has one.
+fn node_once() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_NODE_ONCE.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_BVH_NODE_ONCE").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Where the instruction's node is.
@@ -226,6 +254,7 @@ impl<'a> Lower<'a> {
             }
         };
         let zero = self.s.m.i32(0);
+        let guarding = super::super::bvh_walk_guard() > 0;
         let gate = self.begin_guarded(guard);
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
@@ -233,6 +262,9 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        // The first 64 bytes, for every kind ([`node_once`]).
+        let first: Option<Vec<V>> = (node_once() == 1 && !bvh_miss()).then(|| self.bvh_node_words(at, None, 0, 16));
+        let head = self.cur;
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -245,10 +277,13 @@ impl<'a> Lower<'a> {
         // LOCAL (from our wt5): with `VICTORY_BVH_MISS=1` every node is missed
         // without being read: a box returns no child and a triangle the
         // triangle miss, so a walk ends at its first node.
+        let mut box_cuts = None;
         let boxes = if bvh_miss() {
             [self.s.m.i32(bvh::NONE); 4]
         } else {
-            self.bvh_boxes(at, kind, &ray, sort)
+            let (ids, cut) = self.bvh_boxes(at, kind, &ray, sort, first.as_deref(), (pointer, pointer_high));
+            box_cuts = cut;
+            ids
         };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
@@ -256,7 +291,18 @@ impl<'a> Lower<'a> {
         let triangle = if bvh_miss() {
             bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
         } else {
-            self.bvh_triangle(at, kind, &ray)
+            let first = first.or_else(|| (node_once() == 2).then(|| self.bvh_node_words(at, None, 0, 16)));
+            let hit = self.bvh_triangle(at, kind, &ray, first.as_deref());
+            // A triangle on a page without a copy is missed, not tested with
+            // zeros ([`super::super::bvh_walk_guard`]).
+            match at {
+                NodeAt::Memory { mapped, .. } if guarding => {
+                    let c = self.cur;
+                    let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+                    std::array::from_fn(|k| self.s.m.select(c, mapped, hit[k], miss[k]))
+                }
+                _ => hit,
+            }
         };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
@@ -277,6 +323,26 @@ impl<'a> Lower<'a> {
                 ],
             );
             results.push((phi, zero));
+        }
+        // (Counted where nodes are in title memory, whose programs have the
+        // faults buffer already; the title's are.)
+        if guarding && matches!(at, NodeAt::Memory { .. }) {
+            // What the guard cut here: children of a box, a triangle missed.
+            let cut = self.s.m.phi(join, i32t);
+            let triangle_cut = match at {
+                NodeAt::Memory { mapped, .. } => {
+                    let (one, yes) = (self.s.m.i32(1), self.s.m.bool(true));
+                    let gone = self.s.m.bin(triangle_end, Bin::Xor, mapped, yes);
+                    self.s.m.select(triangle_end, gone, one, zero)
+                }
+                NodeAt::Buffer { .. } => zero,
+            };
+            self.s.m.set_phi(
+                cut,
+                vec![(box_cuts.unwrap_or(zero), box_end), (triangle_cut, triangle_end), (zero, leaf_block)],
+            );
+            let some = self.s.m.cmp(join, pred::NE, cut, zero);
+            self.count_walk(super::super::FAULTS_GUARD_CUTS, cut, some);
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -394,9 +460,24 @@ impl<'a> Lower<'a> {
 
     /// The box test ([`bvh::boxes`]): four result dwords. Starts in the
     /// current block and leaves `self.cur` at the block it ends in.
-    fn bvh_boxes(&mut self, at: NodeAt, kind: V, ray: &Ray, sort: bool) -> [V; 4] {
+    /// `pre`: the node's first sixteen dwords, read already.
+    /// `parent`: the node's pointer (and its high dword, of the 64-bit
+    /// form), for [`super::super::bvh_walk_guard`]; with it on, also the
+    /// children it kept the walk from (a count).
+    fn bvh_boxes(
+        &mut self,
+        at: NodeAt,
+        kind: V,
+        ray: &Ray,
+        sort: bool,
+        pre: Option<&[V]>,
+        parent: (V, Option<V>),
+    ) -> ([V; 4], Option<V>) {
         let head = self.cur;
-        let children = self.bvh_node_words(at, None, 0, 4);
+        let children = match pre {
+            Some(w) => w[..4].to_vec(),
+            None => self.bvh_node_words(at, None, 0, 4),
+        };
         let k5 = self.s.m.i32(5);
         let wide = self.s.m.cmp(head, pred::EQ, kind, k5);
         let (wide_block, half_block) = (self.s.m.new_block(), self.s.m.new_block());
@@ -411,7 +492,10 @@ impl<'a> Lower<'a> {
         // again (DexNom/VIctory#21).
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = match pre {
+            Some(w) => w[4..].to_vec(),
+            None => self.bvh_node_words(at, None, 16, 12),
+        };
         let first: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         let floats = |l: &mut Self, at: NodeAt| -> (Vec<V>, usize) {
             let words = l.bvh_node_words(at, None, 0, 12);
@@ -452,7 +536,10 @@ impl<'a> Lower<'a> {
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
         self.cur = half_block;
-        let words = self.bvh_node_words(at, None, 16, 12);
+        let words = match pre {
+            Some(w) => w[4..].to_vec(),
+            None => self.bvh_node_words(at, None, 16, 12),
+        };
         let f32t = self.s.t.f32;
         let mut halves = Vec::with_capacity(24);
         for n in 0..24 {
@@ -516,6 +603,24 @@ impl<'a> Lower<'a> {
         );
         let mut ids = [none; 4];
         let mut distances = [infinity; 4];
+        // The guard ([`super::super::bvh_walk_guard`]): a child at node 0, at
+        // the box itself or (2) before it is not entered. Pointers compared
+        // without their kind bits; in the 64-bit form only while the box's
+        // pointer has no high bits (children are 32-bit).
+        let level = super::super::bvh_walk_guard();
+        let walk_guard = (level > 0).then(|| {
+            let not_kind = self.s.m.i32(!7);
+            let here = self.s.m.bin(c, Bin::And, parent.0, not_kind);
+            let low = match parent.1 {
+                Some(high) => {
+                    let z = self.s.m.i32(0);
+                    self.s.m.cmp(c, pred::EQ, high, z)
+                }
+                None => self.s.m.bool(true),
+            };
+            (not_kind, here, low)
+        });
+        let mut cuts = walk_guard.map(|_| self.s.m.i32(0));
         for n in 0..4 {
             let bx = &coords[6 * n..6 * n + 6];
             let (mut near, mut far) = ([fzero; 3], [fzero; 3]);
@@ -546,6 +651,24 @@ impl<'a> Lower<'a> {
                 Some(there) => self.s.m.bin(c, Bin::And, hit, there[n]),
                 None => hit,
             };
+            let hit = match walk_guard {
+                Some((not_kind, here, low)) => {
+                    let to = self.s.m.bin(c, Bin::And, children[n], not_kind);
+                    let z = self.s.m.i32(0);
+                    let at_zero = self.s.m.cmp(c, pred::EQ, to, z);
+                    let back = self.s.m.cmp(c, if level >= 2 { pred::IULE } else { pred::EQ }, to, here);
+                    let back = self.s.m.bin(c, Bin::And, back, low);
+                    let bad = self.s.m.bin(c, Bin::Or, at_zero, back);
+                    let cut = self.s.m.bin(c, Bin::And, hit, bad);
+                    let one = self.s.m.i32(1);
+                    let add = self.s.m.select(c, cut, one, z);
+                    cuts = cuts.map(|sum| self.s.m.bin(c, Bin::Add, sum, add));
+                    let yes = self.s.m.bool(true);
+                    let good = self.s.m.bin(c, Bin::Xor, bad, yes);
+                    self.s.m.bin(c, Bin::And, hit, good)
+                }
+                None => hit,
+            };
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
@@ -560,17 +683,35 @@ impl<'a> Lower<'a> {
                 ids[b] = self.s.m.select(c, swap, ia, ib);
             }
         }
-        ids
+        (ids, cuts)
+    }
+
+    /// Adds `n` to dword `dword` of the faults buffer where `when`
+    /// (counts of [`super::super::bvh_walk_guard`]); leaves `self.cur` at
+    /// the block after.
+    pub(super) fn count_walk(&mut self, dword: u32, n: V, when: V) {
+        let gate = self.begin_guarded(Some(when));
+        let c = self.cur;
+        let h = self.s.root_uav_handle(super::super::SLOT_FAULTS);
+        let i32t = self.s.t.i32;
+        let iu = self.s.m.undef(i32t);
+        let (add, byte) = (self.s.m.i32(0), self.s.m.i32(4 * dword));
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, add, byte, iu, iu, n]);
+        self.end_guarded(gate, &[]);
     }
 
     /// The triangle test ([`bvh::triangle`] of [`bvh::triangle_vertices`]):
     /// four result dwords, made in the current block.
-    fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray) -> [V; 4] {
+    /// `pre`: the node's first sixteen dwords, read already.
+    fn bvh_triangle(&mut self, at: NodeAt, kind: V, ray: &Ray, pre: Option<&[V]>) -> [V; 4] {
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         // The triangle's byte of the dword at byte 60: which of its
         // vertices barycentric I and J weigh.
-        let id = self.bvh_node_words(at, None, 60, 1)[0];
+        let id = match pre {
+            Some(w) => w[15],
+            None => self.bvh_node_words(at, None, 60, 1)[0],
+        };
         let (k2, k3, k12, k15) = (k(self, 2), k(self, 3), k(self, 12), k(self, 15));
         let shift = self.s.m.bin(c, Bin::Shl, kind, k3);
         let id = self.s.m.bin(c, Bin::LShr, id, shift);
@@ -596,8 +737,25 @@ impl<'a> Lower<'a> {
             let nibble = self.s.m.bin(c, Bin::Shl, n, k2);
             let vertex = self.s.m.bin(c, Bin::LShr, map, nibble);
             let vertex = self.s.m.bin(c, Bin::And, vertex, k15);
-            let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
-            let words = self.bvh_node_words(at, Some(byte), 0, 3);
+            let words = match pre {
+                // One of the node's five vertices, dwords 3v to 3v + 2: the
+                // vertex numbers the maps hold are 0-4.
+                Some(w) => (0..3)
+                    .map(|a| {
+                        let mut x = w[12 + a];
+                        for v in (0..4).rev() {
+                            let kv = k(self, v as u32);
+                            let is = self.s.m.cmp(c, pred::EQ, vertex, kv);
+                            x = self.s.m.select(c, is, w[3 * v + a], x);
+                        }
+                        x
+                    })
+                    .collect(),
+                None => {
+                    let byte = self.s.m.bin(c, Bin::Mul, vertex, k12);
+                    self.bvh_node_words(at, Some(byte), 0, 3)
+                }
+            };
             // Relative to the ray's origin.
             let r: Vec<V> = (0..3)
                 .map(|a| {
