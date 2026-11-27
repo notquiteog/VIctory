@@ -15,7 +15,10 @@ Measured walking outdoors on an NVIDIA card, Series S profile at half resolution
 
 - Ray tracing is the title's own: real bounced light, reflections and clouds. A tree canopy sometimes shows as dark squares for a few seconds.
 - You need 64 GB of RAM: the game uses 25–45 GB.
-- Before each start, `play.ps1` compiles the pipelines earlier runs used, so a new driver or build doesn't stutter. This is quick when nothing changed. The very first run still compiles as it goes.
+- Pipelines are compiled ahead of time. The game creates nearly all of its pipelines while loading, and every run records them.
+  - Before each start, `play.ps1` compiles the ones earlier runs used. This takes about a second when nothing changed.
+  - After the game closes, it compiles all the others. Ctrl+C stops it, and it picks up where it left off next time.
+  - Only the very first run compiles as it goes.
 
 ## Run it
 
@@ -46,7 +49,7 @@ scripts\play.ps1 -Exe <your copy's executable>
 | `-Safe` | Turns off the newer submission paths. Try it first if something breaks. |
 | `-Adapter <name>` | Picks a card on a PC with more than one. |
 | `-WarmAll` | Compiles every pipeline the game has ever created, not only the ones earlier runs used. Takes a long time the first time. |
-| `-NoWarm` | Starts at once, without compiling pipelines first. |
+| `-NoWarm` | Doesn't compile pipelines ahead of time, before the start or after the game closes. |
 | `-SmoothMotion` | NVIDIA only: starts a copy named `victory_sm.exe`, so a Smooth Motion profile you set for that name in the NVIDIA App applies. |
 
 Every `VICTORY_*` setting is documented where the code reads it.

@@ -16,9 +16,10 @@
 #                for that name in the NVIDIA App applies (the driver's frame generation; nothing is downloaded)
 # -Build         target\diag (the default, the build all measurements are of) or target\release
 # -More          other settings: -More @{VICTORY_PANEL='1'}
-# -NoWarm        start at once, without first compiling the pipelines earlier runs used (victory warm --used)
-# -WarmAll       compile every pipeline the title has ever created first, not only those earlier runs used (long the
-#                first time: tens of thousands; afterwards only new ones)
+# -NoWarm        no compiling of pipelines ahead: by default the ones earlier runs used are made before the start
+#                (victory warm --used) and, after the game closes, every other one the title has created (victory warm)
+# -WarmAll       compile every pipeline the title has ever created before the start, not only those earlier runs used
+#                (long the first time: tens of thousands; afterwards only new ones)
 # -RayTracing    accepted and ignored (ray tracing is the default); kept so older command lines still work
 #
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -104,4 +105,11 @@ try {
         & (Join-Path $PSScriptRoot "..\target\$Build\victory.exe") @warmArgs
     }
     & $victory @runArgs
+    if (-not $NoWarm -and -not $WarmAll) {
+        # After the game: the rest of the pipelines the title has created (it creates nearly all while it loads, so
+        # one run records them), so places not seen yet don't stutter either. Resumable: stopping it with Ctrl+C
+        # only leaves the rest for next time.
+        Write-Host "Compiling the other pipelines the title has created, for next time (Ctrl+C stops it; it goes on next time)"
+        & (Join-Path $PSScriptRoot "..\target\$Build\victory.exe") warm
+    }
 } finally { Pop-Location }
