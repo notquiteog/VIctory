@@ -82,6 +82,14 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The [`SLOT_FAULTS`] dword that counts what `VICTORY_BVH_WALK_GUARD`
+/// cut from walks of ray-tracing structures (children of a box not entered,
+/// triangles on pages without a copy missed); the dword after it counts the
+/// lanes of walking programs that left a loop at its limit. Page numbers go
+/// to the dwords from 1 to the one before these two.
+pub const FAULTS_GUARD_CUTS: u32 = MEMORY_FAULTS - 2;
+/// See [`FAULTS_GUARD_CUTS`].
+pub const FAULTS_LOOP_EXITS: u32 = MEMORY_FAULTS - 1;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

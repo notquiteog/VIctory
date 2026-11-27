@@ -69,7 +69,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
+use victory_shader::emit::{FAULTS_GUARD_CUTS, FAULTS_LOOP_EXITS, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -191,6 +191,8 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
+    /// The faults buffer's counts as last read ([`Memory::take_faults`]).
+    counted: [u32; 2],
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -227,6 +229,11 @@ struct Stats {
     /// pages taken from faults, and the different pages faulted.
     left: u64,
     distinct: std::collections::HashSet<u64>,
+    /// What `VICTORY_BVH_WALK_GUARD` cut from walks, and the lanes of
+    /// walking programs that left a loop at its limit (the faults buffer's
+    /// counts, [`FAULTS_GUARD_CUTS`]).
+    guard_cuts: u64,
+    loop_exits: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -275,6 +282,7 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            counted: [0; 2],
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -691,8 +699,21 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        // The counts the walking programs keep: only ever added to by the
+        // card, so read and never cleared (a clear here could lose what the
+        // card adds meanwhile).
+        let [cuts, exits] = &mut self.counted;
+        for (dword, last, total) in [
+            (FAULTS_GUARD_CUTS, cuts, &mut self.stats.guard_cuts),
+            (FAULTS_LOOP_EXITS, exits, &mut self.stats.loop_exits),
+        ] {
+            // SAFETY: inside the faults' mapping.
+            let now = unsafe { self.faults.1.add(dword as usize).read_volatile() };
+            *total += u64::from(now.wrapping_sub(*last));
+            *last = now;
+        }
         let mut pages = Vec::new();
-        for i in 1..MEMORY_FAULTS as usize {
+        for i in 1..FAULTS_GUARD_CUTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
@@ -858,6 +879,16 @@ impl Memory {
             s.left as f64 / frames,
             faults_all()
         );
+        if s.guard_cuts + s.loop_exits > 0 || victory_shader::emit::bvh_walk_guard() > 0 {
+            tracing::info!(
+                "walks of ray-tracing structures since the last line: {} cut by the guard (VICTORY_BVH_WALK_GUARD={}), {} lanes left a loop at its limit; {:.0} and {:.0} a frame",
+                s.guard_cuts,
+                victory_shader::emit::bvh_walk_guard(),
+                s.loop_exits,
+                s.guard_cuts as f64 / frames,
+                s.loop_exits as f64 / frames
+            );
+        }
         self.stats.from = Some((now, self.frame));
     }
 }

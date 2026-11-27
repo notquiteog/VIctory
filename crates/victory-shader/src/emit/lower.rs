@@ -3853,7 +3853,8 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
+        // (The last two dwords count, [`super::FAULTS_GUARD_CUTS`].)
+        let places = k(self, MEMORY_FAULTS - 3);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let noting = self.begin_guarded(Some(missing));
         let c = self.cur;
@@ -14365,12 +14366,25 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        let mut end = a;
+        // A program that walks ray-tracing structures counts its lanes that
+        // leave here (`VICTORY_BVH_WALK_GUARD`, [`super::FAULTS_LOOP_EXITS`]).
+        if super::bvh_walk_guard() > 0
+            && self.x.res.bvh.iter().any(|n| matches!(n.1, crate::resource::BvhNodes::Memory { .. }))
+        {
+            let cur = self.cur;
+            self.cur = a;
+            let (one, yes) = (self.s.m.i32(1), self.s.m.bool(true));
+            self.count_walk(super::FAULTS_LOOP_EXITS, one, yes);
+            end = self.cur;
+            self.cur = cur;
+        }
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                .op(end, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        self.s.m.terminate(end, Term::Ret);
         self.abort = Some(a);
         a
     }

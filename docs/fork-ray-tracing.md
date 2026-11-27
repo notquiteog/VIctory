@@ -153,6 +153,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_BVH_NODE_ONCE=1` / `=2` | how a node test reads the node (unset or 0: each kind's dwords in that kind's branch). 1: the node's first 64 bytes at once, before the kind is looked at, with a triangle's vertices picked from them. 2: a triangle node's 64 bytes at once, in its own branch. On the RTX card, 1 made the trace passes 3-4x slower (register pressure), and 2 was within noise |
 | `VICTORY_FLOAT_ATOMIC_INTS=0` | a float atomic minimum or maximum on title memory is a loop of compare-exchanges, as before (on: one integer atomic on its bits) |
+| `VICTORY_BVH_WALK_GUARD=1` / `=2` | node tests guard the title's walks (off when unset). 1: a box's child at node 0 or at the box itself is not entered, and a triangle on a page without a copy is missed (after Marvisak/VIctory PR 2853 by Lkxex). 2: also a child at or before its box (children lie after their box in a structure built top down). With either, the walking programs count the cuts and the lanes that left a loop at its limit, and the memory line logs them ("walks of ray-tracing structures since the last line") |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
