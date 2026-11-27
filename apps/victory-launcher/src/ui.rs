@@ -2541,7 +2541,7 @@ impl App {
         let cache = self.settings.cache_path();
         // (What was chosen: 0 nothing yet, 1 the first button, 2 the second, 3 cancel.)
         let mut chosen = 0;
-        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
             ui.set_width(460.0);
             match confirm {
                 Confirm::ClearShaders => {
@@ -2601,6 +2601,10 @@ impl App {
                 }
             });
         });
+        // (Escape, or a click beside it: as its last button.)
+        if chosen == 0 && modal.should_close() {
+            chosen = 3;
+        }
         if chosen == 0 {
             return;
         }
