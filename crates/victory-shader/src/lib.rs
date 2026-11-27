@@ -17,6 +17,7 @@ pub mod native;
 pub mod resource;
 pub mod spill;
 pub mod structure;
+pub mod walk;
 
 /// The version of what the translator makes, part of the key of every
 /// cached translation (`victory-gpu`'s `shader_cache`): **bump it with any
@@ -45,6 +46,16 @@ pub use native::{
 pub fn bvh_builder_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| builder_setting(std::env::var_os("VICTORY_BVH_BUILDER").as_deref()))
+}
+
+/// Whether the title's ray tracing runs on the host's own ray tracing
+/// (`VICTORY_RT_HARDWARE=1`: host acceleration structures, and the title's
+/// walks of its structures as inline ray queries where the translator knows
+/// their shape; off by default until proven, docs/hardware-rt.md). Read
+/// once; part of the translation (the shader cache's key names it).
+pub fn rt_hardware() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_HARDWARE").is_some_and(|v| v == "1"))
 }
 
 /// [`bvh_builder_on`] for a value of the setting.

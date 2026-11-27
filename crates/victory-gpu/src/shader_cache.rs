@@ -127,6 +127,8 @@ fn build() -> [u8; 32] {
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
+            // The hardware ray-tracing path translates walks as ray queries (docs/hardware-rt.md).
+            "VICTORY_RT_HARDWARE",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
             "VICTORY_TITLE_VIEW_BOUND",

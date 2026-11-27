@@ -606,6 +606,10 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
         t.programs += 1;
         match victory_shader::spill::build(&p) {
             Ok(program) => {
+                // With the walk census, only the programs that walk structures.
+                if walk_census_line(&example, &p, &program) {
+                    continue;
+                }
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
@@ -688,6 +692,44 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
             }
         }
     }
+}
+
+/// `VICTORY_WALK_CENSUS=<file>`: for each program with ray-tracing node
+/// tests, one line per loop around them ([`victory_shader::walk`]),
+/// appended. Game-derived: refused inside the repository. Whether the census
+/// is on and `p` has no node test (the rest of the walk skips it).
+fn walk_census_line(example: &dyn Fn() -> String, native: &NativeProgram, p: &ir::Program) -> bool {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("VICTORY_WALK_CENSUS")?);
+        victory_core::ensure_outside_repo(&path).ok()?;
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
+    });
+    let Some(out) = out else { return false };
+    let tests = p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name().starts_with("image_bvh")).count();
+    if tests == 0 {
+        return true;
+    }
+    let walks = victory_shader::walk::census(p);
+    let mut text = format!(
+        "program {} {:?} wave{} tests {tests} walks {}
+",
+        example(),
+        native.stage,
+        if p.wave64 { 64 } else { 32 },
+        walks.len()
+    );
+    for w in &walks {
+        text += &format!(
+            "  walk @{:#x} blocks {} insts {} depth {} | {} | to {:x?} | out {:?} | carried {:?}
+    ops {:?}
+",
+            w.offset, w.blocks, w.insts, w.depth, w.shape(), w.exit_offsets, w.live_out, w.carried, w.ops
+        );
+    }
+    let _ = lock(out).write_all(text.as_bytes());
+    false
 }
 
 /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:

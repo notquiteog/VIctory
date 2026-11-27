@@ -1,9 +1,12 @@
 //! The title's calls into its ray-tracing structure builder
 //! (`XboxBvhBuilder.dll`, the title's own DLL, which still serves them): two
 //! are seen on the way, for `victory_gpu::bvhsize` (structures' compacted
-//! sizes given a bound before the card has them). With the structure builder
-//! on (unless `VICTORY_BVH_BUILDER=0`) and unless `VICTORY_BVH_SIZES_BOUND=0`, the
-//! main image's import slots of them are pointed here ([`wrap_imports`]).
+//! sizes given a bound before the card has them), and with the two below for
+//! `victory_gpu::hwrt` (the census, `VICTORY_RT_CENSUS=1`, and the hardware
+//! path, `VICTORY_RT_HARDWARE=1`). With the structure builder on (unless
+//! `VICTORY_BVH_BUILDER=0`) and unless `VICTORY_BVH_SIZES_BOUND=0`, or with
+//! either of those, the main image's import slots of them are pointed here
+//! ([`wrap_imports`]).
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,12 +23,21 @@ const BATCHED: &str = "?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBui
 /// postbuild)` (not imported by the title known so far).
 const BUILD: &str = "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z";
 
+/// `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X(list,
+/// count, descs, extra)`: packed structures unpacked in place.
+const REHYDRATE: &str = "?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z";
+/// `XboxBvhBuilder::CopyRaytracingAccelerationStructure(list, dest, source,
+/// mode)`.
+const COPY: &str = "?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z";
+
 /// The DLL's own functions, as the import slots held them.
-static ORIGINAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static ORIGINAL: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 
 type Prebuild = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut u64);
 type Batched = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void);
 type Build = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u32, *const c_void);
+type Rehydrate = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const u64) -> i32;
+type Copy = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, u64, u32);
 
 /// A member function (`this` first, as any argument, on x64).
 unsafe extern "system" fn prebuild(this: *mut c_void, inputs: *const c_void, stream: *const c_void, info: *mut u64) {
@@ -39,6 +51,7 @@ unsafe extern "system" fn prebuild(this: *mut c_void, inputs: *const c_void, str
         // member is `ResultDataMaxSizeInBytes`.
         let bound = unsafe { info.read_unaligned() };
         victory_gpu::bvhsize::prebuilt(inputs as u64, bound);
+        victory_gpu::hwrt::prebuilt(inputs as u64, bound);
     }
 }
 
@@ -46,6 +59,7 @@ unsafe extern "system" fn batched(this: *mut c_void, list: *mut c_void, count: u
     // Before the builder records anything (it may translate the asking at
     // once).
     victory_gpu::bvhsize::batch(descs as u64, count);
+    victory_gpu::hwrt::batched(descs as u64, count);
     // SAFETY: as in `prebuild`.
     let original: Batched = unsafe { std::mem::transmute(ORIGINAL[1].load(Ordering::Acquire)) };
     // SAFETY: as in `prebuild`.
@@ -60,6 +74,22 @@ unsafe extern "system" fn build(this: *mut c_void, list: *mut c_void, desc: *con
     unsafe { original(this, list, desc, count, postbuild) };
 }
 
+unsafe extern "system" fn rehydrate(this: *mut c_void, list: *mut c_void, count: u32, descs: *const c_void, extra: *const u64) -> i32 {
+    victory_gpu::hwrt::rehydrate(descs as u64, count, extra as u64);
+    // SAFETY: as in `prebuild`.
+    let original: Rehydrate = unsafe { std::mem::transmute(ORIGINAL[3].load(Ordering::Acquire)) };
+    // SAFETY: as in `prebuild`.
+    unsafe { original(this, list, count, descs, extra) }
+}
+
+unsafe extern "system" fn copy(this: *mut c_void, list: *mut c_void, dest: u64, source: u64, mode: u32) {
+    victory_gpu::hwrt::copied(dest, source, mode);
+    // SAFETY: as in `prebuild`.
+    let original: Copy = unsafe { std::mem::transmute(ORIGINAL[4].load(Ordering::Acquire)) };
+    // SAFETY: as in `prebuild`.
+    unsafe { original(this, list, dest, source, mode) };
+}
+
 /// Ours for an import, and where the DLL's own is kept.
 fn ours(dll: &str, name: &str) -> Option<(usize, usize)> {
     if !dll.eq_ignore_ascii_case(DLL) {
@@ -69,6 +99,9 @@ fn ours(dll: &str, name: &str) -> Option<(usize, usize)> {
         PREBUILD => Some((prebuild as *const () as usize, 0)),
         BATCHED => Some((batched as *const () as usize, 1)),
         BUILD => Some((build as *const () as usize, 2)),
+        // Only for the census and the hardware path.
+        REHYDRATE if victory_gpu::hwrt::census() || victory_gpu::hwrt::hardware() => Some((rehydrate as *const () as usize, 3)),
+        COPY if victory_gpu::hwrt::census() || victory_gpu::hwrt::hardware() => Some((copy as *const () as usize, 4)),
         _ => None,
     }
 }
@@ -78,7 +111,7 @@ fn ours(dll: &str, name: &str) -> Option<(usize, usize)> {
 /// imports are bound and before the title runs.
 pub fn wrap_imports(base: usize, info: &victory_pe::ImageInfo) -> usize {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !victory_gpu::bvhsize::wanted() {
+    if !victory_gpu::hwrt::wanted() {
         return 0;
     }
     let mut wrapped = 0;
